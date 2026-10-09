@@ -272,6 +272,16 @@
 
     const [text, setText] = React.useState(finalText);
     const [editing, setEditing] = React.useState(false);
+    const [kb, setKb] = React.useState(0);
+
+    // Lift the whole sheet content above the keyboard so the text box stays visible
+    React.useEffect(() => {
+      const K = RN.Keyboard;
+      if (!K || typeof K.addListener !== "function") return undefined;
+      const a = K.addListener("keyboardDidShow", (e) => setKb((e && e.endCoordinates && e.endCoordinates.height) || 0));
+      const b = K.addListener("keyboardDidHide", () => setKb(0));
+      return () => { try { a.remove(); b.remove(); } catch (e) {} };
+    }, []);
 
     const close = () => { try { ActionSheetModule.hideActionSheet(); } catch (e) {} };
     const act = (action, t) => () => { finish({ action, text: t }); close(); };
@@ -284,7 +294,7 @@
 
     const body = h(
       View,
-      { style: { padding: 16, paddingBottom: 28 } },
+      { style: { padding: 16, paddingBottom: 28 + kb } },
       h(Text, { style: { color: C.muted, fontSize: 12, fontWeight: "700", textTransform: "uppercase", marginBottom: 8 } }, "Preview"),
       h(
         View,
@@ -443,6 +453,22 @@
   }
 
   // Chat-box hook: holds the send BEFORE Discord clears the input, so Cancel keeps the text.
+  let shapeReported = false;
+  function describeArgs(args) {
+    try {
+      return args
+        .map((a) => {
+          if (a === null) return "null";
+          if (typeof a !== "object") return typeof a;
+          return "{" + Object.keys(a).slice(0, 8).join(",") + "}";
+        })
+        .join(" | ")
+        .slice(0, 160);
+    } catch (e) {
+      return "?";
+    }
+  }
+
   function patchChatInput() {
     if (!ChatInputModule || typeof ChatInputModule.handleSendMessage !== "function") {
       log("ChatInputModule.handleSendMessage not found");
@@ -459,6 +485,11 @@
 
         const slot = findTextSlot(args);
         const original = slot ? String(slot.get() || "") : "";
+        if (!slot) {
+          const shape = describeArgs(args);
+          log("handleSendMessage: no text found in args:", shape);
+          if (!shapeReported) { shapeReported = true; showToast("Chat hook can't read text: " + shape); }
+        }
         if (!slot || !original.trim() || original.trim().startsWith("/") || getKeys().length === 0) {
           return orig(...args);
         }
