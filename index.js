@@ -180,7 +180,7 @@
   async function callGroq(apiKey, text, replyContext = "") {
     const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
     const timer = controller ? setTimeout(() => controller.abort(), 20000) : null;
-    const systemPrompt = buildSystemPrompt() + (replyContext ? "\n\n[Context: The user is replying to this message: \"" + replyContext + "\"]" : "");
+    const systemPrompt = buildSystemPrompt() + (replyContext ? "\n\nContext: The user is actively replying to this specific message in the chat: \"" + replyContext + "\". Use that message only as context. Still output only the final chat message." : "");
     try {
       const res = await fetch(GROQ_URL, {
         method: "POST",
@@ -324,16 +324,102 @@
     return null;
   }
 
+  function clipReply(content) {
+    const text = typeof content === "string" ? content.trim() : "";
+    if (!text) return "";
+    return text.length > 500 ? text.slice(0, 500) + "…" : text;
+  }
+
+  function textOfMessage(msg) {
+    if (!msg || typeof msg !== "object") return "";
+    return clipReply(
+      typeof msg.content === "string" ? msg.content :
+      typeof msg.text === "string" ? msg.text : ""
+    );
+  }
+
   function getReplyContext(channelId, ref) {
     try {
       const messageId = ref && (ref.message_id || ref.messageId);
       if (!messageId || !MessageStore || typeof MessageStore.getMessage !== "function") return "";
       const target = MessageStore.getMessage(channelId, messageId);
-      const content = target && typeof target.content === "string" ? target.content.trim() : "";
-      return content.length > 500 ? content.slice(0, 500) + "…" : content;
+      return textOfMessage(target);
     } catch (e) {
       return "";
     }
+  }
+
+  // Discord v348.10 often blocks MessageStore.getMessage outside the React tree.
+  // Swipe-to-reply still attaches the quoted message on the send payload, so read that first.
+  function extractReplyMessage(args) {
+    const seen = new Set();
+    function walk(v, depth) {
+      try {
+        if (!v || typeof v !== "object" || depth > 5 || seen.has(v)) return "";
+        seen.add(v);
+        const direct =
+          textOfMessage(v.referencedMessage) ||
+          textOfMessage(v.referenced_message) ||
+          textOfMessage(v.replyingTo) ||
+          textOfMessage(v.replyTo) ||
+          textOfMessage(v.messageReply);
+        if (direct) return direct;
+        if (v.message && typeof v.message === "object") {
+          const nested =
+            textOfMessage(v.message.referencedMessage) ||
+            textOfMessage(v.message.referenced_message);
+          if (nested) return nested;
+        }
+        const keys = Object.keys(v).slice(0, 40);
+        for (let i = 0; i < keys.length; i++) {
+          const child = v[keys[i]];
+          if (child && typeof child === "object") {
+            const hit = walk(child, depth + 1);
+            if (hit) return hit;
+          }
+        }
+      } catch (e) {}
+      return "";
+    }
+    try {
+      for (const a of args || []) {
+        const hit = walk(a, 0);
+        if (hit) return hit;
+      }
+    } catch (e) {
+      log("Gagal mengekstrak pesan reply:", e);
+    }
+    return "";
+  }
+
+  let PendingReplyStore = null;
+  function getPendingReplyText(channelId) {
+    try {
+      if (!PendingReplyStore) {
+        PendingReplyStore =
+          (metro.findByStoreName && (
+            metro.findByStoreName("PendingReplyStore") ||
+            metro.findByStoreName("ReplyStore")
+          )) ||
+          metro.findByProps("getPendingReply") ||
+          metro.findByProps("createPendingReply", "deletePendingReply") ||
+          null;
+      }
+      if (!PendingReplyStore || typeof PendingReplyStore.getPendingReply !== "function") return "";
+      const reply = PendingReplyStore.getPendingReply(channelId);
+      if (!reply) return "";
+      return textOfMessage(reply.message) || textOfMessage(reply.referencedMessage) || textOfMessage(reply);
+    } catch (e) {
+      return "";
+    }
+  }
+
+  function resolveReplyContext(channelId, args, explicitRef) {
+    const fromArgs = extractReplyMessage(args);
+    if (fromArgs) return fromArgs;
+    const fromStore = getReplyContext(channelId, explicitRef || findReplyRef(args));
+    if (fromStore) return fromStore;
+    return getPendingReplyText(channelId);
   }
 
   // Preview sheet: Send / Edit (edit the AI response) / Copy prompt / Cancel.
@@ -511,7 +597,9 @@
           }
 
           const channelId = args[0];
-          const replyContext = getReplyContext(channelId, msg?.messageReference);
+          // Swipe-to-reply: read the quoted message off the send args, not MessageStore.
+          const replyContext = resolveReplyContext(channelId, args, msg && msg.messageReference);
+          if (replyContext) log("reply context:", replyContext.slice(0, 80));
           const job = async () => {
             const finalText = await produceFinalText(content, channelId, false, replyContext);
             if (finalText === null) return;
@@ -571,7 +659,8 @@
         }
 
         const channelId = findChannelId(args);
-        const replyContext = getReplyContext(channelId, findReplyRef(args));
+        const replyContext = resolveReplyContext(channelId, args, findReplyRef(args));
+        if (replyContext) log("reply context:", replyContext.slice(0, 80));
         inFlight = true;
 
         (async () => {
