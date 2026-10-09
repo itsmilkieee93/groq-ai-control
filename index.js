@@ -138,6 +138,10 @@
   const MessageModules = metro.findByProps("sendMessage", "receiveMessage");
   const SelectedChannelStore = metro.findByStoreName ? metro.findByStoreName("SelectedChannelStore") : null;
 
+  const ActionSheetModule = metro.findByProps("openLazy", "hideActionSheet");
+  const ASComponents = metro.findByProps("ActionSheet");
+  const ActionSheetComp = ASComponents && ASComponents.ActionSheet;
+
   const NavModule = metro.findByProps("Navigation");
   const Navigation = (NavModule && NavModule.Navigation) || NavModule;
   const FormRowModule = metro.findByProps("FormRow");
@@ -253,7 +257,60 @@
 
   // Preview dialog (Android Alert allows max 3 buttons): Send / Edit / Cancel.
   // Resolves { action: "send" | "edit" | "cancel", text }.
+  function PreviewSheet(props) {
+    const { View, Text, TouchableOpacity, ScrollView } = RN;
+    const { original, finalText, finish } = props;
+    const C = { text: "#f2f3f5", muted: "#b5bac1", card: "#2b2d31", accent: "#5865f2", danger: "#da373c", neutral: "#4e5058" };
+
+    // Swiping the sheet away counts as Cancel (also keeps the send queue from hanging)
+    React.useEffect(() => () => finish({ action: "cancel", text: original }), []);
+
+    const close = () => { try { ActionSheetModule.hideActionSheet(); } catch (e) {} };
+    const act = (action, text) => () => { finish({ action, text }); close(); };
+    const btn = (label, bg, onPress, key) =>
+      h(
+        TouchableOpacity,
+        { key, onPress, style: { backgroundColor: bg, borderRadius: 10, paddingVertical: 12, alignItems: "center", marginTop: 8 } },
+        h(Text, { style: { color: "#fff", fontWeight: "700", fontSize: 15 } }, label)
+      );
+
+    const body = h(
+      View,
+      { style: { padding: 16, paddingBottom: 28 } },
+      h(Text, { style: { color: C.muted, fontSize: 12, fontWeight: "700", textTransform: "uppercase", marginBottom: 8 } }, "Preview"),
+      h(
+        View,
+        { style: { backgroundColor: C.card, borderRadius: 10, padding: 12, maxHeight: 240 } },
+        h(ScrollView, null, h(Text, { selectable: true, style: { color: C.text, fontSize: 15 } }, finalText))
+      ),
+      btn("Send", C.accent, act("send", finalText), "send"),
+      btn("Edit in chat box", C.neutral, act("edit", finalText), "edit"),
+      btn("Cancel", C.danger, act("cancel", original), "cancel")
+    );
+    return ActionSheetComp ? h(ActionSheetComp, null, body) : body;
+  }
+
   function showPreview(original, finalText) {
+    if (ActionSheetModule && typeof ActionSheetModule.openLazy === "function") {
+      return new Promise((resolve) => {
+        let done = false;
+        const finish = (v) => { if (!done) { done = true; resolve(v); } };
+        try {
+          ActionSheetModule.openLazy(
+            Promise.resolve({ default: PreviewSheet }),
+            "GroqPreview",
+            { original, finalText, finish }
+          );
+        } catch (e) {
+          log("action sheet failed, using alert:", e && e.message);
+          showAlertPreview(original, finalText).then(resolve);
+        }
+      });
+    }
+    return showAlertPreview(original, finalText);
+  }
+
+  function showAlertPreview(original, finalText) {
     return new Promise((resolve) => {
       const Alert = RN.Alert;
       if (!Alert || typeof Alert.alert !== "function") return resolve({ action: "send", text: finalText });
