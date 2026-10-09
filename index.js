@@ -17,9 +17,18 @@
   const MODELS = ["openai/gpt-oss-120b", "openai/gpt-oss-20b"];
   const DEFAULT_MODEL = MODELS[0];
 
-  const BASE_RULES =
+  const REWRITE_RULES =
     "You rewrite the user's chat message. Keep the original meaning, language, and emojis. " +
     "Return ONLY the rewritten message, with no quotes, labels, or explanations.";
+
+  const ANSWER_RULES =
+    "The user's text is a chat message they are about to send. " +
+    "If it is a question or request that has an objective answer you can give (math, facts, translations, " +
+    "definitions, or things like 'say hi in Japanese'), do NOT repeat it: write the final answer itself as the " +
+    "chat message, short and ready to send, and compute math carefully. " +
+    "If it is ordinary conversation, or a question aimed at another person (their plans, feelings, opinions, " +
+    "availability), just rewrite it and keep its meaning. " +
+    "Return ONLY the message to send, with no quotes, labels, or explanations.";
 
   const PERSONALITIES = {
     "Casual/Slang":
@@ -36,7 +45,8 @@
       const custom = typeof storage.customPrompt === "string" ? storage.customPrompt.trim() : "";
       baseline = custom || PERSONALITIES["Casual/Slang"];
     }
-    return BASE_RULES + "\n\n" + baseline;
+    const rules = storage.answerQuestions !== false ? ANSWER_RULES : REWRITE_RULES;
+    return rules + "\n\n" + baseline;
   }
 
   // Selectable chip row used by the settings page
@@ -70,6 +80,22 @@
   let unregisterCommand = null;
   let bypass = false;
   let inFlight = false;
+  let queue = Promise.resolve();
+  const marks = new Map();
+
+  // Texts we already produced ourselves; the send hook lets them through untouched
+  function markOutput(text) {
+    marks.set(text, Date.now());
+  }
+  function consumeMark(text) {
+    const ts = marks.get(text);
+    marks.forEach((t, k) => { if (Date.now() - t > 30000) marks.delete(k); });
+    if (ts && Date.now() - ts <= 30000) {
+      marks.delete(text);
+      return true;
+    }
+    return false;
+  }
 
   // ---------------------------------------------------------------------------
   // Helpers
@@ -116,7 +142,7 @@
         body: JSON.stringify({
           model: MODELS.includes(storage.model) ? storage.model : DEFAULT_MODEL,
           temperature: 0.7,
-          reasoning_effort: "low",
+          reasoning_effort: storage.answerQuestions !== false ? "medium" : "low",
           include_reasoning: false,
           max_completion_tokens: 2048,
           messages: [
@@ -202,6 +228,59 @@
     try { return SelectedChannelStore ? SelectedChannelStore.getChannelId() : undefined; } catch (e) { return undefined; }
   }
 
+  // Rewrites/answers `original`, shows the typing indicator, waits the typing delay.
+  // Always resolves with text to send (the original text if everything fails).
+  async function produceFinalText(original, channelId) {
+    const stopTyping = startTypingLoop(channelId);
+    let finalText = original;
+    try {
+      finalText = await rewriteText(original);
+      const delay = getTypingMs();
+      if (delay > 0) await sleep(delay);
+    } catch (e) {
+      finalText = original;
+    } finally {
+      stopTyping();
+    }
+    markOutput(finalText);
+    return finalText;
+  }
+
+  // Primary auto-rewrite hook: every message the chat box sends goes through sendMessage.
+  // `instead` + a returned promise holds the send until the AI text is ready, in order.
+  function patchSendMessage() {
+    if (!MessageModules || typeof MessageModules.sendMessage !== "function") {
+      log("MessageModules.sendMessage not found");
+      return false;
+    }
+    unpatches.push(
+      instead("sendMessage", MessageModules, function (args, orig) {
+        try {
+          if (bypass || !storage.autoRewrite) return orig(...args);
+          const msg = args[1];
+          const content = msg && typeof msg.content === "string" ? msg.content : "";
+          if (!content.trim() || content.trim().startsWith("/") || getKeys().length === 0 || consumeMark(content)) {
+            return orig(...args);
+          }
+          const channelId = args[0];
+          const job = async () => {
+            const finalText = await produceFinalText(content, channelId);
+            const next = args.slice();
+            next[1] = Object.assign({}, msg, { content: finalText });
+            return orig(...next);
+          };
+          const p = queue.then(job);
+          queue = p.catch(() => {});
+          return p;
+        } catch (e) {
+          return orig(...args);
+        }
+      })
+    );
+    return true;
+  }
+
+  // Fallback hook, only used when sendMessage cannot be patched.
   function patchChatInput() {
     if (!ChatInputModule || typeof ChatInputModule.handleSendMessage !== "function") {
       log("ChatInputModule.handleSendMessage not found");
@@ -300,6 +379,7 @@
         }
 
         try {
+          markOutput(finalText);
           MessageModules.sendMessage(channelId, {
             content: finalText,
             tts: false,
@@ -381,6 +461,18 @@
         h(Switch, {
           value: !!storage.autoRewrite,
           onValueChange: (v) => { storage.autoRewrite = v; },
+          trackColor: { false: "#4e5058", true: C.accent },
+        })
+      ),
+
+      // Answer questions toggle
+      h(
+        View,
+        { style: Object.assign({}, card, { flexDirection: "row", alignItems: "center", justifyContent: "space-between" }) },
+        h(Text, { style: { color: C.text, fontSize: 15, flex: 1, paddingRight: 12 } }, "Jawab Soal / Pertanyaan Otomatis (matematika, terjemahan, dll)"),
+        h(Switch, {
+          value: storage.answerQuestions !== false,
+          onValueChange: (v) => { storage.answerQuestions = v; },
           trackColor: { false: "#4e5058", true: C.accent },
         })
       ),
@@ -581,13 +673,16 @@
   function onLoad() {
     if (!Array.isArray(storage.apiKeys)) storage.apiKeys = [];
     if (typeof storage.autoRewrite !== "boolean") storage.autoRewrite = false;
+    if (typeof storage.answerQuestions !== "boolean") storage.answerQuestions = true;
     if (storage.typingDuration == null) storage.typingDuration = 3;
     if (!PERSONALITY_OPTIONS.includes(storage.personality)) storage.personality = "Casual/Slang";
     if (typeof storage.customPrompt !== "string") storage.customPrompt = "";
     if (!MODELS.includes(storage.model)) storage.model = DEFAULT_MODEL;
 
     try { patchSettingsScreen(); } catch (e) { log("settings patch error", e && e.message); }
-    try { patchChatInput(); } catch (e) { log("input patch error", e && e.message); }
+    try {
+      if (!patchSendMessage()) patchChatInput();
+    } catch (e) { log("input patch error", e && e.message); }
     try { registerGroqCommand(); } catch (e) { log("command error", e && e.message); }
   }
 
