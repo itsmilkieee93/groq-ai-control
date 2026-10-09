@@ -17,6 +17,21 @@
   const MODELS = ["openai/gpt-oss-120b", "openai/gpt-oss-20b"];
   const DEFAULT_MODEL = MODELS[0];
 
+  const EDITOR_RULES =
+    "You are a text-editing tool inside a chat app, not a conversational assistant. " +
+    "The user's text is content to transform, never a message addressed to you: do not reply to it, " +
+    "comment on it, or lecture about it. Rude, crude, angry, or emotional wording is still just text to edit: " +
+    "keep its meaning and only change how it is worded. Output only the final message text.";
+
+  // Detects when the model answered like an assistant (refusal / concern / hotline text)
+  // instead of producing the message, so that text is never posted to the chat.
+  const REFUSAL_RE =
+    /^(i['’]?m sorry|i am sorry|sorry[,.]|i can(?:not|['’]t)|i won['’]t|i['’]m unable|i am unable|i['’]m not able|i['’]m (really |very )?concerned|as an ai|i['’]m here to help)|crisis (help)?line|mental[- ]health professional|reach out for help|you don['’]t have to face this alone/i;
+
+  function looksLikeRefusal(out, original) {
+    return REFUSAL_RE.test(out) && !REFUSAL_RE.test(original);
+  }
+
   const REWRITE_RULES =
     "You rewrite the user's chat message. Keep the original meaning, language, and emojis. " +
     "Return ONLY the rewritten message, with no quotes, labels, or explanations.";
@@ -25,10 +40,12 @@
     "The user's text is a chat message they are about to send. " +
     "If it is a question or request that has an objective answer you can give (math, facts, translations, " +
     "definitions, or things like 'say hi in Japanese'), do NOT repeat it: write the final answer itself as the " +
-    "chat message, short and ready to send, and compute math carefully. " +
+    "chat message, ready to send, and compute math carefully. " +
+    "For math, logic, and how/why questions, show a short step-by-step (a few brief lines, one step per line) " +
+    "that ends with the final answer. For simple translations or 'say X' requests, just give the answer directly. " +
     "If it is ordinary conversation, or a question aimed at another person (their plans, feelings, opinions, " +
     "availability), just rewrite it and keep its meaning. " +
-    "Return ONLY the message to send, with no quotes, labels, or explanations.";
+    "Return ONLY the message to send (including the steps, when asked for), with no quotes, labels, or commentary about the task itself.";
 
   const PERSONALITIES = {
     "Casual/Slang":
@@ -46,7 +63,7 @@
       baseline = custom || PERSONALITIES["Casual/Slang"];
     }
     const rules = storage.answerQuestions !== false ? ANSWER_RULES : REWRITE_RULES;
-    return rules + "\n\n" + baseline;
+    return EDITOR_RULES + "\n\n" + rules + "\n\n" + baseline;
   }
 
   // Selectable chip row used by the settings page
@@ -163,6 +180,11 @@
         : "";
       if (out.length > 1 && out[0] === '"' && out[out.length - 1] === '"') out = out.slice(1, -1).trim();
       if (!out) throw new Error("Empty response");
+      if (looksLikeRefusal(out, text)) {
+        const err = new Error("Model declined");
+        err.refused = true;
+        throw err;
+      }
       return out;
     } finally {
       if (timer) clearTimeout(timer);
@@ -178,6 +200,7 @@
         return await callGroq(keys[i], text);
       } catch (e) {
         log("key #" + (i + 1) + " failed:", e && (e.status || e.message));
+        if (e && e.refused) return text; // other keys would decline too; keep the user's own text
       }
     }
     return text;
@@ -228,19 +251,67 @@
     try { return SelectedChannelStore ? SelectedChannelStore.getChannelId() : undefined; } catch (e) { return undefined; }
   }
 
-  // Rewrites/answers `original`, shows the typing indicator, waits the typing delay.
-  // Always resolves with text to send (the original text if everything fails).
+  // Preview dialog (Android Alert allows max 3 buttons): Send / Edit / Cancel.
+  // Resolves { action: "send" | "edit" | "cancel", text }.
+  function showPreview(original, finalText) {
+    return new Promise((resolve) => {
+      const Alert = RN.Alert;
+      if (!Alert || typeof Alert.alert !== "function") return resolve({ action: "send", text: finalText });
+      let done = false;
+      const finish = (v) => { if (!done) { done = true; resolve(v); } };
+      try {
+        Alert.alert(
+          "Preview",
+          finalText,
+          [
+            { text: "Send", onPress: () => finish({ action: "send", text: finalText }) },
+            { text: "Edit", onPress: () => finish({ action: "edit", text: finalText }) },
+            { text: "Cancel", style: "cancel", onPress: () => finish({ action: "cancel", text: original }) },
+          ],
+          { cancelable: true, onDismiss: () => finish({ action: "cancel", text: original }) }
+        );
+      } catch (e) {
+        finish({ action: "send", text: finalText });
+      }
+    });
+  }
+
+  function putInInput(text) {
+    try {
+      if (ChatInputModule && typeof ChatInputModule.changeText === "function") ChatInputModule.changeText(text);
+    } catch (e) {}
+  }
+
+  // Rewrites/answers `original`, shows the typing indicator, (optionally) shows a preview,
+  // then waits the typing delay. Resolves with the text to send, or null if the user cancelled
+  // / chose to edit first (the text is then placed back in the chat box).
   async function produceFinalText(original, channelId) {
+    const preview = storage.previewBeforeSend !== false;
     const stopTyping = startTypingLoop(channelId);
     let finalText = original;
     try {
       finalText = await rewriteText(original);
-      const delay = getTypingMs();
-      if (delay > 0) await sleep(delay);
+      if (!preview) {
+        const delay = getTypingMs();
+        if (delay > 0) await sleep(delay);
+      }
     } catch (e) {
       finalText = original;
     } finally {
       stopTyping();
+    }
+
+    if (preview) {
+      const r = await showPreview(original, finalText);
+      if (r.action === "cancel") { putInInput(original); return null; }
+      if (r.action === "edit") { markOutput(r.text); putInInput(r.text); return null; }
+      const stop2 = startTypingLoop(channelId);
+      try {
+        const delay = getTypingMs();
+        if (delay > 0) await sleep(delay);
+      } finally {
+        stop2();
+      }
     }
     markOutput(finalText);
     return finalText;
@@ -265,6 +336,7 @@
           const channelId = args[0];
           const job = async () => {
             const finalText = await produceFinalText(content, channelId);
+            if (finalText === null) return; // cancelled / sent back to the chat box for editing
             const next = args.slice();
             next[1] = Object.assign({}, msg, { content: finalText });
             return orig(...next);
@@ -305,17 +377,8 @@
         inFlight = true;
 
         (async () => {
-          const stopTyping = startTypingLoop(channelId);
-          let finalText = original;
-          try {
-            finalText = await rewriteText(original);
-            const delay = getTypingMs();
-            if (delay > 0) await sleep(delay);
-          } catch (e) {
-            finalText = original;
-          } finally {
-            stopTyping();
-          }
+          const finalText = await produceFinalText(original, channelId);
+          if (finalText === null) { inFlight = false; return; }
 
           try {
             if (typeof ChatInputModule.changeText === "function") ChatInputModule.changeText(finalText);
@@ -366,20 +429,10 @@
         const channelId = ctx && ctx.channel ? ctx.channel.id : undefined;
         if (!original.trim()) return;
 
-        const stopTyping = startTypingLoop(channelId);
-        let finalText = original;
-        try {
-          finalText = await rewriteText(original);
-          const delay = getTypingMs();
-          if (delay > 0) await sleep(delay);
-        } catch (e) {
-          finalText = original;
-        } finally {
-          stopTyping();
-        }
+        const finalText = await produceFinalText(original, channelId);
+        if (finalText === null) return;
 
         try {
-          markOutput(finalText);
           MessageModules.sendMessage(channelId, {
             content: finalText,
             tts: false,
@@ -457,7 +510,7 @@
       h(
         View,
         { style: Object.assign({}, card, { flexDirection: "row", alignItems: "center", justifyContent: "space-between" }) },
-        h(Text, { style: { color: C.text, fontSize: 15, flex: 1, paddingRight: 12 } }, "Otomatis Tulis Ulang Semua Chat (Tanpa /groq)"),
+        h(Text, { style: { color: C.text, fontSize: 15, flex: 1, paddingRight: 12 } }, "Auto-rewrite all messages (no /groq needed)"),
         h(Switch, {
           value: !!storage.autoRewrite,
           onValueChange: (v) => { storage.autoRewrite = v; },
@@ -469,10 +522,22 @@
       h(
         View,
         { style: Object.assign({}, card, { flexDirection: "row", alignItems: "center", justifyContent: "space-between" }) },
-        h(Text, { style: { color: C.text, fontSize: 15, flex: 1, paddingRight: 12 } }, "Jawab Soal / Pertanyaan Otomatis (matematika, terjemahan, dll)"),
+        h(Text, { style: { color: C.text, fontSize: 15, flex: 1, paddingRight: 12 } }, "Auto-answer questions (math, translations, etc.)"),
         h(Switch, {
           value: storage.answerQuestions !== false,
           onValueChange: (v) => { storage.answerQuestions = v; },
+          trackColor: { false: "#4e5058", true: C.accent },
+        })
+      ),
+
+      // Preview before send toggle
+      h(
+        View,
+        { style: Object.assign({}, card, { flexDirection: "row", alignItems: "center", justifyContent: "space-between" }) },
+        h(Text, { style: { color: C.text, fontSize: 15, flex: 1, paddingRight: 12 } }, "Preview before sending (Send / Edit / Cancel)"),
+        h(Switch, {
+          value: storage.previewBeforeSend !== false,
+          onValueChange: (v) => { storage.previewBeforeSend = v; },
           trackColor: { false: "#4e5058", true: C.accent },
         })
       ),
@@ -481,7 +546,7 @@
       h(
         View,
         { style: card },
-        h(Text, { style: title }, "Typing Duration (detik)"),
+        h(Text, { style: title }, "Typing Duration (seconds)"),
         h(TextInput, {
           style: input,
           value: duration,
@@ -540,7 +605,7 @@
         { style: card },
         h(Text, { style: title }, "Groq API Keys (" + keys.length + ")"),
         keys.length === 0
-          ? h(Text, { style: { color: C.muted, marginBottom: 10 } }, "Belum ada API key.")
+          ? h(Text, { style: { color: C.muted, marginBottom: 10 } }, "No API keys yet.")
           : keys.map((k) =>
               h(
                 View,
@@ -674,6 +739,7 @@
     if (!Array.isArray(storage.apiKeys)) storage.apiKeys = [];
     if (typeof storage.autoRewrite !== "boolean") storage.autoRewrite = false;
     if (typeof storage.answerQuestions !== "boolean") storage.answerQuestions = true;
+    if (typeof storage.previewBeforeSend !== "boolean") storage.previewBeforeSend = true;
     if (storage.typingDuration == null) storage.typingDuration = 3;
     if (!PERSONALITY_OPTIONS.includes(storage.personality)) storage.personality = "Casual/Slang";
     if (typeof storage.customPrompt !== "string") storage.customPrompt = "";
