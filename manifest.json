@@ -1,0 +1,12 @@
+{
+  "name": "Groq AI Control",
+  "description": "Rewrite your chat messages using Groq AI before sending them. Supports custom personalities and automatic typing indicator.",
+  "author": "Anonymous",
+  "main": "index.js",
+  "version": "1.0.0",
+  "id": "groq-ai-control",
+  "hash": "auto",
+  "vendetta": {
+    "icon": "robot"
+  }
+}
