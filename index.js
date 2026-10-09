@@ -371,7 +371,7 @@
   // Rewrites/answers `original`, shows the typing indicator, (optionally) shows a preview,
   // then waits the typing delay. Resolves with the text to send, or null if the user cancelled
   // / chose to edit first (the text is then placed back in the chat box).
-  async function produceFinalText(original, channelId) {
+  async function produceFinalText(original, channelId, textStaysInBox) {
     const preview = storage.previewBeforeSend !== false;
     const stopTyping = startTypingLoop(channelId);
     let finalText = original;
@@ -389,7 +389,11 @@
 
     if (preview) {
       const r = await showPreview(original, finalText);
-      if (r.action === "cancel") { putInInput(original); return null; }
+      if (r.action === "cancel") {
+        // When the send was intercepted before Discord cleared the box, the text is still there.
+        if (!textStaysInBox) putInInput(original);
+        return null;
+      }
       finalText = r.text || finalText;
       const stop2 = startTypingLoop(channelId);
       try {
@@ -438,7 +442,7 @@
     return true;
   }
 
-  // Fallback hook, only used when sendMessage cannot be patched.
+  // Chat-box hook: holds the send BEFORE Discord clears the input, so Cancel keeps the text.
   function patchChatInput() {
     if (!ChatInputModule || typeof ChatInputModule.handleSendMessage !== "function") {
       log("ChatInputModule.handleSendMessage not found");
@@ -463,7 +467,7 @@
         inFlight = true;
 
         (async () => {
-          const finalText = await produceFinalText(original, channelId);
+          const finalText = await produceFinalText(original, channelId, true);
           if (finalText === null) { inFlight = false; return; }
 
           try {
@@ -833,7 +837,10 @@
 
     try { patchSettingsScreen(); } catch (e) { log("settings patch error", e && e.message); }
     try {
-      if (!patchSendMessage()) patchChatInput();
+      // Hook the chat box first: a cancelled preview then leaves the typed text untouched.
+      // sendMessage stays hooked as a fallback for sends the chat-box hook can't read.
+      patchChatInput();
+      patchSendMessage();
     } catch (e) { log("input patch error", e && e.message); }
     try { registerGroqCommand(); } catch (e) { log("command error", e && e.message); }
   }
