@@ -1,4 +1,4 @@
-function () {
+(function () {
   "use strict";
 
   // ---------------------------------------------------------------------------
@@ -63,11 +63,7 @@ function () {
       baseline = custom || PERSONALITIES["Casual/Slang"];
     }
     const rules = storage.answerQuestions !== false ? ANSWER_RULES : REWRITE_RULES;
-    return EDITOR_RULES + "
-
-" + rules + "
-
-" + baseline;
+    return EDITOR_RULES + "\n\n" + rules + "\n\n" + baseline;
   }
 
   // Selectable chip row used by the settings page
@@ -138,12 +134,12 @@ function () {
   // Metro modules (resolved lazily so a miss never crashes the plugin)
   // ---------------------------------------------------------------------------
   const ChatInputModule =
-    metro.findByProps("handleSendMessage", "changeText") || 
-    metro.findByProps("handleSendMessage") || 
+    metro.findByProps("handleSendMessage", "changeText") ||
+    metro.findByProps("handleSendMessage") ||
     metro.find(m => m?.default?.render?.name === "ChatInput" || m?.ChatInput) ||
     null;
-    
-  // Updated text setters for Discord v348.10+ to directly look inside ChatInputModule methods
+
+  // Find available text setters (Discord v348.10+)
   const TextSetters = [
     ["changeText", ChatInputModule],
     ["setText", ChatInputModule],
@@ -151,7 +147,11 @@ function () {
     ["changeText", metro.findByProps("changeText")],
     ["setText", metro.findByProps("setText", "clearText")],
     ["setValue", metro.findByProps("setValue", "clearValue")]
-  ].filter((x) => x[1] && typeof x[1][x[0]] === "function");
+  ].filter(
+    ([method, module]) =>
+      module && typeof module[method] === "function"
+  );
+
 
   const TypingModule = metro.findByProps("sendTyping", "startTyping");
   const MessageModules = metro.findByProps("sendMessage", "receiveMessage");
@@ -459,7 +459,7 @@ function () {
           if (bypass || !storage.autoRewrite) return orig(...args);
           const msg = args[1];
           const content = msg && typeof msg.content === "string" ? msg.content : "";
-          
+
           // COMPREHENSIVE DISCORD COMMAND PROTECTION
           // Checks raw prefixes, built-in application objects, and message component types
           const isCommand = (
@@ -523,7 +523,7 @@ function () {
 
         const slot = findTextSlot(args);
         const original = slot ? String(slot.get() || "") : "";
-        
+
         // COMPREHENSIVE DISCORD COMMAND PROTECTION
         // Checks raw text prefix and structure layout fields for any built-in/application command objects
         const isCommand = (
@@ -935,4 +935,4 @@ function () {
   }
 
   return { onLoad, onUnload, settings: GroqSettingsPage };
-};
+});
