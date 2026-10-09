@@ -1,5 +1,4 @@
-
-(function () {
+function () {
   "use strict";
 
   // ---------------------------------------------------------------------------
@@ -64,7 +63,11 @@
       baseline = custom || PERSONALITIES["Casual/Slang"];
     }
     const rules = storage.answerQuestions !== false ? ANSWER_RULES : REWRITE_RULES;
-    return EDITOR_RULES + "\n\n" + rules + "\n\n" + baseline;
+    return EDITOR_RULES + "
+
+" + rules + "
+
+" + baseline;
   }
 
   // Selectable chip row used by the settings page
@@ -135,13 +138,21 @@
   // Metro modules (resolved lazily so a miss never crashes the plugin)
   // ---------------------------------------------------------------------------
   const ChatInputModule =
-    metro.findByProps("handleSendMessage", "changeText") || metro.findByProps("handleSendMessage") || null;
-  // Possible "put text into the chat box" helpers, depending on the Discord build
+    metro.findByProps("handleSendMessage", "changeText") || 
+    metro.findByProps("handleSendMessage") || 
+    metro.find(m => m?.default?.render?.name === "ChatInput" || m?.ChatInput) ||
+    null;
+    
+  // Updated text setters for Discord v348.10+ to directly look inside ChatInputModule methods
   const TextSetters = [
+    ["changeText", ChatInputModule],
+    ["setText", ChatInputModule],
+    ["insertText", ChatInputModule],
     ["changeText", metro.findByProps("changeText")],
-    ["insertText", metro.findByProps("insertText")],
     ["setText", metro.findByProps("setText", "clearText")],
-  ].filter((x) => x[1]);
+    ["setValue", metro.findByProps("setValue", "clearValue")]
+  ].filter((x) => x[1] && typeof x[1][x[0]] === "function");
+
   const TypingModule = metro.findByProps("sendTyping", "startTyping");
   const MessageModules = metro.findByProps("sendMessage", "receiveMessage");
   const SelectedChannelStore = metro.findByStoreName ? metro.findByStoreName("SelectedChannelStore") : null;
@@ -382,7 +393,7 @@
   function putInInput(text) {
     for (const [name, mod] of TextSetters) {
       try {
-        if (typeof mod[name] === "function") {
+        if (mod && typeof mod[name] === "function") {
           mod[name](text);
           log("restored text via", name);
           showToast("Message restored (" + name + ")");
@@ -448,7 +459,16 @@
           if (bypass || !storage.autoRewrite) return orig(...args);
           const msg = args[1];
           const content = msg && typeof msg.content === "string" ? msg.content : "";
-          if (!content.trim() || content.trim().startsWith("/") || getKeys().length === 0 || consumeMark(content)) {
+          
+          // COMPREHENSIVE DISCORD COMMAND PROTECTION
+          // Checks raw prefixes, built-in application objects, and message component types
+          const isCommand = (
+            content.trim().startsWith("/") ||
+            (msg && (msg.applicationCommand || msg.command || msg.interactionData || msg.type === 20)) ||
+            args.some(a => a && (a.applicationCommand || a.command || a.interactionType || a.type === 20))
+          );
+
+          if (!content.trim() || isCommand || getKeys().length === 0 || consumeMark(content)) {
             return orig(...args);
           }
           const channelId = args[0];
@@ -503,12 +523,20 @@
 
         const slot = findTextSlot(args);
         const original = slot ? String(slot.get() || "") : "";
+        
+        // COMPREHENSIVE DISCORD COMMAND PROTECTION
+        // Checks raw text prefix and structure layout fields for any built-in/application command objects
+        const isCommand = (
+          original.trim().startsWith("/") ||
+          args.some(a => a && (a.applicationCommand || a.command || a.interactionType || a.interactionData || a.type === 20))
+        );
+
         if (!slot) {
           const shape = describeArgs(args);
           log("handleSendMessage: no text found in args:", shape);
           if (!shapeReported) { shapeReported = true; showToast("Chat hook can't read text: " + shape); }
         }
-        if (!slot || !original.trim() || original.trim().startsWith("/") || getKeys().length === 0) {
+        if (!slot || !original.trim() || isCommand || getKeys().length === 0) {
           return orig(...args);
         }
 
@@ -520,7 +548,7 @@
           if (finalText === null) { inFlight = false; return; }
 
           try {
-            if (typeof ChatInputModule.changeText === "function") ChatInputModule.changeText(finalText);
+            if (ChatInputModule && typeof ChatInputModule.changeText === "function") ChatInputModule.changeText(finalText);
           } catch (e) {}
 
           try {
@@ -907,4 +935,4 @@
   }
 
   return { onLoad, onUnload, settings: GroqSettingsPage };
-})();
+};
