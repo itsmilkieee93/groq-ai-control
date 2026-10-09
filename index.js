@@ -133,7 +133,14 @@
   // ---------------------------------------------------------------------------
   // Metro modules (resolved lazily so a miss never crashes the plugin)
   // ---------------------------------------------------------------------------
-  const ChatInputModule = metro.findByProps("handleSendMessage", "changeText");
+  const ChatInputModule =
+    metro.findByProps("handleSendMessage", "changeText") || metro.findByProps("handleSendMessage") || null;
+  // Possible "put text into the chat box" helpers, depending on the Discord build
+  const TextSetters = [
+    ["changeText", metro.findByProps("changeText")],
+    ["insertText", metro.findByProps("insertText")],
+    ["setText", metro.findByProps("setText", "clearText")],
+  ].filter((x) => x[1]);
   const TypingModule = metro.findByProps("sendTyping", "startTyping");
   const MessageModules = metro.findByProps("sendMessage", "receiveMessage");
   const SelectedChannelStore = metro.findByStoreName ? metro.findByStoreName("SelectedChannelStore") : null;
@@ -372,10 +379,20 @@
   // Restores text into the chat box. changeText is not reliable on every Discord build,
   // so the text is also copied to the clipboard as a guaranteed way to never lose it.
   function putInInput(text) {
-    try {
-      if (ChatInputModule && typeof ChatInputModule.changeText === "function") ChatInputModule.changeText(text);
-    } catch (e) {}
-    if (copyText(text)) showToast("Message copied to clipboard");
+    for (const [name, mod] of TextSetters) {
+      try {
+        if (typeof mod[name] === "function") {
+          mod[name](text);
+          log("restored text via", name);
+          showToast("Message restored (" + name + ")");
+          return true;
+        }
+      } catch (e) {
+        log("text setter", name, "failed:", e && e.message);
+      }
+    }
+    if (copyText(text)) showToast("Chat box not reachable, message copied to clipboard");
+    return false;
   }
 
   // Rewrites/answers `original`, shows the typing indicator, (optionally) shows a preview,
@@ -471,7 +488,7 @@
 
   function patchChatInput() {
     if (!ChatInputModule || typeof ChatInputModule.handleSendMessage !== "function") {
-      log("ChatInputModule.handleSendMessage not found");
+      log("ChatInputModule.handleSendMessage not found; text setters:", TextSetters.map((x) => x[0]).join(",") || "none");
       return;
     }
     // NOTE: `instead` is used (not plain `before`) because the rewrite is asynchronous:
