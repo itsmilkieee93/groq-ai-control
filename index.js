@@ -139,19 +139,6 @@
     metro.find(m => m?.default?.render?.name === "ChatInput" || m?.ChatInput) ||
     null;
 
-  // Find available text setters (Discord v348.10+)
-  const TextSetters = [
-    ["changeText", ChatInputModule],
-    ["setText", ChatInputModule],
-    ["insertText", ChatInputModule],
-    ["changeText", metro.findByProps("changeText")],
-    ["setText", metro.findByProps("setText", "clearText")],
-    ["setValue", metro.findByProps("setValue", "clearValue")]
-  ].filter(
-    ([method, module]) =>
-      module && typeof module[method] === "function"
-  );
-
   const TypingModule = metro.findByProps("sendTyping", "startTyping");
   const MessageModules = metro.findByProps("sendMessage", "receiveMessage");
   const SelectedChannelStore = metro.findByStoreName ? metro.findByStoreName("SelectedChannelStore") : null;
@@ -247,6 +234,36 @@
   // ---------------------------------------------------------------------------
   // Chat input interception
   // ---------------------------------------------------------------------------
+  // Slash / app-command detection. On mobile a picked command shows as a chip, so the text
+  // box holds only the arguments (no leading "/"). The command info lives somewhere inside the
+  // send arguments instead, so scan them (a few levels deep) for any command marker.
+  const CMD_KEYS = [
+    "applicationCommand", "applicationCommandData", "command", "commandName", "commandId",
+    "interactionData", "interactionType", "interaction", "activeCommand", "commandOptions",
+  ];
+  function hasCommandMarker(v, depth, seen) {
+    try {
+      if (!v || typeof v !== "object" || depth > 3 || seen.has(v)) return false;
+      seen.add(v);
+      if (v.type === 20) return true; // CHAT_INPUT_COMMAND message type
+      const keys = Object.keys(v).slice(0, 40);
+      for (const k of keys) {
+        if (CMD_KEYS.indexOf(k) !== -1 && v[k]) return true;
+      }
+      for (const k of keys) {
+        const c = v[k];
+        if (c && typeof c === "object" && !Array.isArray(c) && hasCommandMarker(c, depth + 1, seen)) return true;
+      }
+    } catch (e) {}
+    return false;
+  }
+  function isSlashCommand(text, args) {
+    if (typeof text === "string" && /^[\s\u200b-\u200d\ufeff]*\//.test(text)) return true;
+    const seen = new Set();
+    for (const a of args || []) if (hasCommandMarker(a, 0, seen)) return true;
+    return false;
+  }
+
   function findTextSlot(args) {
     for (let i = 0; i < args.length; i++) {
       const a = args[i];
@@ -278,18 +295,19 @@
     try { return SelectedChannelStore ? SelectedChannelStore.getChannelId() : undefined; } catch (e) { return undefined; }
   }
 
-  // Preview dialog (Android Alert allows max 3 buttons): Send / Edit / Cancel.
-  // Resolves { action: "send" | "edit" | "cancel", text }.
+  // Preview sheet: Send / Edit (edit the AI response) / Copy prompt / Cancel.
+  // Resolves { action: "send" | "edit" | "cancel", text }. Cancel only closes the preview.
+  // "edit" only comes from the plain-Alert fallback (max 3 buttons), which has no text box.
   function PreviewSheet(props) {
     const { View, Text, TextInput, TouchableOpacity, ScrollView } = RN;
-    const { original, finalText, finish } = props;
+    const { original, finalText, finish, startEditing } = props;
     const C = { text: "#f2f3f5", muted: "#b5bac1", card: "#2b2d31", accent: "#5865f2", danger: "#da373c", neutral: "#4e5058" };
 
     // Swiping the sheet away counts as Cancel (also keeps the send queue from hanging)
     React.useEffect(() => () => finish({ action: "cancel", text: original }), []);
 
     const [text, setText] = React.useState(finalText);
-    const [editing, setEditing] = React.useState(false);
+    const [editing, setEditing] = React.useState(!!startEditing);
     const [kb, setKb] = React.useState(0);
 
     // Lift the whole sheet content above the keyboard so the text box stays visible
@@ -329,12 +347,13 @@
       ),
       btn("Send", C.accent, () => { if (!text.trim()) return; act("send", text)(); }, "send"),
       editing ? null : btn("Edit", C.neutral, () => setEditing(true), "edit"),
+      btn("Copy prompt", C.neutral, () => { showToast(copyText(original) ? "Prompt copied to clipboard" : "Couldn't copy to clipboard"); }, "copy"),
       btn("Cancel", C.danger, act("cancel", original), "cancel")
     );
     return ActionSheetComp ? h(ActionSheetComp, null, body) : body;
   }
 
-  function showPreview(original, finalText) {
+  function showPreview(original, finalText, startEditing) {
     if (ActionSheetModule && typeof ActionSheetModule.openLazy === "function") {
       return new Promise((resolve) => {
         let done = false;
@@ -343,30 +362,35 @@
           ActionSheetModule.openLazy(
             Promise.resolve({ default: PreviewSheet }),
             "GroqPreview",
-            { original, finalText, finish }
+            { original, finalText, finish, startEditing }
           );
         } catch (e) {
           log("action sheet failed, using alert:", e && e.message);
-          showAlertPreview(original, finalText).then(resolve);
+          showAlertPreview(original, finalText, startEditing).then(resolve);
         }
       });
     }
-    return showAlertPreview(original, finalText);
+    return showAlertPreview(original, finalText, startEditing);
   }
 
-  function showAlertPreview(original, finalText) {
+  function showAlertPreview(original, finalText, noEdit) {
     return new Promise((resolve) => {
       const Alert = RN.Alert;
       if (!Alert || typeof Alert.alert !== "function") return resolve({ action: "send", text: finalText });
       let done = false;
       const finish = (v) => { if (!done) { done = true; resolve(v); } };
+      // Edit needs a text box, which only the sheet has. If we are already coming from an
+      // Edit request and the sheet is unavailable, offer Copy prompt instead of a dead Edit.
+      const middle = noEdit
+        ? { text: "Copy prompt", onPress: () => { showToast(copyText(original) ? "Prompt copied to clipboard" : "Couldn't copy to clipboard"); finish({ action: "cancel", text: original }); } }
+        : { text: "Edit", onPress: () => finish({ action: "edit", text: finalText }) };
       try {
         Alert.alert(
           "Preview",
           finalText,
           [
             { text: "Send", onPress: () => finish({ action: "send", text: finalText }) },
-            { text: "Edit", onPress: () => finish({ action: "edit", text: finalText }) },
+            middle,
             { text: "Cancel", style: "cancel", onPress: () => finish({ action: "cancel", text: original }) },
           ],
           { cancelable: true, onDismiss: () => finish({ action: "cancel", text: original }) }
@@ -387,30 +411,9 @@
     return false;
   }
 
-  // Restores text into the chat box. changeText is not reliable on every Discord build,
-  // so the text is also copied to the clipboard as a guaranteed way to never lose it.
-  function putInInput(text) {
-    for (const [name, mod] of TextSetters) {
-      try {
-        // Make sure the [name, mod] pair resolves to a callable setter
-        if (mod && typeof mod[name] === "function") {
-          mod[name](text);
-          log("restored text via", name);
-          showToast("Message restored (" + name + ")");
-          return true;
-        }
-      } catch (e) {
-        log("text setter", name, "failed:", e && e.message);
-      }
-    }
-    if (copyText(text)) showToast("Chat box not reachable, message copied to clipboard");
-    return false;
-  }
-
   // Rewrites/answers `original`, shows the typing indicator, (optionally) shows a preview,
-  // then waits the typing delay. Resolves with the text to send, or null if the user cancelled
-  // / chose to edit first (the text is then placed back in the chat box).
-  async function produceFinalText(original, channelId, textStaysInBox) {
+  // then waits the typing delay. Resolves with the text to send, or null if the user cancelled.
+  async function produceFinalText(original, channelId) {
     const preview = storage.previewBeforeSend !== false;
     const stopTyping = startTypingLoop(channelId);
     let finalText = original;
@@ -427,12 +430,10 @@
     }
 
     if (preview) {
-      const r = await showPreview(original, finalText);
-      if (r.action === "cancel") {
-        // When the send was intercepted before Discord cleared the box, the text is still there.
-        if (!textStaysInBox) putInInput(original);
-        return null;
-      }
+      let r = await showPreview(original, finalText);
+      // Alert fallback "Edit": reopen the sheet straight in edit mode
+      if (r.action === "edit") r = await showPreview(original, r.text || finalText, true);
+      if (r.action === "cancel") return null; // Cancel just exits the preview
       finalText = r.text || finalText;
       const stop2 = startTypingLoop(channelId);
       try {
@@ -462,11 +463,7 @@
           const content = msg && typeof msg.content === "string" ? msg.content : "";
 
           // Strict check to detect every kind of app/bot command (Discord v348.10+)
-          const isCommand = (
-            content.trim().startsWith("/") ||
-            (msg && (msg.applicationCommand || msg.command || msg.interactionData || msg.type === 20)) ||
-            args.some(a => a && (a.applicationCommand || a.command || a.interactionType || a.interactionData || a.type === 20))
-          );
+          const isCommand = isSlashCommand(content, args);
 
           if (!content.trim() || isCommand || getKeys().length === 0 || consumeMark(content)) {
             return orig(...args);
@@ -524,10 +521,8 @@
         const original = slot ? String(slot.get() || "") : "";
 
         // Detect app commands at the chat-input level before sending
-        const isCommand = (
-          original.trim().startsWith("/") ||
-          args.some(a => a && (a.applicationCommand || a.command || a.interactionType || a.interactionData || a.type === 20))
-        );
+        const isCommand = isSlashCommand(original, args);
+        if (!shapeReported) { shapeReported = true; log("handleSendMessage args:", describeArgs(args), "| command:", isCommand); }
 
         if (!slot || !original.trim() || isCommand || getKeys().length === 0) {
           return orig(...args);
@@ -537,7 +532,7 @@
         inFlight = true;
 
         (async () => {
-          const finalText = await produceFinalText(original, channelId, true);
+          const finalText = await produceFinalText(original, channelId);
           if (finalText === null) { inFlight = false; return; }
 
           try {
@@ -692,7 +687,7 @@
       h(
         View,
         { style: Object.assign({}, card, { flexDirection: "row", alignItems: "center", justifyContent: "space-between" }) },
-        h(Text, { style: { color: C.text, fontSize: 15, flex: 1, paddingRight: 12 } }, "Preview before sending (Send / Edit / Cancel)"),
+        h(Text, { style: { color: C.text, fontSize: 15, flex: 1, paddingRight: 12 } }, "Preview before sending (Send / Edit / Copy prompt / Cancel)"),
         h(Switch, {
           value: storage.previewBeforeSend !== false,
           onValueChange: (v) => { storage.previewBeforeSend = v; },
