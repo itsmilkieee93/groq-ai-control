@@ -139,9 +139,26 @@
     metro.find(m => m?.default?.render?.name === "ChatInput" || m?.ChatInput) ||
     null;
 
+  // Find available text setters (Discord v348.10+)
+  const TextSetters = [
+    ["changeText", ChatInputModule],
+    ["setText", ChatInputModule],
+    ["insertText", ChatInputModule],
+    ["changeText", metro.findByProps("changeText")],
+    ["setText", metro.findByProps("setText", "clearText")],
+    ["setValue", metro.findByProps("setValue", "clearValue")]
+  ].filter(
+    ([method, module]) =>
+      module && typeof module[method] === "function"
+  );
+
   const TypingModule = metro.findByProps("sendTyping", "startTyping");
   const MessageModules = metro.findByProps("sendMessage", "receiveMessage");
   const SelectedChannelStore = metro.findByStoreName ? metro.findByStoreName("SelectedChannelStore") : null;
+  const MessageStore =
+    metro.findByProps("getMessage", "getMessages") ||
+    (metro.findByStoreName ? metro.findByStoreName("MessageStore") : null) ||
+    null;
 
   const ClipboardModule =
     metro.findByProps("setString", "getString") ||
@@ -160,9 +177,10 @@
   // ---------------------------------------------------------------------------
   // Groq networking with rotating API keys
   // ---------------------------------------------------------------------------
-  async function callGroq(apiKey, text) {
+  async function callGroq(apiKey, text, replyContext = "") {
     const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
     const timer = controller ? setTimeout(() => controller.abort(), 20000) : null;
+    const systemPrompt = buildSystemPrompt() + (replyContext ? "\n\n[Context: The user is replying to this message: \"" + replyContext + "\"]" : "");
     try {
       const res = await fetch(GROQ_URL, {
         method: "POST",
@@ -177,7 +195,7 @@
           include_reasoning: false,
           max_completion_tokens: 2048,
           messages: [
-            { role: "system", content: buildSystemPrompt() },
+            { role: "system", content: systemPrompt },
             { role: "user", content: text },
           ],
         }),
@@ -207,11 +225,11 @@
 
   // Tries each key in order. 429 / any network or API error -> next key.
   // All keys failed (or none set) -> original text is returned untouched.
-  async function rewriteText(text) {
+  async function rewriteText(text, replyContext = "") {
     const keys = getKeys();
     for (let i = 0; i < keys.length; i++) {
       try {
-        return await callGroq(keys[i], text);
+        return await callGroq(keys[i], text, replyContext);
       } catch (e) {
         log("key #" + (i + 1) + " failed:", e && (e.status || e.message));
         if (e && e.refused) return text; // other keys would decline too; keep the user's own text
@@ -293,6 +311,29 @@
       if (typeof a === "string" && /^\d{15,}$/.test(a)) return a;
     }
     try { return SelectedChannelStore ? SelectedChannelStore.getChannelId() : undefined; } catch (e) { return undefined; }
+  }
+
+  // Reply Context: when the user is replying to someone, look the original message up in
+  // Discord's local message cache so the AI can see what is being answered.
+  function findReplyRef(args) {
+    for (const a of args || []) {
+      if (!a || typeof a !== "object") continue;
+      const ref = a.messageReference || (a.message && a.message.messageReference);
+      if (ref && typeof ref === "object") return ref;
+    }
+    return null;
+  }
+
+  function getReplyContext(channelId, ref) {
+    try {
+      const messageId = ref && (ref.message_id || ref.messageId);
+      if (!messageId || !MessageStore || typeof MessageStore.getMessage !== "function") return "";
+      const target = MessageStore.getMessage(channelId, messageId);
+      const content = target && typeof target.content === "string" ? target.content.trim() : "";
+      return content.length > 500 ? content.slice(0, 500) + "…" : content;
+    } catch (e) {
+      return "";
+    }
   }
 
   // Preview sheet: Send / Edit (edit the AI response) / Copy prompt / Cancel.
@@ -413,12 +454,12 @@
 
   // Rewrites/answers `original`, shows the typing indicator, (optionally) shows a preview,
   // then waits the typing delay. Resolves with the text to send, or null if the user cancelled.
-  async function produceFinalText(original, channelId) {
+  async function produceFinalText(original, channelId, textStaysInBox, replyContext = "") {
     const preview = storage.previewBeforeSend !== false;
     const stopTyping = startTypingLoop(channelId);
     let finalText = original;
     try {
-      finalText = await rewriteText(original);
+      finalText = await rewriteText(original, replyContext);
       if (!preview) {
         const delay = getTypingMs();
         if (delay > 0) await sleep(delay);
@@ -470,8 +511,9 @@
           }
 
           const channelId = args[0];
+          const replyContext = getReplyContext(channelId, msg?.messageReference);
           const job = async () => {
-            const finalText = await produceFinalText(content, channelId);
+            const finalText = await produceFinalText(content, channelId, false, replyContext);
             if (finalText === null) return;
             const next = args.slice();
             next[1] = Object.assign({}, msg, { content: finalText });
@@ -529,10 +571,11 @@
         }
 
         const channelId = findChannelId(args);
+        const replyContext = getReplyContext(channelId, findReplyRef(args));
         inFlight = true;
 
         (async () => {
-          const finalText = await produceFinalText(original, channelId);
+          const finalText = await produceFinalText(original, channelId, true, replyContext);
           if (finalText === null) { inFlight = false; return; }
 
           try {
