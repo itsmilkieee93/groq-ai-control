@@ -152,7 +152,6 @@
       module && typeof module[method] === "function"
   );
 
-
   const TypingModule = metro.findByProps("sendTyping", "startTyping");
   const MessageModules = metro.findByProps("sendMessage", "receiveMessage");
   const SelectedChannelStore = metro.findByStoreName ? metro.findByStoreName("SelectedChannelStore") : null;
@@ -393,6 +392,7 @@
   function putInInput(text) {
     for (const [name, mod] of TextSetters) {
       try {
+        // Make sure the [name, mod] pair resolves to a callable setter
         if (mod && typeof mod[name] === "function") {
           mod[name](text);
           log("restored text via", name);
@@ -446,6 +446,7 @@
     return finalText;
   }
 
+
   // Primary auto-rewrite hook: every message the chat box sends goes through sendMessage.
   // `instead` + a returned promise holds the send until the AI text is ready, in order.
   function patchSendMessage() {
@@ -460,21 +461,21 @@
           const msg = args[1];
           const content = msg && typeof msg.content === "string" ? msg.content : "";
 
-          // COMPREHENSIVE DISCORD COMMAND PROTECTION
-          // Checks raw prefixes, built-in application objects, and message component types
+          // Strict check to detect every kind of app/bot command (Discord v348.10+)
           const isCommand = (
             content.trim().startsWith("/") ||
             (msg && (msg.applicationCommand || msg.command || msg.interactionData || msg.type === 20)) ||
-            args.some(a => a && (a.applicationCommand || a.command || a.interactionType || a.type === 20))
+            args.some(a => a && (a.applicationCommand || a.command || a.interactionType || a.interactionData || a.type === 20))
           );
 
           if (!content.trim() || isCommand || getKeys().length === 0 || consumeMark(content)) {
             return orig(...args);
           }
+
           const channelId = args[0];
           const job = async () => {
             const finalText = await produceFinalText(content, channelId);
-            if (finalText === null) return; // cancelled / sent back to the chat box for editing
+            if (finalText === null) return;
             const next = args.slice();
             next[1] = Object.assign({}, msg, { content: finalText });
             return orig(...next);
@@ -509,33 +510,25 @@
 
   function patchChatInput() {
     if (!ChatInputModule || typeof ChatInputModule.handleSendMessage !== "function") {
-      log("ChatInputModule.handleSendMessage not found; text setters:", TextSetters.map((x) => x[0]).join(",") || "none");
+      log("ChatInputModule.handleSendMessage not found");
       return;
     }
-    // NOTE: `instead` is used (not plain `before`) because the rewrite is asynchronous:
-    // the original send must be held back until Groq answers, then released.
     unpatches.push(
       instead("handleSendMessage", ChatInputModule, function (args, orig) {
         if (bypass || !storage.autoRewrite || inFlight) {
-          if (inFlight && !bypass) return; // swallow double-taps while rewriting
+          if (inFlight && !bypass) return;
           return orig(...args);
         }
 
         const slot = findTextSlot(args);
         const original = slot ? String(slot.get() || "") : "";
 
-        // COMPREHENSIVE DISCORD COMMAND PROTECTION
-        // Checks raw text prefix and structure layout fields for any built-in/application command objects
+        // Detect app commands at the chat-input level before sending
         const isCommand = (
           original.trim().startsWith("/") ||
           args.some(a => a && (a.applicationCommand || a.command || a.interactionType || a.interactionData || a.type === 20))
         );
 
-        if (!slot) {
-          const shape = describeArgs(args);
-          log("handleSendMessage: no text found in args:", shape);
-          if (!shapeReported) { shapeReported = true; showToast("Chat hook can't read text: " + shape); }
-        }
         if (!slot || !original.trim() || isCommand || getKeys().length === 0) {
           return orig(...args);
         }
@@ -548,7 +541,7 @@
           if (finalText === null) { inFlight = false; return; }
 
           try {
-            if (ChatInputModule && typeof ChatInputModule.changeText === "function") ChatInputModule.changeText(finalText);
+            if (typeof ChatInputModule.changeText === "function") ChatInputModule.changeText(finalText);
           } catch (e) {}
 
           try {
@@ -556,14 +549,12 @@
             bypass = true;
             orig(...args);
           } catch (e) {
-            log("send failed, retrying with original text", e && e.message);
             try { slot.set(original); orig(...args); } catch (e2) {}
           } finally {
             bypass = false;
             inFlight = false;
           }
         })();
-        // original call is held back; it is released above after rewriting
       })
     );
   }
