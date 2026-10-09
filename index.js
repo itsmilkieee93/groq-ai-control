@@ -138,6 +138,11 @@
   const MessageModules = metro.findByProps("sendMessage", "receiveMessage");
   const SelectedChannelStore = metro.findByStoreName ? metro.findByStoreName("SelectedChannelStore") : null;
 
+  const ClipboardModule =
+    metro.findByProps("setString", "getString") ||
+    (metro.common && metro.common.clipboard) ||
+    RN.Clipboard ||
+    null;
   const ActionSheetModule = metro.findByProps("openLazy", "hideActionSheet");
   const ASComponents = metro.findByProps("ActionSheet");
   const ActionSheetComp = ASComponents && ASComponents.ActionSheet;
@@ -258,15 +263,18 @@
   // Preview dialog (Android Alert allows max 3 buttons): Send / Edit / Cancel.
   // Resolves { action: "send" | "edit" | "cancel", text }.
   function PreviewSheet(props) {
-    const { View, Text, TouchableOpacity, ScrollView } = RN;
+    const { View, Text, TextInput, TouchableOpacity, ScrollView } = RN;
     const { original, finalText, finish } = props;
     const C = { text: "#f2f3f5", muted: "#b5bac1", card: "#2b2d31", accent: "#5865f2", danger: "#da373c", neutral: "#4e5058" };
 
     // Swiping the sheet away counts as Cancel (also keeps the send queue from hanging)
     React.useEffect(() => () => finish({ action: "cancel", text: original }), []);
 
+    const [text, setText] = React.useState(finalText);
+    const [editing, setEditing] = React.useState(false);
+
     const close = () => { try { ActionSheetModule.hideActionSheet(); } catch (e) {} };
-    const act = (action, text) => () => { finish({ action, text }); close(); };
+    const act = (action, t) => () => { finish({ action, text: t }); close(); };
     const btn = (label, bg, onPress, key) =>
       h(
         TouchableOpacity,
@@ -281,10 +289,18 @@
       h(
         View,
         { style: { backgroundColor: C.card, borderRadius: 10, padding: 12, maxHeight: 240 } },
-        h(ScrollView, null, h(Text, { selectable: true, style: { color: C.text, fontSize: 15 } }, finalText))
+        editing
+          ? h(TextInput, {
+              value: text,
+              onChangeText: setText,
+              multiline: true,
+              autoFocus: true,
+              style: { color: C.text, fontSize: 15, padding: 0, maxHeight: 216, textAlignVertical: "top" },
+            })
+          : h(ScrollView, null, h(Text, { selectable: true, style: { color: C.text, fontSize: 15 } }, text))
       ),
-      btn("Send", C.accent, act("send", finalText), "send"),
-      btn("Edit in chat box", C.neutral, act("edit", finalText), "edit"),
+      btn("Send", C.accent, () => { if (!text.trim()) return; act("send", text)(); }, "send"),
+      editing ? null : btn("Edit", C.neutral, () => setEditing(true), "edit"),
       btn("Cancel", C.danger, act("cancel", original), "cancel")
     );
     return ActionSheetComp ? h(ActionSheetComp, null, body) : body;
@@ -333,10 +349,23 @@
     });
   }
 
+  function copyText(text) {
+    try {
+      if (ClipboardModule && typeof ClipboardModule.setString === "function") {
+        ClipboardModule.setString(text);
+        return true;
+      }
+    } catch (e) {}
+    return false;
+  }
+
+  // Restores text into the chat box. changeText is not reliable on every Discord build,
+  // so the text is also copied to the clipboard as a guaranteed way to never lose it.
   function putInInput(text) {
     try {
       if (ChatInputModule && typeof ChatInputModule.changeText === "function") ChatInputModule.changeText(text);
     } catch (e) {}
+    if (copyText(text)) showToast("Message copied to clipboard");
   }
 
   // Rewrites/answers `original`, shows the typing indicator, (optionally) shows a preview,
@@ -361,7 +390,7 @@
     if (preview) {
       const r = await showPreview(original, finalText);
       if (r.action === "cancel") { putInInput(original); return null; }
-      if (r.action === "edit") { markOutput(r.text); putInInput(r.text); return null; }
+      finalText = r.text || finalText;
       const stop2 = startTypingLoop(channelId);
       try {
         const delay = getTypingMs();
