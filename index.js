@@ -1087,8 +1087,10 @@
       if (t && typeof t.target === "object" && typeof t.target.value === "string") return t.target.value;
       return t == null ? "" : String(t);
     };
+
+    const switchRow = (label, value, onValueChange, subLabel) =>
       native
-        ? h(FormSwitchRow, { label, subLabel, value: !!value, onValueChange })
+        ? h(FormSwitchRow, { label: label, subLabel: subLabel, value: !!value, onValueChange: onValueChange })
         : h(View, null, h(Text, null, label));
 
     const divider = () => (native ? h(FormDivider) : null);
