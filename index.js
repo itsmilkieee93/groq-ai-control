@@ -159,6 +159,10 @@
     metro.findByProps("getMessage", "getMessages") ||
     (metro.findByStoreName ? metro.findByStoreName("MessageStore") : null) ||
     null;
+  const UserStore =
+    (metro.findByStoreName ? metro.findByStoreName("UserStore") : null) ||
+    metro.findByProps("getCurrentUser") ||
+    null;
 
   const ClipboardModule =
     metro.findByProps("setString", "getString") ||
@@ -180,7 +184,7 @@
   async function callGroq(apiKey, text, replyContext = "") {
     const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
     const timer = controller ? setTimeout(() => controller.abort(), 20000) : null;
-    const systemPrompt = buildSystemPrompt() + (replyContext ? "\n\nContext: The user is actively replying to this specific message in the chat: \"" + replyContext + "\". Use that message only as context. Still output only the final chat message." : "");
+    const systemPrompt = buildSystemPrompt() + (replyContext ? "\n\n" + replyContext : "");
     try {
       const res = await fetch(GROQ_URL, {
         method: "POST",
@@ -338,14 +342,47 @@
     );
   }
 
-  function getReplyContext(channelId, ref) {
+  function identityOf(user) {
+    if (!user || typeof user !== "object") return { id: "", username: "", globalName: "" };
+    const id = user.id || user.userId || user.user_id || "";
+    const username = user.username || user.tag || "";
+    const globalName = user.globalName || user.global_name || user.displayName || "";
+    return {
+      id: id ? String(id) : "",
+      username: username ? String(username) : "",
+      globalName: globalName ? String(globalName) : "",
+    };
+  }
+
+  function authorOf(msg) {
+    if (!msg || typeof msg !== "object") return { id: "", username: "", globalName: "" };
+    const who = identityOf(msg.author || msg.user || msg.member || msg);
+    if (!who.id) who.id = String(msg.authorId || msg.author_id || msg.userId || msg.user_id || "");
+    return who;
+  }
+
+  function getSelfIdentity() {
+    try {
+      const user = UserStore && typeof UserStore.getCurrentUser === "function"
+        ? UserStore.getCurrentUser()
+        : null;
+      return identityOf(user);
+    } catch (e) {
+      return { id: "", username: "", globalName: "" };
+    }
+  }
+
+  function looksLikeMessage(v) {
+    return !!(v && typeof v === "object" && (typeof v.content === "string" || v.author || v.id || v.message_id));
+  }
+
+  function messageFromStore(channelId, ref) {
     try {
       const messageId = ref && (ref.message_id || ref.messageId);
-      if (!messageId || !MessageStore || typeof MessageStore.getMessage !== "function") return "";
-      const target = MessageStore.getMessage(channelId, messageId);
-      return textOfMessage(target);
+      if (!messageId || !MessageStore || typeof MessageStore.getMessage !== "function") return null;
+      return MessageStore.getMessage(channelId, messageId) || null;
     } catch (e) {
-      return "";
+      return null;
     }
   }
 
@@ -355,20 +392,20 @@
     const seen = new Set();
     function walk(v, depth) {
       try {
-        if (!v || typeof v !== "object" || depth > 5 || seen.has(v)) return "";
+        if (!v || typeof v !== "object" || depth > 5 || seen.has(v)) return null;
         seen.add(v);
-        const direct =
-          textOfMessage(v.referencedMessage) ||
-          textOfMessage(v.referenced_message) ||
-          textOfMessage(v.replyingTo) ||
-          textOfMessage(v.replyTo) ||
-          textOfMessage(v.messageReply);
-        if (direct) return direct;
+        const direct = [
+          v.referencedMessage,
+          v.referenced_message,
+          v.replyingTo,
+          v.replyTo,
+          v.messageReply,
+        ];
         if (v.message && typeof v.message === "object") {
-          const nested =
-            textOfMessage(v.message.referencedMessage) ||
-            textOfMessage(v.message.referenced_message);
-          if (nested) return nested;
+          direct.push(v.message.referencedMessage, v.message.referenced_message);
+        }
+        for (let i = 0; i < direct.length; i++) {
+          if (looksLikeMessage(direct[i])) return direct[i];
         }
         const keys = Object.keys(v).slice(0, 40);
         for (let i = 0; i < keys.length; i++) {
@@ -379,7 +416,7 @@
           }
         }
       } catch (e) {}
-      return "";
+      return null;
     }
     try {
       for (const a of args || []) {
@@ -389,11 +426,11 @@
     } catch (e) {
       log("Gagal mengekstrak pesan reply:", e);
     }
-    return "";
+    return null;
   }
 
   let PendingReplyStore = null;
-  function getPendingReplyText(channelId) {
+  function getPendingReplyMessage(channelId) {
     try {
       if (!PendingReplyStore) {
         PendingReplyStore =
@@ -405,21 +442,51 @@
           metro.findByProps("createPendingReply", "deletePendingReply") ||
           null;
       }
-      if (!PendingReplyStore || typeof PendingReplyStore.getPendingReply !== "function") return "";
+      if (!PendingReplyStore || typeof PendingReplyStore.getPendingReply !== "function") return null;
       const reply = PendingReplyStore.getPendingReply(channelId);
-      if (!reply) return "";
-      return textOfMessage(reply.message) || textOfMessage(reply.referencedMessage) || textOfMessage(reply);
+      if (!reply) return null;
+      return reply.message || reply.referencedMessage || reply.referenced_message || reply;
     } catch (e) {
-      return "";
+      return null;
     }
   }
 
-  function resolveReplyContext(channelId, args, explicitRef) {
-    const fromArgs = extractReplyMessage(args);
-    if (fromArgs) return fromArgs;
-    const fromStore = getReplyContext(channelId, explicitRef || findReplyRef(args));
-    if (fromStore) return fromStore;
-    return getPendingReplyText(channelId);
+  function resolveReplyInfo(channelId, args, explicitRef) {
+    const msg =
+      extractReplyMessage(args) ||
+      messageFromStore(channelId, explicitRef || findReplyRef(args)) ||
+      getPendingReplyMessage(channelId);
+    if (!msg) return null;
+    const who = authorOf(msg);
+    return {
+      text: textOfMessage(msg),
+      id: who.id,
+      username: who.username,
+      globalName: who.globalName,
+    };
+  }
+
+  function formatContext(reply) {
+    const self = getSelfIdentity();
+    const lines = [
+      "This is Discord. You are writing the outgoing Discord chat message for this speaker:",
+      "- discord_user_id: " + (self.id || "unknown"),
+      "- discord_username: " + (self.username || "unknown"),
+      "- discord_global_name: " + (self.globalName || "unknown"),
+    ];
+    if (reply && (reply.text || reply.id || reply.username || reply.globalName)) {
+      lines.push("The speaker is replying to this Discord message:");
+      lines.push("- reply_discord_user_id: " + (reply.id || "unknown"));
+      lines.push("- reply_discord_username: " + (reply.username || "unknown"));
+      lines.push("- reply_discord_global_name: " + (reply.globalName || "unknown"));
+      if (reply.text) lines.push("- reply_message: \"" + reply.text.replace(/"/g, "'") + "\"");
+    }
+    lines.push("These are Discord user IDs, usernames, and global names. Use them only as context. Output only the final chat message.");
+    return lines.join("\n");
+  }
+
+  function buildPayloadContext(channelId, args, explicitRef) {
+    return formatContext(resolveReplyInfo(channelId, args, explicitRef));
   }
 
   // Preview sheet: Send / Edit (edit the AI response) / Copy prompt / Cancel.
@@ -597,9 +664,9 @@
           }
 
           const channelId = args[0];
-          // Swipe-to-reply: read the quoted message off the send args, not MessageStore.
-          const replyContext = resolveReplyContext(channelId, args, msg && msg.messageReference);
-          if (replyContext) log("reply context:", replyContext.slice(0, 80));
+          // Swipe-to-reply: quoted message + both speakers' username/global name.
+          const replyContext = buildPayloadContext(channelId, args, msg && msg.messageReference);
+          log("payload context:", replyContext.replace(/\n/g, " | ").slice(0, 180));
           const job = async () => {
             const finalText = await produceFinalText(content, channelId, false, replyContext);
             if (finalText === null) return;
@@ -659,8 +726,8 @@
         }
 
         const channelId = findChannelId(args);
-        const replyContext = resolveReplyContext(channelId, args, findReplyRef(args));
-        if (replyContext) log("reply context:", replyContext.slice(0, 80));
+        const replyContext = buildPayloadContext(channelId, args, findReplyRef(args));
+        log("payload context:", replyContext.replace(/\n/g, " | ").slice(0, 180));
         inFlight = true;
 
         (async () => {
@@ -714,7 +781,7 @@
         const channelId = ctx && ctx.channel ? ctx.channel.id : undefined;
         if (!original.trim()) return;
 
-        const finalText = await produceFinalText(original, channelId);
+        const finalText = await produceFinalText(original, channelId, false, formatContext(null));
         if (finalText === null) return;
 
         try {
