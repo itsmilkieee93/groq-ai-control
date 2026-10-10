@@ -1116,7 +1116,7 @@
 
   function GroqSettingsPage() {
     useProxy(storage);
-    const { ScrollView, Text, View, TextInput } = RN;
+    const { ScrollView, Text, View, TextInput, TouchableOpacity } = RN;
     const Table = metro.findByProps("TableRowGroup", "TableSwitchRow", "TableRow") || {};
     const TableRowGroup = Table.TableRowGroup;
     const TableSwitchRow = Table.TableSwitchRow;
@@ -1151,7 +1151,7 @@
 
     const addKey = () => {
       const k = newKey.trim();
-      if (!k.startsWith("gsk_")) return showToast("API key must start with gsk_");
+      if (!k.startsWith("gsk_")) return showToast("API key must start with gsk_ 😊");
       const list = Array.isArray(storage.apiKeys) ? storage.apiKeys : [];
       if (list.some((x) => x && x.key === k)) return showToast("Key already added");
       const nextId = list.reduce((m, x) => Math.max(m, (x && x.id) || 0), 0) + 1;
@@ -1160,6 +1160,32 @@
     };
     const removeKey = (id) => {
       storage.apiKeys = (storage.apiKeys || []).filter((x) => x && x.id !== id);
+    };
+    const confirmRemoveKey = (k) => {
+      const title = "Delete API key?";
+      const body = "Key #" + k.id + " (" + mask(k.key) + ") will be removed. This can't be undone.";
+      try {
+        const alerts = vendetta.ui && vendetta.ui.alerts;
+        if (alerts && typeof alerts.showConfirmationAlert === "function") {
+          alerts.showConfirmationAlert({
+            title: title,
+            content: body,
+            confirmText: "Delete",
+            confirmColor: "red",
+            cancelText: "Cancel",
+            onConfirm: () => removeKey(k.id),
+          });
+          return;
+        }
+      } catch (e) {}
+      try {
+        RN.Alert.alert(title, body, [
+          { text: "Cancel", style: "cancel" },
+          { text: "Delete", style: "destructive", onPress: () => removeKey(k.id) },
+        ]);
+      } catch (e) {
+        removeKey(k.id);
+      }
     };
     const mask = (k) => (k.length > 12 ? k.slice(0, 8) + "…" + k.slice(-4) : k);
     const keys = Array.isArray(storage.apiKeys) ? storage.apiKeys : [];
@@ -1173,6 +1199,23 @@
     }
 
     const group = (title, rows) => h(TableRowGroup, { title: title }, rows.filter(Boolean));
+
+    // Discord-style filled button (green = success, red = danger).
+    const GREEN = "#248046";
+    const RED = "#da373c";
+    const button = (label, bg, onPress, small) =>
+      h(TouchableOpacity, {
+        onPress: onPress,
+        activeOpacity: 0.8,
+        style: {
+          backgroundColor: bg,
+          borderRadius: 8,
+          paddingVertical: small ? 8 : 12,
+          paddingHorizontal: small ? 16 : 20,
+          alignItems: "center",
+          justifyContent: "center",
+        },
+      }, h(Text, { style: { color: "#ffffff", fontWeight: "700", fontSize: small ? 14 : 15 } }, label));
 
     // Labelled text field drawn as a real input box (own column/row), not bare text.
     const P = getPalette();
@@ -1259,23 +1302,22 @@
       : null;
 
     const body = [
-      group("General", [
+      group("General ⚙️", [
         sw("Auto-rewrite all messages", storage.autoRewrite, (v) => { storage.autoRewrite = v; }, "No /groq needed"),
         sw("Auto-answer questions", storage.answerQuestions !== false, (v) => { storage.answerQuestions = v; }, "Math, translations, and other answers"),
         sw("Preview before sending", storage.previewBeforeSend !== false, (v) => { storage.previewBeforeSend = v; }, "Send / Edit / Copy prompt / Cancel"),
       ]),
-      group("Timing", [durationRow]),
-      group("AI Model", MODELS.map((m) => pick(m.replace("openai/", ""), m === model, () => { storage.model = m; }))),
-      group("AI Personality", [
+      group("Timing ⏱️", [durationRow]),
+      group("AI Model 🧠", MODELS.map((m) => pick(m.replace("openai/", ""), m === model, () => { storage.model = m; }))),
+      group("AI Personality 🎨", [
         ...PERSONALITY_OPTIONS.map((opt) => pick(opt, opt === personality, () => { storage.personality = opt; })),
         customField,
       ]),
-      group("Groq API Keys", [
+      group("Groq API Keys 🔑", [
         keys.length === 0 ? h(TableRow, { label: "No API keys yet" }) : null,
         ...keys.map((k) => h(TableRow, {
           label: "#" + k.id + "  " + mask(k.key),
-          trailing: h(Text, { style: { color: "#da373c", fontWeight: "600" } }, "Delete"),
-          onPress: () => removeKey(k.id),
+          trailing: button("Delete", RED, () => confirmRemoveKey(k), true),
         })),
         h(View, { style: { paddingHorizontal: 16, paddingVertical: 12, backgroundColor: ROW_BG } },
           inputField("New API key", {
@@ -1287,7 +1329,9 @@
             onSubmitEditing: addKey,
           })
         ),
-        h(TableRow, { label: "Add API key", onPress: addKey }),
+        h(View, { style: { paddingHorizontal: 16, paddingBottom: 16, paddingTop: 4, backgroundColor: ROW_BG } },
+          button("Add API key", GREEN, addKey, false)
+        ),
       ]),
     ];
 
