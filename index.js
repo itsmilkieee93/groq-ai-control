@@ -155,14 +155,6 @@
   const TypingModule = metro.findByProps("sendTyping", "startTyping");
   const MessageModules = metro.findByProps("sendMessage", "receiveMessage");
   const SelectedChannelStore = metro.findByStoreName ? metro.findByStoreName("SelectedChannelStore") : null;
-  const MessageStore =
-    metro.findByProps("getMessage", "getMessages") ||
-    (metro.findByStoreName ? metro.findByStoreName("MessageStore") : null) ||
-    null;
-  const UserStore =
-    (metro.findByStoreName ? metro.findByStoreName("UserStore") : null) ||
-    metro.findByProps("getCurrentUser") ||
-    null;
 
   const ClipboardModule =
     metro.findByProps("setString", "getString") ||
@@ -375,177 +367,291 @@
     try { return SelectedChannelStore ? SelectedChannelStore.getChannelId() : undefined; } catch (e) { return undefined; }
   }
 
-  // Reply Context: when the user is replying to someone, look the original message up in
-  // Discord's local message cache so the AI can see what is being answered.
-  function findReplyRef(args) {
-    for (const a of args || []) {
-      if (!a || typeof a !== "object") continue;
-      const ref = a.messageReference || (a.message && a.message.messageReference);
-      if (ref && typeof ref === "object") return ref;
+  // Bot embeds, forwarded snapshots, and swipe-reply context.
+  // Inlined: Kettu only evals this one file, so a separate import cannot load.
+  function createReplyContext({ metro, log }) {
+    const MessageStore =
+      metro.findByProps("getMessage", "getMessages") ||
+      (metro.findByStoreName ? metro.findByStoreName("MessageStore") : null) ||
+      null;
+    const UserStore =
+      (metro.findByStoreName ? metro.findByStoreName("UserStore") : null) ||
+      metro.findByProps("getCurrentUser") ||
+      null;
+
+    let PendingReplyStore = null;
+
+    function clipReply(content) {
+      const text = typeof content === "string" ? content.trim() : "";
+      if (!text) return "";
+      return text.length > 900 ? text.slice(0, 900) + "…" : text;
     }
-    return null;
-  }
 
-  function clipReply(content) {
-    const text = typeof content === "string" ? content.trim() : "";
-    if (!text) return "";
-    return text.length > 500 ? text.slice(0, 500) + "…" : text;
-  }
-
-  function textOfMessage(msg) {
-    if (!msg || typeof msg !== "object") return "";
-    return clipReply(
-      typeof msg.content === "string" ? msg.content :
-      typeof msg.text === "string" ? msg.text : ""
-    );
-  }
-
-  function identityOf(user) {
-    if (!user || typeof user !== "object") return { id: "", username: "", globalName: "" };
-    const id = user.id || user.userId || user.user_id || "";
-    const username = user.username || user.tag || "";
-    const globalName = user.globalName || user.global_name || user.displayName || "";
-    return {
-      id: id ? String(id) : "",
-      username: username ? String(username) : "",
-      globalName: globalName ? String(globalName) : "",
-    };
-  }
-
-  function authorOf(msg) {
-    if (!msg || typeof msg !== "object") return { id: "", username: "", globalName: "" };
-    const who = identityOf(msg.author || msg.user || msg.member || msg);
-    if (!who.id) who.id = String(msg.authorId || msg.author_id || msg.userId || msg.user_id || "");
-    return who;
-  }
-
-  function getSelfIdentity() {
-    try {
-      const user = UserStore && typeof UserStore.getCurrentUser === "function"
-        ? UserStore.getCurrentUser()
-        : null;
-      return identityOf(user);
-    } catch (e) {
-      return { id: "", username: "", globalName: "" };
+    function pushPart(parts, value) {
+      const text = typeof value === "string" ? value.trim() : "";
+      if (text) parts.push(text);
     }
-  }
 
-  function looksLikeMessage(v) {
-    return !!(v && typeof v === "object" && (typeof v.content === "string" || v.author || v.id || v.message_id));
-  }
-
-  function messageFromStore(channelId, ref) {
-    try {
-      const messageId = ref && (ref.message_id || ref.messageId);
-      if (!messageId || !MessageStore || typeof MessageStore.getMessage !== "function") return null;
-      return MessageStore.getMessage(channelId, messageId) || null;
-    } catch (e) {
-      return null;
+    function embedText(embed, parts) {
+      if (!embed || typeof embed !== "object") return;
+      pushPart(parts, embed.title || embed.rawTitle);
+      pushPart(parts, embed.description || embed.rawDescription);
+      const author = embed.author;
+      if (author) pushPart(parts, typeof author === "string" ? author : author.name);
+      const fields = Array.isArray(embed.fields) ? embed.fields : [];
+      for (let i = 0; i < fields.length && i < 12; i++) {
+        const field = fields[i];
+        if (!field) continue;
+        const name = String(field.name || field.rawName || "").trim();
+        const value = String(field.value || field.rawValue || "").trim();
+        if (name && value) parts.push(name + ": " + value);
+        else pushPart(parts, name || value);
+      }
+      const footer = embed.footer;
+      if (footer) pushPart(parts, typeof footer === "string" ? footer : footer.text);
     }
-  }
 
-  // Discord v348.10 often blocks MessageStore.getMessage outside the React tree.
-  // Swipe-to-reply still attaches the quoted message on the send payload, so read that first.
-  function extractReplyMessage(args) {
-    const seen = new Set();
-    function walk(v, depth) {
-      try {
-        if (!v || typeof v !== "object" || depth > 5 || seen.has(v)) return null;
-        seen.add(v);
-        const direct = [
-          v.referencedMessage,
-          v.referenced_message,
-          v.replyingTo,
-          v.replyTo,
-          v.messageReply,
-        ];
-        if (v.message && typeof v.message === "object") {
-          direct.push(v.message.referencedMessage, v.message.referenced_message);
-        }
-        for (let i = 0; i < direct.length; i++) {
-          if (looksLikeMessage(direct[i])) return direct[i];
-        }
-        const keys = Object.keys(v).slice(0, 40);
-        for (let i = 0; i < keys.length; i++) {
-          const child = v[keys[i]];
-          if (child && typeof child === "object") {
-            const hit = walk(child, depth + 1);
-            if (hit) return hit;
+    function componentLabels(components, parts, depth) {
+      if (!Array.isArray(components) || depth > 3) return;
+      for (let i = 0; i < components.length && i < 16; i++) {
+        const c = components[i];
+        if (!c || typeof c !== "object") continue;
+        pushPart(parts, c.label || c.placeholder);
+        if (Array.isArray(c.components)) componentLabels(c.components, parts, depth + 1);
+        if (Array.isArray(c.options)) {
+          for (let j = 0; j < c.options.length && j < 8; j++) {
+            pushPart(parts, c.options[j] && c.options[j].label);
           }
         }
-      } catch (e) {}
-      return null;
+      }
     }
-    try {
+
+    function snapshotMessages(msg) {
+      const snaps = msg && (msg.messageSnapshots || msg.message_snapshots || msg.snapshots);
+      if (!Array.isArray(snaps)) return [];
+      const out = [];
+      for (let i = 0; i < snaps.length && i < 3; i++) {
+        const snap = snaps[i];
+        if (snap && typeof snap === "object") out.push(snap.message || snap);
+      }
+      return out;
+    }
+
+    function isForwardedMessage(msg) {
+      if (!msg || typeof msg !== "object") return false;
+      if (msg.messageSnapshots || msg.message_snapshots) return true;
+      const ref = msg.messageReference || msg.message_reference;
+      return !!(ref && (ref.type === 1 || ref.type === "FORWARD"));
+    }
+
+    function isBotMessage(msg) {
+      if (!msg || typeof msg !== "object") return false;
+      const author = msg.author || msg.user || {};
+      return !!(author.bot || author.isBot || msg.bot || msg.webhookId || msg.webhook_id);
+    }
+
+    function textOfMessage(msg, depth) {
+      if (!msg || typeof msg !== "object") return "";
+      const level = depth || 0;
+      if (level > 2) return "";
+      const parts = [];
+      const content = typeof msg.content === "string" ? msg.content : typeof msg.text === "string" ? msg.text : "";
+      pushPart(parts, content);
+      const embeds = Array.isArray(msg.embeds) ? msg.embeds : msg.embed ? [msg.embed] : [];
+      for (let i = 0; i < embeds.length && i < 3; i++) embedText(embeds[i], parts);
+      componentLabels(msg.components, parts, 0);
+      const attachments = Array.isArray(msg.attachments) ? msg.attachments : [];
+      if (attachments.length) {
+        const names = [];
+        for (let i = 0; i < attachments.length && i < 4; i++) {
+          const name = attachments[i] && (attachments[i].filename || attachments[i].name);
+          if (name) names.push(name);
+        }
+        if (names.length) parts.push("attachments: " + names.join(", "));
+      }
+      const snaps = snapshotMessages(msg);
+      for (let i = 0; i < snaps.length; i++) {
+        const inner = textOfMessage(snaps[i], level + 1);
+        if (inner) parts.push("forwarded: " + inner);
+      }
+      return clipReply(parts.join(" | "));
+    }
+
+    function identityOf(user) {
+      if (!user || typeof user !== "object") return { id: "", username: "", globalName: "" };
+      const id = user.id || user.userId || user.user_id || "";
+      const username = user.username || user.tag || "";
+      const globalName = user.globalName || user.global_name || user.displayName || "";
+      return {
+        id: id ? String(id) : "",
+        username: username ? String(username) : "",
+        globalName: globalName ? String(globalName) : "",
+      };
+    }
+
+    function authorOf(msg) {
+      if (!msg || typeof msg !== "object") return { id: "", username: "", globalName: "" };
+      const who = identityOf(msg.author || msg.user || msg.member || msg);
+      if (!who.id) who.id = String(msg.authorId || msg.author_id || msg.userId || msg.user_id || "");
+      return who;
+    }
+
+    function getSelfIdentity() {
+      try {
+        const user = UserStore && typeof UserStore.getCurrentUser === "function"
+          ? UserStore.getCurrentUser()
+          : null;
+        return identityOf(user);
+      } catch (e) {
+        return { id: "", username: "", globalName: "" };
+      }
+    }
+
+    function looksLikeMessage(v) {
+      if (!v || typeof v !== "object" || Array.isArray(v)) return false;
+      if (typeof v.content === "string") return true;
+      if (v.embeds || v.embed || v.messageSnapshots || v.message_snapshots) return true;
+      const author = v.author || v.user;
+      if (author && (author.id || author.username || author.bot)) return true;
+      if (v.id && (v.channel_id || v.channelId || v.timestamp || v.components || v.message_id)) return true;
+      return false;
+    }
+
+    function findReplyRef(args) {
       for (const a of args || []) {
-        const hit = walk(a, 0);
-        if (hit) return hit;
+        if (!a || typeof a !== "object") continue;
+        const ref = a.messageReference || (a.message && a.message.messageReference);
+        if (ref && typeof ref === "object") return ref;
       }
-    } catch (e) {
-      log("Gagal mengekstrak pesan reply:", e);
-    }
-    return null;
-  }
-
-  let PendingReplyStore = null;
-  function getPendingReplyMessage(channelId) {
-    try {
-      if (!PendingReplyStore) {
-        PendingReplyStore =
-          (metro.findByStoreName && (
-            metro.findByStoreName("PendingReplyStore") ||
-            metro.findByStoreName("ReplyStore")
-          )) ||
-          metro.findByProps("getPendingReply") ||
-          metro.findByProps("createPendingReply", "deletePendingReply") ||
-          null;
-      }
-      if (!PendingReplyStore || typeof PendingReplyStore.getPendingReply !== "function") return null;
-      const reply = PendingReplyStore.getPendingReply(channelId);
-      if (!reply) return null;
-      return reply.message || reply.referencedMessage || reply.referenced_message || reply;
-    } catch (e) {
       return null;
     }
-  }
 
-  function resolveReplyInfo(channelId, args, explicitRef) {
-    const msg =
-      extractReplyMessage(args) ||
-      messageFromStore(channelId, explicitRef || findReplyRef(args)) ||
-      getPendingReplyMessage(channelId);
-    if (!msg) return null;
-    const who = authorOf(msg);
-    return {
-      text: textOfMessage(msg),
-      id: who.id,
-      username: who.username,
-      globalName: who.globalName,
-    };
-  }
-
-  function formatContext(reply) {
-    const self = getSelfIdentity();
-    const lines = [
-      "This is Discord. You are writing the outgoing Discord chat message for this speaker:",
-      "- discord_user_id: " + (self.id || "unknown"),
-      "- discord_username: " + (self.username || "unknown"),
-      "- discord_global_name: " + (self.globalName || "unknown"),
-    ];
-    if (reply && (reply.text || reply.id || reply.username || reply.globalName)) {
-      lines.push("The speaker is replying to this Discord message:");
-      lines.push("- reply_discord_user_id: " + (reply.id || "unknown"));
-      lines.push("- reply_discord_username: " + (reply.username || "unknown"));
-      lines.push("- reply_discord_global_name: " + (reply.globalName || "unknown"));
-      if (reply.text) lines.push("- reply_message: \"" + reply.text.replace(/"/g, "'") + "\"");
+    function messageFromStore(channelId, ref) {
+      try {
+        const messageId = ref && (ref.message_id || ref.messageId);
+        if (!messageId || !MessageStore || typeof MessageStore.getMessage !== "function") return null;
+        return MessageStore.getMessage(channelId, messageId) || null;
+      } catch (e) {
+        return null;
+      }
     }
-    lines.push("These are Discord user IDs, usernames, and global names. Use them only as context. Output only the final chat message.");
-    return lines.join("\n");
+
+    function extractReplyMessage(args) {
+      const seen = new Set();
+      function walk(v, depth) {
+        try {
+          if (!v || typeof v !== "object" || depth > 5 || seen.has(v)) return null;
+          seen.add(v);
+          const direct = [
+            v.referencedMessage,
+            v.referenced_message,
+            v.replyingTo,
+            v.replyTo,
+            v.messageReply,
+          ];
+          if (v.message && typeof v.message === "object") {
+            direct.push(v.message.referencedMessage, v.message.referenced_message);
+          }
+          const snaps = snapshotMessages(v);
+          for (let i = 0; i < snaps.length; i++) direct.push(snaps[i]);
+          for (let i = 0; i < direct.length; i++) {
+            if (looksLikeMessage(direct[i])) return direct[i];
+          }
+          const keys = Object.keys(v).slice(0, 40);
+          for (let i = 0; i < keys.length; i++) {
+            const child = v[keys[i]];
+            if (child && typeof child === "object") {
+              const hit = walk(child, depth + 1);
+              if (hit) return hit;
+            }
+          }
+        } catch (e) {}
+        return null;
+      }
+      try {
+        for (const a of args || []) {
+          const hit = walk(a, 0);
+          if (hit) return hit;
+        }
+      } catch (e) {
+        log("Gagal mengekstrak pesan reply:", e);
+      }
+      return null;
+    }
+
+    function getPendingReplyMessage(channelId) {
+      try {
+        if (!PendingReplyStore) {
+          PendingReplyStore =
+            (metro.findByStoreName && (
+              metro.findByStoreName("PendingReplyStore") ||
+              metro.findByStoreName("ReplyStore")
+            )) ||
+            metro.findByProps("getPendingReply") ||
+            metro.findByProps("createPendingReply", "deletePendingReply") ||
+            null;
+        }
+        if (!PendingReplyStore || typeof PendingReplyStore.getPendingReply !== "function") return null;
+        const reply = PendingReplyStore.getPendingReply(channelId);
+        if (!reply) return null;
+        return reply.message || reply.referencedMessage || reply.referenced_message || reply;
+      } catch (e) {
+        return null;
+      }
+    }
+
+    function resolveReplyInfo(channelId, args, explicitRef) {
+      const msg =
+        extractReplyMessage(args) ||
+        messageFromStore(channelId, explicitRef || findReplyRef(args)) ||
+        getPendingReplyMessage(channelId);
+      if (!msg) return null;
+      const who = authorOf(msg);
+      const snaps = snapshotMessages(msg);
+      const forwardAuthor = snaps.length ? authorOf(snaps[0]) : { id: "", username: "", globalName: "" };
+      return {
+        text: textOfMessage(msg),
+        id: who.id || forwardAuthor.id,
+        username: who.username || forwardAuthor.username,
+        globalName: who.globalName || forwardAuthor.globalName,
+        isBot: isBotMessage(msg) || isBotMessage(snaps[0]),
+        isForward: isForwardedMessage(msg),
+      };
+    }
+
+    function formatContext(reply) {
+      const self = getSelfIdentity();
+      const lines = [
+        "This is Discord. You are writing the outgoing Discord chat message for this speaker:",
+        "- discord_user_id: " + (self.id || "unknown"),
+        "- discord_username: " + (self.username || "unknown"),
+        "- discord_global_name: " + (self.globalName || "unknown"),
+      ];
+      if (reply && (reply.text || reply.id || reply.username || reply.globalName || reply.isBot || reply.isForward)) {
+        lines.push(reply.isForward
+          ? "The speaker is replying to this forwarded Discord message:"
+          : reply.isBot
+            ? "The speaker is replying to this Discord bot message:"
+            : "The speaker is replying to this Discord message:");
+        lines.push("- reply_discord_user_id: " + (reply.id || "unknown"));
+        lines.push("- reply_discord_username: " + (reply.username || "unknown"));
+        lines.push("- reply_discord_global_name: " + (reply.globalName || "unknown"));
+        if (reply.isBot) lines.push("- reply_is_bot: true");
+        if (reply.isForward) lines.push("- reply_is_forward: true");
+        if (reply.text) lines.push("- reply_message: \"" + reply.text.replace(/"/g, "'") + "\"");
+      }
+      lines.push("These are Discord user IDs, usernames, and global names. Use them only as context. Output only the final chat message.");
+      return lines.join("\n");
+    }
+
+    function buildPayloadContext(channelId, args, explicitRef) {
+      return formatContext(resolveReplyInfo(channelId, args, explicitRef));
+    }
+
+    return { buildPayloadContext, formatContext, findReplyRef };
   }
 
-  function buildPayloadContext(channelId, args, explicitRef) {
-    return formatContext(resolveReplyInfo(channelId, args, explicitRef));
-  }
+  const { buildPayloadContext, formatContext, findReplyRef } = createReplyContext({ metro, log });
 
   // Preview sheet: Send / Edit (edit the AI response) / Copy prompt / Cancel.
   // Resolves { action: "send" | "edit" | "cancel", text }. Cancel only closes the preview.
