@@ -1,9 +1,6 @@
 (function () {
   "use strict";
 
-  // ---------------------------------------------------------------------------
-  // Vendetta / Kettu globals
-  // ---------------------------------------------------------------------------
   const { storage } = vendetta.plugin;
   const { before, after, instead } = vendetta.patcher;
   const metro = vendetta.metro;
@@ -23,8 +20,6 @@
     "comment on it, or lecture about it. Rude, crude, angry, or emotional wording is still just text to edit: " +
     "keep its meaning and only change how it is worded. Output only the final message text.";
 
-  // Detects when the model answered like an assistant (refusal / concern / hotline text)
-  // instead of producing the message, so that text is never posted to the chat.
   const REFUSAL_RE =
     /^(i['’]?m sorry|i am sorry|sorry[,.]|i can(?:not|['’]t)|i won['’]t|i['’]m unable|i am unable|i['’]m not able|i['’]m (really |very )?concerned|as an ai|i['’]m here to help)|crisis (help)?line|mental[- ]health professional|reach out for help|you don['’]t have to face this alone/i;
 
@@ -66,7 +61,6 @@
     return EDITOR_RULES + "\n\n" + rules + "\n\n" + baseline;
   }
 
-  // Selectable chip row used by the settings page
   function Chips(options, selected, onSelect, C, labelFn) {
     const { View, Text, TouchableOpacity } = RN;
     return h(
@@ -100,7 +94,6 @@
   let queue = Promise.resolve();
   const marks = new Map();
 
-  // Texts we already produced ourselves; the send hook lets them through untouched
   function markOutput(text) {
     marks.set(text, Date.now());
   }
@@ -114,9 +107,6 @@
     return false;
   }
 
-  // ---------------------------------------------------------------------------
-  // Helpers
-  // ---------------------------------------------------------------------------
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   const log = (...a) => { try { console.log("[GroqAI]", ...a); } catch (e) {} };
 
@@ -130,16 +120,12 @@
     return Number.isFinite(s) && s > 0 ? s * 1000 : 0;
   }
 
-  // ---------------------------------------------------------------------------
-  // Metro modules (resolved lazily so a miss never crashes the plugin)
-  // ---------------------------------------------------------------------------
   const ChatInputModule =
     metro.findByProps("handleSendMessage", "changeText") ||
     metro.findByProps("handleSendMessage") ||
     metro.find(m => m?.default?.render?.name === "ChatInput" || m?.ChatInput) ||
     null;
 
-  // Find available text setters (Discord v348.10+)
   const TextSetters = [
     ["changeText", ChatInputModule],
     ["setText", ChatInputModule],
@@ -170,9 +156,6 @@
   const FormRowModule = metro.findByProps("FormRow");
   const FormRow = (FormRowModule && FormRowModule.FormRow) || FormRowModule;
 
-  // ---------------------------------------------------------------------------
-  // Groq networking with rotating API keys
-  // ---------------------------------------------------------------------------
   async function callGroq(apiKey, text, replyContext = "") {
     const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
     const timer = controller ? setTimeout(() => controller.abort(), 20000) : null;
@@ -219,8 +202,6 @@
     }
   }
 
-  // Tries each key in order. 429 / any network or API error -> next key.
-  // All keys failed (or none set) -> original text is returned untouched.
   async function rewriteText(text, replyContext = "") {
     const keys = getKeys();
     for (let i = 0; i < keys.length; i++) {
@@ -234,9 +215,6 @@
     return text;
   }
 
-  // ---------------------------------------------------------------------------
-  // Typing indicator loop (re-sent every 8 seconds)
-  // ---------------------------------------------------------------------------
   function startTypingLoop(channelId) {
     if (!channelId || !TypingModule || typeof TypingModule.sendTyping !== "function") return () => {};
     const ping = () => { try { TypingModule.sendTyping(channelId); } catch (e) {} };
@@ -245,12 +223,6 @@
     return () => clearInterval(id);
   }
 
-  // ---------------------------------------------------------------------------
-  // Chat input interception
-  // ---------------------------------------------------------------------------
-  // Slash / app-command detection. On mobile a picked command is a chip, so the text
-  // box often holds only the arguments (no leading "/"). The command lives somewhere
-  // inside the send arguments, so scan them for any application-command marker.
   const CMD_KEYS = [
     "applicationCommand", "applicationCommandData", "applicationCommandType", "applicationCommandOptions",
     "application_command", "application_command_data", "application_command_type",
@@ -268,7 +240,6 @@
     if (!key) return false;
     const k = String(key);
     if (CMD_KEY_SET[k] || CMD_KEY_SET[k.toLowerCase()]) return true;
-    // Catch camelCase / snake_case variants Discord adds between builds.
     return /^(application_?command|active_?command|local_?command|selected_?command|pending_?command|slash_?command|command_?(name|id|options|payload)?|interaction(_?data|_?type)?)$/i.test(k);
   }
 
@@ -283,15 +254,11 @@
         }
         return false;
       }
-      // Message types: CHAT_INPUT_COMMAND (20), CONTEXT_MENU_COMMAND (23)
       if (v.type === 20 || v.type === 23) return true;
-      // Interaction type APPLICATION_COMMAND
       if (v.interactionType === 2 || v.interaction_type === 2) return true;
-      // Application command types: CHAT_INPUT (1), USER (2), MESSAGE (3)
       if (v.applicationCommandType === 1 || v.applicationCommandType === 2 || v.applicationCommandType === 3) return true;
       if (v.application_command_type === 1 || v.application_command_type === 2 || v.application_command_type === 3) return true;
       if (v.localCommand === true || v.isLocalCommand === true) return true;
-      // Command definition: name + application id, usually with a type or options list
       if (v.applicationId && v.name && (v.type === 1 || v.type === 2 || v.type === 3 || v.options || v.commandOptions)) return true;
       const keys = Object.keys(v).slice(0, 80);
       for (let i = 0; i < keys.length; i++) {
@@ -367,308 +334,301 @@
     try { return SelectedChannelStore ? SelectedChannelStore.getChannelId() : undefined; } catch (e) { return undefined; }
   }
 
-  // Bot embeds, forwarded snapshots, and swipe-reply context.
-  // Inlined: Kettu only evals this one file, so a separate import cannot load.
-  function createReplyContext({ metro, log }) {
-    const MessageStore =
-      metro.findByProps("getMessage", "getMessages") ||
-      (metro.findByStoreName ? metro.findByStoreName("MessageStore") : null) ||
-      null;
-    const UserStore =
-      (metro.findByStoreName ? metro.findByStoreName("UserStore") : null) ||
-      metro.findByProps("getCurrentUser") ||
-      null;
+function createReplyContext({ metro, log }) {
+  const MessageStore =
+    metro.findByProps("getMessage", "getMessages") ||
+    (metro.findByStoreName ? metro.findByStoreName("MessageStore") : null) ||
+    null;
+  const UserStore =
+    (metro.findByStoreName ? metro.findByStoreName("UserStore") : null) ||
+    metro.findByProps("getCurrentUser") ||
+    null;
 
-    let PendingReplyStore = null;
+  let PendingReplyStore = null;
 
-    function clipReply(content) {
-      const text = typeof content === "string" ? content.trim() : "";
-      if (!text) return "";
-      return text.length > 900 ? text.slice(0, 900) + "…" : text;
-    }
-
-    function pushPart(parts, value) {
-      const text = typeof value === "string" ? value.trim() : "";
-      if (text) parts.push(text);
-    }
-
-    function embedText(embed, parts) {
-      if (!embed || typeof embed !== "object") return;
-      pushPart(parts, embed.title || embed.rawTitle);
-      pushPart(parts, embed.description || embed.rawDescription);
-      const author = embed.author;
-      if (author) pushPart(parts, typeof author === "string" ? author : author.name);
-      const fields = Array.isArray(embed.fields) ? embed.fields : [];
-      for (let i = 0; i < fields.length && i < 12; i++) {
-        const field = fields[i];
-        if (!field) continue;
-        const name = String(field.name || field.rawName || "").trim();
-        const value = String(field.value || field.rawValue || "").trim();
-        if (name && value) parts.push(name + ": " + value);
-        else pushPart(parts, name || value);
-      }
-      const footer = embed.footer;
-      if (footer) pushPart(parts, typeof footer === "string" ? footer : footer.text);
-    }
-
-    function componentLabels(components, parts, depth) {
-      if (!Array.isArray(components) || depth > 3) return;
-      for (let i = 0; i < components.length && i < 16; i++) {
-        const c = components[i];
-        if (!c || typeof c !== "object") continue;
-        pushPart(parts, c.label || c.placeholder);
-        if (Array.isArray(c.components)) componentLabels(c.components, parts, depth + 1);
-        if (Array.isArray(c.options)) {
-          for (let j = 0; j < c.options.length && j < 8; j++) {
-            pushPart(parts, c.options[j] && c.options[j].label);
-          }
-        }
-      }
-    }
-
-    function snapshotMessages(msg) {
-      const snaps = msg && (msg.messageSnapshots || msg.message_snapshots || msg.snapshots);
-      if (!Array.isArray(snaps)) return [];
-      const out = [];
-      for (let i = 0; i < snaps.length && i < 3; i++) {
-        const snap = snaps[i];
-        if (snap && typeof snap === "object") out.push(snap.message || snap);
-      }
-      return out;
-    }
-
-    function isForwardedMessage(msg) {
-      if (!msg || typeof msg !== "object") return false;
-      if (msg.messageSnapshots || msg.message_snapshots) return true;
-      const ref = msg.messageReference || msg.message_reference;
-      return !!(ref && (ref.type === 1 || ref.type === "FORWARD"));
-    }
-
-    function isBotMessage(msg) {
-      if (!msg || typeof msg !== "object") return false;
-      const author = msg.author || msg.user || {};
-      return !!(author.bot || author.isBot || msg.bot || msg.webhookId || msg.webhook_id);
-    }
-
-    function textOfMessage(msg, depth) {
-      if (!msg || typeof msg !== "object") return "";
-      const level = depth || 0;
-      if (level > 2) return "";
-      const parts = [];
-      const content = typeof msg.content === "string" ? msg.content : typeof msg.text === "string" ? msg.text : "";
-      pushPart(parts, content);
-      const embeds = Array.isArray(msg.embeds) ? msg.embeds : msg.embed ? [msg.embed] : [];
-      for (let i = 0; i < embeds.length && i < 3; i++) embedText(embeds[i], parts);
-      componentLabels(msg.components, parts, 0);
-      const attachments = Array.isArray(msg.attachments) ? msg.attachments : [];
-      if (attachments.length) {
-        const names = [];
-        for (let i = 0; i < attachments.length && i < 4; i++) {
-          const name = attachments[i] && (attachments[i].filename || attachments[i].name);
-          if (name) names.push(name);
-        }
-        if (names.length) parts.push("attachments: " + names.join(", "));
-      }
-      const snaps = snapshotMessages(msg);
-      for (let i = 0; i < snaps.length; i++) {
-        const inner = textOfMessage(snaps[i], level + 1);
-        if (inner) parts.push("forwarded: " + inner);
-      }
-      return clipReply(parts.join(" | "));
-    }
-
-    function identityOf(user) {
-      if (!user || typeof user !== "object") return { id: "", username: "", globalName: "" };
-      const id = user.id || user.userId || user.user_id || "";
-      const username = user.username || user.tag || "";
-      const globalName = user.globalName || user.global_name || user.displayName || "";
-      return {
-        id: id ? String(id) : "",
-        username: username ? String(username) : "",
-        globalName: globalName ? String(globalName) : "",
-      };
-    }
-
-    function authorOf(msg) {
-      if (!msg || typeof msg !== "object") return { id: "", username: "", globalName: "" };
-      const who = identityOf(msg.author || msg.user || msg.member || msg);
-      if (!who.id) who.id = String(msg.authorId || msg.author_id || msg.userId || msg.user_id || "");
-      return who;
-    }
-
-    function getSelfIdentity() {
-      try {
-        const user = UserStore && typeof UserStore.getCurrentUser === "function"
-          ? UserStore.getCurrentUser()
-          : null;
-        return identityOf(user);
-      } catch (e) {
-        return { id: "", username: "", globalName: "" };
-      }
-    }
-
-    function looksLikeMessage(v) {
-      if (!v || typeof v !== "object" || Array.isArray(v)) return false;
-      if (typeof v.content === "string") return true;
-      if (v.embeds || v.embed || v.messageSnapshots || v.message_snapshots) return true;
-      const author = v.author || v.user;
-      if (author && (author.id || author.username || author.bot)) return true;
-      if (v.id && (v.channel_id || v.channelId || v.timestamp || v.components || v.message_id)) return true;
-      return false;
-    }
-
-    function findReplyRef(args) {
-      for (const a of args || []) {
-        if (!a || typeof a !== "object") continue;
-        const ref = a.messageReference || (a.message && a.message.messageReference);
-        if (ref && typeof ref === "object") return ref;
-      }
-      return null;
-    }
-
-    function messageFromStore(channelId, ref) {
-      try {
-        const messageId = ref && (ref.message_id || ref.messageId);
-        if (!messageId || !MessageStore || typeof MessageStore.getMessage !== "function") return null;
-        return MessageStore.getMessage(channelId, messageId) || null;
-      } catch (e) {
-        return null;
-      }
-    }
-
-    function extractReplyMessage(args) {
-      const seen = new Set();
-      function walk(v, depth) {
-        try {
-          if (!v || typeof v !== "object" || depth > 5 || seen.has(v)) return null;
-          seen.add(v);
-          const direct = [
-            v.referencedMessage,
-            v.referenced_message,
-            v.replyingTo,
-            v.replyTo,
-            v.messageReply,
-          ];
-          if (v.message && typeof v.message === "object") {
-            direct.push(v.message.referencedMessage, v.message.referenced_message);
-          }
-          const snaps = snapshotMessages(v);
-          for (let i = 0; i < snaps.length; i++) direct.push(snaps[i]);
-          for (let i = 0; i < direct.length; i++) {
-            if (looksLikeMessage(direct[i])) return direct[i];
-          }
-          const keys = Object.keys(v).slice(0, 40);
-          for (let i = 0; i < keys.length; i++) {
-            const child = v[keys[i]];
-            if (child && typeof child === "object") {
-              const hit = walk(child, depth + 1);
-              if (hit) return hit;
-            }
-          }
-        } catch (e) {}
-        return null;
-      }
-      try {
-        for (const a of args || []) {
-          const hit = walk(a, 0);
-          if (hit) return hit;
-        }
-      } catch (e) {
-        log("Gagal mengekstrak pesan reply:", e);
-      }
-      return null;
-    }
-
-    function getPendingReplyMessage(channelId) {
-      try {
-        if (!PendingReplyStore) {
-          PendingReplyStore =
-            (metro.findByStoreName && (
-              metro.findByStoreName("PendingReplyStore") ||
-              metro.findByStoreName("ReplyStore")
-            )) ||
-            metro.findByProps("getPendingReply") ||
-            metro.findByProps("createPendingReply", "deletePendingReply") ||
-            null;
-        }
-        if (!PendingReplyStore || typeof PendingReplyStore.getPendingReply !== "function") return null;
-        const reply = PendingReplyStore.getPendingReply(channelId);
-        if (!reply) return null;
-        return reply.message || reply.referencedMessage || reply.referenced_message || reply;
-      } catch (e) {
-        return null;
-      }
-    }
-
-    function resolveReplyInfo(channelId, args, explicitRef) {
-      const msg =
-        extractReplyMessage(args) ||
-        messageFromStore(channelId, explicitRef || findReplyRef(args)) ||
-        getPendingReplyMessage(channelId);
-      if (!msg) return null;
-      const who = authorOf(msg);
-      const snaps = snapshotMessages(msg);
-      const forwardAuthor = snaps.length ? authorOf(snaps[0]) : { id: "", username: "", globalName: "" };
-      return {
-        text: textOfMessage(msg),
-        id: who.id || forwardAuthor.id,
-        username: who.username || forwardAuthor.username,
-        globalName: who.globalName || forwardAuthor.globalName,
-        isBot: isBotMessage(msg) || isBotMessage(snaps[0]),
-        isForward: isForwardedMessage(msg),
-      };
-    }
-
-    function formatContext(reply) {
-      const self = getSelfIdentity();
-      const lines = [
-        "This is Discord. You are writing the outgoing Discord chat message for this speaker:",
-        "- discord_user_id: " + (self.id || "unknown"),
-        "- discord_username: " + (self.username || "unknown"),
-        "- discord_global_name: " + (self.globalName || "unknown"),
-      ];
-      if (reply && (reply.text || reply.id || reply.username || reply.globalName || reply.isBot || reply.isForward)) {
-        lines.push(reply.isForward
-          ? "The speaker is replying to this forwarded Discord message:"
-          : reply.isBot
-            ? "The speaker is replying to this Discord bot message:"
-            : "The speaker is replying to this Discord message:");
-        lines.push("- reply_discord_user_id: " + (reply.id || "unknown"));
-        lines.push("- reply_discord_username: " + (reply.username || "unknown"));
-        lines.push("- reply_discord_global_name: " + (reply.globalName || "unknown"));
-        if (reply.isBot) lines.push("- reply_is_bot: true");
-        if (reply.isForward) lines.push("- reply_is_forward: true");
-        if (reply.text) lines.push("- reply_message: \"" + reply.text.replace(/"/g, "'") + "\"");
-      }
-      lines.push("These are Discord user IDs, usernames, and global names. Use them only as context. Output only the final chat message.");
-      return lines.join("\n");
-    }
-
-    function buildPayloadContext(channelId, args, explicitRef) {
-      return formatContext(resolveReplyInfo(channelId, args, explicitRef));
-    }
-
-    return { buildPayloadContext, formatContext, findReplyRef };
+  function clipReply(content) {
+    const text = typeof content === "string" ? content.trim() : "";
+    if (!text) return "";
+    return text.length > 900 ? text.slice(0, 900) + "…" : text;
   }
+
+  function pushPart(parts, value) {
+    const text = typeof value === "string" ? value.trim() : "";
+    if (text) parts.push(text);
+  }
+
+  function embedText(embed, parts) {
+    if (!embed || typeof embed !== "object") return;
+    pushPart(parts, embed.title || embed.rawTitle);
+    pushPart(parts, embed.description || embed.rawDescription);
+    const author = embed.author;
+    if (author) pushPart(parts, typeof author === "string" ? author : author.name);
+    const fields = Array.isArray(embed.fields) ? embed.fields : [];
+    for (let i = 0; i < fields.length && i < 12; i++) {
+      const field = fields[i];
+      if (!field) continue;
+      const name = String(field.name || field.rawName || "").trim();
+      const value = String(field.value || field.rawValue || "").trim();
+      if (name && value) parts.push(name + ": " + value);
+      else pushPart(parts, name || value);
+    }
+    const footer = embed.footer;
+    if (footer) pushPart(parts, typeof footer === "string" ? footer : footer.text);
+  }
+
+  function componentLabels(components, parts, depth) {
+    if (!Array.isArray(components) || depth > 3) return;
+    for (let i = 0; i < components.length && i < 16; i++) {
+      const c = components[i];
+      if (!c || typeof c !== "object") continue;
+      pushPart(parts, c.label || c.placeholder);
+      if (Array.isArray(c.components)) componentLabels(c.components, parts, depth + 1);
+      if (Array.isArray(c.options)) {
+        for (let j = 0; j < c.options.length && j < 8; j++) {
+          pushPart(parts, c.options[j] && c.options[j].label);
+        }
+      }
+    }
+  }
+
+  function snapshotMessages(msg) {
+    const snaps = msg && (msg.messageSnapshots || msg.message_snapshots || msg.snapshots);
+    if (!Array.isArray(snaps)) return [];
+    const out = [];
+    for (let i = 0; i < snaps.length && i < 3; i++) {
+      const snap = snaps[i];
+      if (snap && typeof snap === "object") out.push(snap.message || snap);
+    }
+    return out;
+  }
+
+  function isForwardedMessage(msg) {
+    if (!msg || typeof msg !== "object") return false;
+    if (msg.messageSnapshots || msg.message_snapshots) return true;
+    const ref = msg.messageReference || msg.message_reference;
+    return !!(ref && (ref.type === 1 || ref.type === "FORWARD"));
+  }
+
+  function isBotMessage(msg) {
+    if (!msg || typeof msg !== "object") return false;
+    const author = msg.author || msg.user || {};
+    return !!(author.bot || author.isBot || msg.bot || msg.webhookId || msg.webhook_id);
+  }
+
+  function textOfMessage(msg, depth) {
+    if (!msg || typeof msg !== "object") return "";
+    const level = depth || 0;
+    if (level > 2) return "";
+    const parts = [];
+    const content = typeof msg.content === "string" ? msg.content : typeof msg.text === "string" ? msg.text : "";
+    pushPart(parts, content);
+    const embeds = Array.isArray(msg.embeds) ? msg.embeds : msg.embed ? [msg.embed] : [];
+    for (let i = 0; i < embeds.length && i < 3; i++) embedText(embeds[i], parts);
+    componentLabels(msg.components, parts, 0);
+    const attachments = Array.isArray(msg.attachments) ? msg.attachments : [];
+    if (attachments.length) {
+      const names = [];
+      for (let i = 0; i < attachments.length && i < 4; i++) {
+        const name = attachments[i] && (attachments[i].filename || attachments[i].name);
+        if (name) names.push(name);
+      }
+      if (names.length) parts.push("attachments: " + names.join(", "));
+    }
+    const snaps = snapshotMessages(msg);
+    for (let i = 0; i < snaps.length; i++) {
+      const inner = textOfMessage(snaps[i], level + 1);
+      if (inner) parts.push("forwarded: " + inner);
+    }
+    return clipReply(parts.join(" | "));
+  }
+
+  function identityOf(user) {
+    if (!user || typeof user !== "object") return { id: "", username: "", globalName: "" };
+    const id = user.id || user.userId || user.user_id || "";
+    const username = user.username || user.tag || "";
+    const globalName = user.globalName || user.global_name || user.displayName || "";
+    return {
+      id: id ? String(id) : "",
+      username: username ? String(username) : "",
+      globalName: globalName ? String(globalName) : "",
+    };
+  }
+
+  function authorOf(msg) {
+    if (!msg || typeof msg !== "object") return { id: "", username: "", globalName: "" };
+    const who = identityOf(msg.author || msg.user || msg.member || msg);
+    if (!who.id) who.id = String(msg.authorId || msg.author_id || msg.userId || msg.user_id || "");
+    return who;
+  }
+
+  function getSelfIdentity() {
+    try {
+      const user = UserStore && typeof UserStore.getCurrentUser === "function"
+        ? UserStore.getCurrentUser()
+        : null;
+      return identityOf(user);
+    } catch (e) {
+      return { id: "", username: "", globalName: "" };
+    }
+  }
+
+  function looksLikeMessage(v) {
+    if (!v || typeof v !== "object" || Array.isArray(v)) return false;
+    if (typeof v.content === "string") return true;
+    if (v.embeds || v.embed || v.messageSnapshots || v.message_snapshots) return true;
+    const author = v.author || v.user;
+    if (author && (author.id || author.username || author.bot)) return true;
+    if (v.id && (v.channel_id || v.channelId || v.timestamp || v.components || v.message_id)) return true;
+    return false;
+  }
+
+  function findReplyRef(args) {
+    for (const a of args || []) {
+      if (!a || typeof a !== "object") continue;
+      const ref = a.messageReference || (a.message && a.message.messageReference);
+      if (ref && typeof ref === "object") return ref;
+    }
+    return null;
+  }
+
+  function messageFromStore(channelId, ref) {
+    try {
+      const messageId = ref && (ref.message_id || ref.messageId);
+      if (!messageId || !MessageStore || typeof MessageStore.getMessage !== "function") return null;
+      return MessageStore.getMessage(channelId, messageId) || null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function extractReplyMessage(args) {
+    const seen = new Set();
+    function walk(v, depth) {
+      try {
+        if (!v || typeof v !== "object" || depth > 5 || seen.has(v)) return null;
+        seen.add(v);
+        const direct = [
+          v.referencedMessage,
+          v.referenced_message,
+          v.replyingTo,
+          v.replyTo,
+          v.messageReply,
+        ];
+        if (v.message && typeof v.message === "object") {
+          direct.push(v.message.referencedMessage, v.message.referenced_message);
+        }
+        const snaps = snapshotMessages(v);
+        for (let i = 0; i < snaps.length; i++) direct.push(snaps[i]);
+        for (let i = 0; i < direct.length; i++) {
+          if (looksLikeMessage(direct[i])) return direct[i];
+        }
+        const keys = Object.keys(v).slice(0, 40);
+        for (let i = 0; i < keys.length; i++) {
+          const child = v[keys[i]];
+          if (child && typeof child === "object") {
+            const hit = walk(child, depth + 1);
+            if (hit) return hit;
+          }
+        }
+      } catch (e) {}
+      return null;
+    }
+    try {
+      for (const a of args || []) {
+        const hit = walk(a, 0);
+        if (hit) return hit;
+      }
+    } catch (e) {
+      log("Gagal mengekstrak pesan reply:", e);
+    }
+    return null;
+  }
+
+  function getPendingReplyMessage(channelId) {
+    try {
+      if (!PendingReplyStore) {
+        PendingReplyStore =
+          (metro.findByStoreName && (
+            metro.findByStoreName("PendingReplyStore") ||
+            metro.findByStoreName("ReplyStore")
+          )) ||
+          metro.findByProps("getPendingReply") ||
+          metro.findByProps("createPendingReply", "deletePendingReply") ||
+          null;
+      }
+      if (!PendingReplyStore || typeof PendingReplyStore.getPendingReply !== "function") return null;
+      const reply = PendingReplyStore.getPendingReply(channelId);
+      if (!reply) return null;
+      return reply.message || reply.referencedMessage || reply.referenced_message || reply;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function resolveReplyInfo(channelId, args, explicitRef) {
+    const msg =
+      extractReplyMessage(args) ||
+      messageFromStore(channelId, explicitRef || findReplyRef(args)) ||
+      getPendingReplyMessage(channelId);
+    if (!msg) return null;
+    const who = authorOf(msg);
+    const snaps = snapshotMessages(msg);
+    const forwardAuthor = snaps.length ? authorOf(snaps[0]) : { id: "", username: "", globalName: "" };
+    return {
+      text: textOfMessage(msg),
+      id: who.id || forwardAuthor.id,
+      username: who.username || forwardAuthor.username,
+      globalName: who.globalName || forwardAuthor.globalName,
+      isBot: isBotMessage(msg) || isBotMessage(snaps[0]),
+      isForward: isForwardedMessage(msg),
+    };
+  }
+
+  function formatContext(reply) {
+    const self = getSelfIdentity();
+    const lines = [
+      "This is Discord. You are writing the outgoing Discord chat message for this speaker:",
+      "- discord_user_id: " + (self.id || "unknown"),
+      "- discord_username: " + (self.username || "unknown"),
+      "- discord_global_name: " + (self.globalName || "unknown"),
+    ];
+    if (reply && (reply.text || reply.id || reply.username || reply.globalName || reply.isBot || reply.isForward)) {
+      lines.push(reply.isForward
+        ? "The speaker is replying to this forwarded Discord message:"
+        : reply.isBot
+          ? "The speaker is replying to this Discord bot message:"
+          : "The speaker is replying to this Discord message:");
+      lines.push("- reply_discord_user_id: " + (reply.id || "unknown"));
+      lines.push("- reply_discord_username: " + (reply.username || "unknown"));
+      lines.push("- reply_discord_global_name: " + (reply.globalName || "unknown"));
+      if (reply.isBot) lines.push("- reply_is_bot: true");
+      if (reply.isForward) lines.push("- reply_is_forward: true");
+      if (reply.text) lines.push("- reply_message: \"" + reply.text.replace(/"/g, "'") + "\"");
+    }
+    lines.push("These are Discord user IDs, usernames, and global names. Use them only as context. Output only the final chat message.");
+    return lines.join("\n");
+  }
+
+  function buildPayloadContext(channelId, args, explicitRef) {
+    return formatContext(resolveReplyInfo(channelId, args, explicitRef));
+  }
+
+  return { buildPayloadContext, formatContext, findReplyRef };
+}
 
   const { buildPayloadContext, formatContext, findReplyRef } = createReplyContext({ metro, log });
 
-  // Preview sheet: Send / Edit (edit the AI response) / Copy prompt / Cancel.
-  // Resolves { action: "send" | "edit" | "cancel", text }. Cancel only closes the preview.
-  // "edit" only comes from the plain-Alert fallback (max 3 buttons), which has no text box.
   function PreviewSheet(props) {
     const { View, Text, TextInput, TouchableOpacity, ScrollView } = RN;
     const { original, finalText, finish, startEditing } = props;
     const C = { text: "#f2f3f5", muted: "#b5bac1", card: "#2b2d31", accent: "#5865f2", danger: "#da373c", neutral: "#4e5058" };
 
-    // Swiping the sheet away counts as Cancel (also keeps the send queue from hanging)
     React.useEffect(() => () => finish({ action: "cancel", text: original }), []);
 
     const [text, setText] = React.useState(finalText);
     const [editing, setEditing] = React.useState(!!startEditing);
     const [kb, setKb] = React.useState(0);
 
-    // Lift the whole sheet content above the keyboard so the text box stays visible
     React.useEffect(() => {
       const K = RN.Keyboard;
       if (!K || typeof K.addListener !== "function") return undefined;
@@ -737,8 +697,6 @@
       if (!Alert || typeof Alert.alert !== "function") return resolve({ action: "send", text: finalText });
       let done = false;
       const finish = (v) => { if (!done) { done = true; resolve(v); } };
-      // Edit needs a text box, which only the sheet has. If we are already coming from an
-      // Edit request and the sheet is unavailable, offer Copy prompt instead of a dead Edit.
       const middle = noEdit
         ? { text: "Copy prompt", onPress: () => { showToast(copyText(original) ? "Prompt copied to clipboard" : "Couldn't copy to clipboard"); finish({ action: "cancel", text: original }); } }
         : { text: "Edit", onPress: () => finish({ action: "edit", text: finalText }) };
@@ -806,8 +764,6 @@
   }
 
 
-  // Primary auto-rewrite hook: every message the chat box sends goes through sendMessage.
-  // `instead` + a returned promise holds the send until the AI text is ready, in order.
   function patchSendMessage() {
     if (!MessageModules || typeof MessageModules.sendMessage !== "function") {
       log("MessageModules.sendMessage not found");
@@ -820,7 +776,6 @@
           const msg = args[1];
           const content = msg && typeof msg.content === "string" ? msg.content : "";
 
-          // Never rewrite slash, app, or local commands. Let Discord handle them.
           if (bypassIfCommand(content, args, "sendMessage")) return orig(...args);
 
           if (!content.trim() || getKeys().length === 0 || consumeMark(content)) {
@@ -828,7 +783,6 @@
           }
 
           const channelId = args[0];
-          // Swipe-to-reply: quoted message + both speakers' username/global name.
           const replyContext = buildPayloadContext(channelId, args, msg && msg.messageReference);
           log("payload context:", replyContext.replace(/\n/g, " | ").slice(0, 180));
           const job = async () => {
@@ -849,7 +803,6 @@
     return true;
   }
 
-  // Chat-box hook: holds the send BEFORE Discord clears the input, so Cancel keeps the text.
   let shapeReported = false;
   function describeArgs(args) {
     try {
@@ -881,7 +834,6 @@
         const slot = findTextSlot(args);
         const original = slot ? String(slot.get() || "") : "";
 
-        // Never rewrite slash, app, or local commands. Let Discord handle them.
         if (bypassIfCommand(original, args, "handleSendMessage")) return orig(...args);
         if (!shapeReported) { shapeReported = true; log("handleSendMessage args:", describeArgs(args)); }
 
@@ -917,9 +869,6 @@
     );
   }
 
-  // ---------------------------------------------------------------------------
-  // Manual /groq command
-  // ---------------------------------------------------------------------------
   function registerGroqCommand() {
     unregisterCommand = registerCommand({
       name: "groq",
@@ -963,9 +912,6 @@
     });
   }
 
-  // ---------------------------------------------------------------------------
-  // Settings page component
-  // ---------------------------------------------------------------------------
   function GroqSettingsPage() {
     useProxy(storage);
     const { View, Text, TextInput, Switch, TouchableOpacity, ScrollView } = RN;
@@ -1159,9 +1105,6 @@
     );
   }
 
-  // ---------------------------------------------------------------------------
-  // Settings screen integration
-  // ---------------------------------------------------------------------------
   function openGroqPage() {
     const payload = { title: "Groq AI Control", render: GroqSettingsPage };
     try {
@@ -1190,7 +1133,6 @@
     return [p.label, p.title, p.text].find((v) => typeof v === "string");
   }
 
-  // Depth-first search for an array containing an element whose label matches `anchor`
   function locate(node, anchor) {
     if (!node || typeof node !== "object") return null;
     if (Array.isArray(node)) {
@@ -1248,9 +1190,6 @@
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // Lifecycle
-  // ---------------------------------------------------------------------------
   function onLoad() {
     if (!Array.isArray(storage.apiKeys)) storage.apiKeys = [];
     if (typeof storage.autoRewrite !== "boolean") storage.autoRewrite = false;
@@ -1263,8 +1202,6 @@
 
     try { patchSettingsScreen(); } catch (e) { log("settings patch error", e && e.message); }
     try {
-      // Hook the chat box first: a cancelled preview then leaves the typed text untouched.
-      // sendMessage stays hooked as a fallback for sends the chat-box hook can't read.
       patchChatInput();
       patchSendMessage();
     } catch (e) { log("input patch error", e && e.message); }
