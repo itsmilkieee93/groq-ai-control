@@ -769,15 +769,22 @@
       return new Promise((resolve) => {
         let done = false;
         const finish = (v) => { if (!done) { done = true; resolve(v); } };
+        // If the sheet never appears (slash UI still open), fall back to Alert.
+        const timer = setTimeout(() => {
+          if (done) return;
+          log("action sheet did not open, using alert");
+          showAlertPreview(original, finalText, startEditing).then(finish);
+        }, 1200);
         try {
           ActionSheetModule.openLazy(
             Promise.resolve({ default: PreviewSheet }),
             "GroqPreview",
-            { original, finalText, finish, startEditing }
+            { original, finalText, finish: (v) => { clearTimeout(timer); finish(v); }, startEditing }
           );
         } catch (e) {
+          clearTimeout(timer);
           log("action sheet failed, using alert:", e && e.message);
-          showAlertPreview(original, finalText, startEditing).then(resolve);
+          showAlertPreview(original, finalText, startEditing).then(finish);
         }
       });
     }
@@ -993,6 +1000,8 @@
         log("payload context (/groq):", replyContext.replace(/\n/g, " | ").slice(0, 180));
         log("slash target:", replyTarget && replyTarget.id);
 
+        // Let the slash UI close before the preview opens.
+        await sleep(300);
         const finalText = await produceFinalText(original, channelId, false, replyContext);
         if (finalText === null) return;
 
