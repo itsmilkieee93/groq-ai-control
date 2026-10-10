@@ -256,34 +256,92 @@
   // ---------------------------------------------------------------------------
   // Chat input interception
   // ---------------------------------------------------------------------------
-  // Slash / app-command detection. On mobile a picked command shows as a chip, so the text
-  // box holds only the arguments (no leading "/"). The command info lives somewhere inside the
-  // send arguments instead, so scan them (a few levels deep) for any command marker.
+  // Slash / app-command detection. On mobile a picked command is a chip, so the text
+  // box often holds only the arguments (no leading "/"). The command lives somewhere
+  // inside the send arguments, so scan them for any application-command marker.
   const CMD_KEYS = [
-    "applicationCommand", "applicationCommandData", "command", "commandName", "commandId",
-    "interactionData", "interactionType", "interaction", "activeCommand", "commandOptions",
+    "applicationCommand", "applicationCommandData", "applicationCommandType", "applicationCommandOptions",
+    "application_command", "application_command_data", "application_command_type",
+    "command", "commandName", "commandId", "command_name", "command_id",
+    "interactionData", "interactionType", "interaction",
+    "interaction_data", "interaction_type",
+    "activeCommand", "commandOptions", "commandPayload",
+    "localCommand", "isLocalCommand",
+    "selectedCommand", "pendingCommand", "slashCommand",
   ];
+  const CMD_KEY_SET = {};
+  for (let i = 0; i < CMD_KEYS.length; i++) CMD_KEY_SET[CMD_KEYS[i].toLowerCase()] = true;
+
+  function isCommandKey(key) {
+    if (!key) return false;
+    const k = String(key);
+    if (CMD_KEY_SET[k] || CMD_KEY_SET[k.toLowerCase()]) return true;
+    // Catch camelCase / snake_case variants Discord adds between builds.
+    return /^(application_?command|active_?command|local_?command|selected_?command|pending_?command|slash_?command|command_?(name|id|options|payload)?|interaction(_?data|_?type)?)$/i.test(k);
+  }
+
   function hasCommandMarker(v, depth, seen) {
     try {
-      if (!v || typeof v !== "object" || depth > 3 || seen.has(v)) return false;
+      if (v == null || typeof v !== "object" || depth > 6 || seen.has(v)) return false;
       seen.add(v);
-      if (v.type === 20) return true; // CHAT_INPUT_COMMAND message type
-      const keys = Object.keys(v).slice(0, 40);
-      for (const k of keys) {
-        if (CMD_KEYS.indexOf(k) !== -1 && v[k]) return true;
+      if (Array.isArray(v)) {
+        const n = Math.min(v.length, 12);
+        for (let i = 0; i < n; i++) {
+          if (hasCommandMarker(v[i], depth + 1, seen)) return true;
+        }
+        return false;
       }
-      for (const k of keys) {
-        const c = v[k];
-        if (c && typeof c === "object" && !Array.isArray(c) && hasCommandMarker(c, depth + 1, seen)) return true;
+      // Message types: CHAT_INPUT_COMMAND (20), CONTEXT_MENU_COMMAND (23)
+      if (v.type === 20 || v.type === 23) return true;
+      // Interaction type APPLICATION_COMMAND
+      if (v.interactionType === 2 || v.interaction_type === 2) return true;
+      // Application command types: CHAT_INPUT (1), USER (2), MESSAGE (3)
+      if (v.applicationCommandType === 1 || v.applicationCommandType === 2 || v.applicationCommandType === 3) return true;
+      if (v.application_command_type === 1 || v.application_command_type === 2 || v.application_command_type === 3) return true;
+      if (v.localCommand === true || v.isLocalCommand === true) return true;
+      // Command definition: name + application id, usually with a type or options list
+      if (v.applicationId && v.name && (v.type === 1 || v.type === 2 || v.type === 3 || v.options || v.commandOptions)) return true;
+      const keys = Object.keys(v).slice(0, 80);
+      for (let i = 0; i < keys.length; i++) {
+        const k = keys[i];
+        if (isCommandKey(k) && v[k]) return true;
+      }
+      for (let i = 0; i < keys.length; i++) {
+        const c = v[keys[i]];
+        if (c && typeof c === "object" && hasCommandMarker(c, depth + 1, seen)) return true;
       }
     } catch (e) {}
     return false;
   }
-  function isSlashCommand(text, args) {
-    if (typeof text === "string" && /^[\s\u200b-\u200d\ufeff]*\//.test(text)) return true;
-    const seen = new Set();
-    for (const a of args || []) if (hasCommandMarker(a, 0, seen)) return true;
+
+  function startsWithSlash(text) {
+    return typeof text === "string" && /^[\s\u00a0\u1680\u2000-\u200d\u202f\u205f\u2060\u3000\ufeff]*\//.test(text);
+  }
+
+  function hasActiveInputCommand() {
+    try {
+      if (!ChatInputModule) return false;
+      if (ChatInputModule.activeCommand || ChatInputModule.applicationCommand || ChatInputModule.localCommand) return true;
+      if (typeof ChatInputModule.getActiveCommand === "function" && ChatInputModule.getActiveCommand()) return true;
+    } catch (e) {}
     return false;
+  }
+
+  function isSlashCommand(text, args) {
+    if (startsWithSlash(text)) return true;
+    if (hasActiveInputCommand()) return true;
+    const seen = new Set();
+    for (const a of args || []) {
+      if (startsWithSlash(a)) return true;
+      if (hasCommandMarker(a, 0, seen)) return true;
+    }
+    return false;
+  }
+
+  function bypassIfCommand(text, args, where) {
+    if (!isSlashCommand(text, args)) return false;
+    log("bypass:", where, "application/local command");
+    return true;
   }
 
   function findTextSlot(args) {
@@ -656,10 +714,10 @@
           const msg = args[1];
           const content = msg && typeof msg.content === "string" ? msg.content : "";
 
-          // Strict check to detect every kind of app/bot command (Discord v348.10+)
-          const isCommand = isSlashCommand(content, args);
+          // Never rewrite slash, app, or local commands. Let Discord handle them.
+          if (bypassIfCommand(content, args, "sendMessage")) return orig(...args);
 
-          if (!content.trim() || isCommand || getKeys().length === 0 || consumeMark(content)) {
+          if (!content.trim() || getKeys().length === 0 || consumeMark(content)) {
             return orig(...args);
           }
 
@@ -717,11 +775,11 @@
         const slot = findTextSlot(args);
         const original = slot ? String(slot.get() || "") : "";
 
-        // Detect app commands at the chat-input level before sending
-        const isCommand = isSlashCommand(original, args);
-        if (!shapeReported) { shapeReported = true; log("handleSendMessage args:", describeArgs(args), "| command:", isCommand); }
+        // Never rewrite slash, app, or local commands. Let Discord handle them.
+        if (bypassIfCommand(original, args, "handleSendMessage")) return orig(...args);
+        if (!shapeReported) { shapeReported = true; log("handleSendMessage args:", describeArgs(args)); }
 
-        if (!slot || !original.trim() || isCommand || getKeys().length === 0) {
+        if (!slot || !original.trim() || getKeys().length === 0) {
           return orig(...args);
         }
 
