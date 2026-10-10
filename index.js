@@ -523,9 +523,12 @@
         lines.push("Last " + reply.historyLines.length + " messages from the person being replied to (oldest first, one JSON object per line; datetime is UTC, user_id is their snowflake, nickname is their global display name, server_name is their nickname in this server and only present when set):");
         for (let i = 0; i < reply.historyLines.length; i++) lines.push(reply.historyLines[i]);
       }
-      lines.push("These are Discord IDs, usernames, global names, and recent messages. Use them ONLY to understand the situation. "
-        + "Do NOT insert names, IDs, or details from this context into the message, and do NOT replace pronouns (he, she, they, it, that, this) with names. "
-        + "A name or fact may only appear in the output if the speaker's own text already contains it. Keep the speaker's original wording and meaning as close as possible. Output only the final chat message.");
+      const strict = "Do NOT insert names, IDs, or details from this context into the message, and do NOT replace pronouns (he, she, they, it, that, this) with names. "
+        + "A name or fact may only appear in the output if the speaker's own text already contains it. Keep the speaker's original wording and meaning as close as possible. ";
+      const footer = storage.answerQuestions !== false
+        ? "If the speaker's text is a question about this conversation (what someone means, said, or is talking about, who someone is, what happened), answer it from this context in the speaker's own voice, ready to send; if the context cannot answer it, just rewrite the question without guessing. For any other message: " + strict
+        : "Use them ONLY to understand the situation. " + strict;
+      lines.push("These are Discord IDs, usernames, global names, and recent messages. " + footer + "Output only the final chat message.");
       return lines.join("\n");
     }
 
@@ -606,6 +609,10 @@
     "chat message, ready to send, and compute math carefully. " +
     "For math, logic, and how/why questions, show a short step-by-step (a few brief lines, one step per line) " +
     "that ends with the final answer. For simple translations or 'say X' requests, just give the answer directly. " +
+    "When Discord context is provided (the reply target, surrounding channel messages, recent messages from the person " +
+    "being replied to) and the message asks about what was said or what someone means (for example 'what is he talking " +
+    "about', 'what does that mean', 'who is that', 'what happened'), answer it yourself from that context as the chat " +
+    "message, ready to send; if the context does not contain the answer, just rewrite the question instead of guessing. " +
     "If it is ordinary conversation, or a question aimed at another person (their plans, feelings, opinions, " +
     "availability), just rewrite it and keep its meaning. " +
     "Return ONLY the message to send (including the steps, when asked for), with no quotes, labels, or commentary about the task itself.";
