@@ -14,6 +14,7 @@
     const pendingByChannel = new Map();
     let PendingReplyStore = null;
     let fluxUnsub = null;
+    let fluxRef = null;
 
     function rememberPending(channelId, message) {
       if (!channelId || !message) return;
@@ -62,6 +63,7 @@
         log("FluxDispatcher not found; swipe reply cache disabled");
         return;
       }
+      fluxRef = Flux;
       try {
         Flux.subscribe("CREATE_PENDING_REPLY", onFluxAction);
         Flux.subscribe("SET_PENDING_REPLY", onFluxAction);
@@ -375,7 +377,31 @@
       }
     }
 
-    return { buildPayloadContext, formatContext, findReplyRef, getReplyTarget, forgetPending, start, stop };
+    // Whether the @ ON/OFF toggle of the pending reply is on. null = unknown.
+    function getReplyMention(channelId) {
+      try {
+        getPendingReplyMessage(channelId); // makes sure PendingReplyStore is resolved
+        if (!PendingReplyStore || typeof PendingReplyStore.getPendingReply !== "function") return null;
+        const reply = PendingReplyStore.getPendingReply(channelId);
+        return reply && typeof reply.shouldMention === "boolean" ? reply.shouldMention : null;
+      } catch (e) {
+        return null;
+      }
+    }
+
+    // Slash commands do not go through the normal send flow, so the reply bar stays open.
+    function clearPending(channelId) {
+      forgetPending(channelId);
+      try {
+        if (fluxRef && typeof fluxRef.dispatch === "function") {
+          fluxRef.dispatch({ type: "DELETE_PENDING_REPLY", channelId: channelId });
+        }
+      } catch (e) {
+        log("could not clear pending reply", e && e.message);
+      }
+    }
+
+    return { buildPayloadContext, formatContext, findReplyRef, getReplyTarget, getReplyMention, clearPending, forgetPending, start, stop };
   }
 
   const { storage } = vendetta.plugin;
@@ -718,7 +744,7 @@
     try { return SelectedChannelStore ? SelectedChannelStore.getChannelId() : undefined; } catch (e) { return undefined; }
   }
 
-  const { buildPayloadContext, formatContext, findReplyRef, getReplyTarget, forgetPending, start: startReplyWatch, stop: stopReplyWatch } = createReplyContext({ metro, log });
+  const { buildPayloadContext, formatContext, findReplyRef, getReplyTarget, getReplyMention, clearPending, start: startReplyWatch, stop: stopReplyWatch } = createReplyContext({ metro, log });
 
   function PreviewSheet(props) {
     const { View, Text, TextInput, TouchableOpacity, ScrollView } = RN;
@@ -881,6 +907,7 @@
   }
 
 
+  let sendShapeReported = false;
   function patchSendMessage() {
     if (!MessageModules || typeof MessageModules.sendMessage !== "function") {
       log("MessageModules.sendMessage not found");
@@ -889,6 +916,7 @@
     unpatches.push(
       instead("sendMessage", MessageModules, function (args, orig) {
         try {
+          if (!sendShapeReported) { sendShapeReported = true; log("sendMessage args:", describeArgs(args)); }
           if (bypass || !storage.autoRewrite) return orig(...args);
           const msg = args[1];
           const content = msg && typeof msg.content === "string" ? msg.content : "";
@@ -1013,9 +1041,11 @@
 
         // Capture the reply target NOW, before the API call. Slash UI clears the pending reply.
         let replyTarget = null;
+        let replyMention = null;
         let replyContext = "";
         try {
           replyTarget = getReplyTarget(channelId);
+          replyMention = getReplyMention(channelId);
           replyContext = buildPayloadContext(channelId, [], null);
         } catch (e) {
           log("reply capture failed:", e && e.message);
@@ -1037,21 +1067,24 @@
             invalidEmojis: [],
             validNonShortcutEmojis: [],
           };
+          // Discord's sendMessage is (channelId, message, waitForChannel, extra);
+          // the reply reference lives in `extra`, not in the message itself.
+          const extra = {};
           if (replyTarget && replyTarget.id) {
-            const ref = {
-              message_id: String(replyTarget.id),
-              channel_id: String(replyTarget.channel_id || replyTarget.channelId || channelId),
+            extra.messageReference = {
               guild_id: replyTarget.guild_id || replyTarget.guildId || undefined,
-              type: 0,
+              channel_id: String(replyTarget.channel_id || replyTarget.channelId || channelId),
+              message_id: String(replyTarget.id),
             };
-            payload.messageReference = ref;
-            payload.message_reference = ref;
-            log("slash reply ref", ref.message_id);
+            if (replyMention !== null) {
+              extra.allowedMentions = { parse: ["users", "roles", "everyone"], replied_user: replyMention };
+            }
+            log("slash reply ref", extra.messageReference.message_id, "mention:", replyMention);
           } else {
             log("slash: no reply target for", channelId);
           }
-          MessageModules.sendMessage(channelId, payload);
-          forgetPending(channelId);
+          MessageModules.sendMessage(channelId, payload, undefined, extra);
+          clearPending(channelId);
         } catch (e) {
           log("/groq failed:", e && e.message);
           showToast("Groq: " + ((e && e.message) || "failed to send message"));
