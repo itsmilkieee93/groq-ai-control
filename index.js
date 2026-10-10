@@ -472,7 +472,7 @@
       const replyUserId = who.id || forwardAuthor.id;
       const historyLines = userHistoryLines(chId, replyUserId);
       const serverName = serverNickOf(guildIdOf(chId, msg), replyUserId, msg);
-      log("snowflake anchor", anchorId || "none", win ? "window " + win.items.length : "no window");
+      log("snowflake anchor", anchorId || "none", win ? "window " + win.items.length : "no window", "history " + historyLines.length, "server_name " + (serverName ? "yes" : "no"));
       const shortId = anchorId ? "…" + anchorId.slice(-6) : "none";
       if (win) toast("ok", "Anchor " + shortId + " · window " + win.items.length + " · history " + historyLines.length);
       else toast("warn", "Anchor " + shortId + ": not in loaded messages, no window · history " + historyLines.length);
