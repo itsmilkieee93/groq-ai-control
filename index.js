@@ -366,7 +366,16 @@
       return formatContext(resolveReplyInfo(channelId, args, explicitRef));
     }
 
-    return { buildPayloadContext, formatContext, findReplyRef, start, stop };
+    function getReplyTarget(channelId) {
+      try {
+        const msg = getPendingReplyMessage(channelId) || cachedPending(channelId);
+        return msg && typeof msg === "object" ? msg : null;
+      } catch (e) {
+        return null;
+      }
+    }
+
+    return { buildPayloadContext, formatContext, findReplyRef, getReplyTarget, forgetPending, start, stop };
   }
 
   const { storage } = vendetta.plugin;
@@ -709,14 +718,15 @@
     try { return SelectedChannelStore ? SelectedChannelStore.getChannelId() : undefined; } catch (e) { return undefined; }
   }
 
-  const { buildPayloadContext, formatContext, findReplyRef, getReplyTarget, start: startReplyWatch, stop: stopReplyWatch } = createReplyContext({ metro, log });
+  const { buildPayloadContext, formatContext, findReplyRef, getReplyTarget, forgetPending, start: startReplyWatch, stop: stopReplyWatch } = createReplyContext({ metro, log });
 
   function PreviewSheet(props) {
     const { View, Text, TextInput, TouchableOpacity, ScrollView } = RN;
-    const { original, finalText, finish, startEditing } = props;
+    const { original, finalText, finish, startEditing, onShown } = props;
     const C = { text: "#f2f3f5", muted: "#b5bac1", card: "#2b2d31", accent: "#5865f2", danger: "#da373c", neutral: "#4e5058" };
 
     React.useEffect(() => () => finish({ action: "cancel", text: original }), []);
+    React.useEffect(() => { if (typeof onShown === "function") onShown(); }, []);
 
     const [text, setText] = React.useState(finalText);
     const [editing, setEditing] = React.useState(!!startEditing);
@@ -769,17 +779,24 @@
       return new Promise((resolve) => {
         let done = false;
         const finish = (v) => { if (!done) { done = true; resolve(v); } };
-        // If the sheet never appears (slash UI still open), fall back to Alert.
+        // If the sheet never mounts (slash UI still open), fall back to Alert.
+        // The timer is cleared by onShown as soon as the sheet is on screen.
         const timer = setTimeout(() => {
           if (done) return;
           log("action sheet did not open, using alert");
           showAlertPreview(original, finalText, startEditing).then(finish);
-        }, 1200);
+        }, 2500);
         try {
           ActionSheetModule.openLazy(
             Promise.resolve({ default: PreviewSheet }),
             "GroqPreview",
-            { original, finalText, finish: (v) => { clearTimeout(timer); finish(v); }, startEditing }
+            {
+              original,
+              finalText,
+              startEditing,
+              onShown: () => clearTimeout(timer),
+              finish: (v) => { clearTimeout(timer); finish(v); },
+            }
           );
         } catch (e) {
           clearTimeout(timer);
@@ -995,17 +1012,25 @@
         if (!original.trim()) return;
 
         // Capture the reply target NOW, before the API call. Slash UI clears the pending reply.
-        const replyTarget = getReplyTarget(channelId);
-        const replyContext = buildPayloadContext(channelId, [], null);
+        let replyTarget = null;
+        let replyContext = "";
+        try {
+          replyTarget = getReplyTarget(channelId);
+          replyContext = buildPayloadContext(channelId, [], null);
+        } catch (e) {
+          log("reply capture failed:", e && e.message);
+          try { replyContext = formatContext(null); } catch (e2) {}
+        }
         log("payload context (/groq):", replyContext.replace(/\n/g, " | ").slice(0, 180));
         log("slash target:", replyTarget && replyTarget.id);
 
-        // Let the slash UI close before the preview opens.
-        await sleep(300);
-        const finalText = await produceFinalText(original, channelId, false, replyContext);
-        if (finalText === null) return;
-
         try {
+          // Let the slash UI close before the preview opens.
+          if (RN.Keyboard && typeof RN.Keyboard.dismiss === "function") RN.Keyboard.dismiss();
+          await sleep(300);
+          const finalText = await produceFinalText(original, channelId, false, replyContext);
+          if (finalText === null) return;
+
           const payload = {
             content: finalText,
             tts: false,
@@ -1026,8 +1051,10 @@
             log("slash: no reply target for", channelId);
           }
           MessageModules.sendMessage(channelId, payload);
+          forgetPending(channelId);
         } catch (e) {
-          showToast("Groq: failed to send message");
+          log("/groq failed:", e && e.message);
+          showToast("Groq: " + ((e && e.message) || "failed to send message"));
         }
       },
     });
