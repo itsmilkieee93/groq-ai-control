@@ -327,8 +327,7 @@
     // 🌸 Snowflake anchor: the replied-to message's ID pins a slice of the channel history,
     // so the AI sees the exact conversation around what is being replied to.
     const DISCORD_EPOCH = 1420070400000;
-    const WINDOW_BEFORE = 4; // messages before the anchor
-    const WINDOW_AFTER = 6;  // messages after the anchor
+    // Window size, on/off and "include other people" are all user settings (Reply Context group).
     const WINDOW_LINE_MAX = 200;
 
     function snowflakeToMs(id) {
@@ -360,13 +359,20 @@
       }
     }
 
-    function sliceAnchorWindow(channelId, anchorId) {
+    function sliceAnchorWindow(channelId, anchorId, targetUserId) {
       if (!channelId || !anchorId) return null;
-      const all = getChannelMessages(channelId);
+      if (storage.ctxWindow === false) return null;
+      let all = getChannelMessages(channelId);
+      // "Include other people" off: keep only the reply target's messages (the anchor itself always stays).
+      if (storage.ctxIncludeOthers === false && targetUserId) {
+        all = all.filter((m) => String(m.id) === String(anchorId) || authorOf(m).id === String(targetUserId));
+      }
       const idx = all.findIndex((m) => String(m.id) === String(anchorId));
       if (idx === -1) return null;
-      const start = Math.max(0, idx - WINDOW_BEFORE);
-      const end = Math.min(all.length, idx + 1 + WINDOW_AFTER);
+      const before = ctxSize("ctxBefore", CTX_BEFORE_DEF);
+      const after = ctxSize("ctxAfter", CTX_AFTER_DEF);
+      const start = Math.max(0, idx - before);
+      const end = Math.min(all.length, idx + 1 + after);
       return { items: all.slice(start, end), anchorId: String(anchorId), hiddenBefore: start, hiddenAfter: all.length - end };
     }
 
@@ -468,13 +474,14 @@
       const anchorId = String(msg.id || (ref && (ref.message_id || ref.messageId)) || "");
       const anchorMs = snowflakeToMs(anchorId);
       const chId = channelId || msg.channel_id || msg.channelId;
-      const win = sliceAnchorWindow(chId, anchorId);
       const replyUserId = who.id || forwardAuthor.id;
+      const win = sliceAnchorWindow(chId, anchorId, replyUserId);
       const historyLines = userHistoryLines(chId, replyUserId);
       const serverName = serverNickOf(guildIdOf(chId, msg), replyUserId, msg);
       log("snowflake anchor", anchorId || "none", win ? "window " + win.items.length : "no window", "history " + historyLines.length, "server_name " + (serverName ? "yes" : "no"));
       const shortId = anchorId ? "…" + anchorId.slice(-6) : "none";
-      if (win) toast("ok", "Anchor " + shortId + " · window " + win.items.length + " · history " + historyLines.length);
+      if (win) toast("ok", "Anchor " + shortId + " · window " + win.items.length + (storage.ctxIncludeOthers === false ? " (target only)" : "") + " · history " + historyLines.length);
+      else if (storage.ctxWindow === false) toast("info", "Anchor " + shortId + ": window is off in settings · history " + historyLines.length);
       else toast("warn", "Anchor " + shortId + ": not in loaded messages, no window · history " + historyLines.length);
       return {
         messageId: anchorId,
@@ -843,6 +850,17 @@
       hint: "5 to 120. How long to wait for Groq before trying the next key. Default 20" },
   };
 
+  // ---- Reply context window settings ----
+  const CTX_BEFORE_DEF = 4;
+  const CTX_AFTER_DEF = 6;
+  const CTX_BEFORE_OPTIONS = [0, 2, 4, 6, 10];
+  const CTX_AFTER_OPTIONS = [0, 3, 6, 10, 15];
+
+  function ctxSize(key, def) {
+    const n = parseInt(storage[key], 10);
+    return Number.isFinite(n) ? Math.min(30, Math.max(0, n)) : def;
+  }
+
   function readAdv(spec) {
     const n = parseFloat(storage[spec.key]);
     if (!Number.isFinite(n)) return spec.def;
@@ -944,6 +962,58 @@
         throw err;
       }
       return out;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  const STATUS_HINTS = {
+    200: "OK · working",
+    400: "Bad request · model or params rejected",
+    401: "Unauthorized · invalid API key",
+    403: "Forbidden · key blocked or no access",
+    404: "Not found · model unavailable for this key",
+    413: "Request too large",
+    429: "Too many requests · rate limit or quota hit (key is valid)",
+    498: "Capacity exceeded · try again later",
+    500: "Groq server error",
+    502: "Bad gateway · Groq is having trouble",
+    503: "Groq unavailable · try again later",
+  };
+
+  // Sends a tiny real chat request with the selected model, so the result reflects what rewrites will hit.
+  async function testGroqKey(apiKey) {
+    const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
+    const timer = controller ? setTimeout(() => controller.abort(), 15000) : null;
+    const model = MODELS.includes(storage.model) ? storage.model : DEFAULT_MODEL;
+    const started = Date.now();
+    try {
+      const res = await fetch(GROQ_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: "Bearer " + apiKey },
+        body: JSON.stringify({
+          model: model,
+          reasoning_effort: "low",
+          include_reasoning: false,
+          max_completion_tokens: 32,
+          messages: [{ role: "user", content: "Reply with the single word: OK" }],
+        }),
+        signal: controller ? controller.signal : undefined,
+      });
+      const ms = Date.now() - started;
+      let detail = "";
+      if (!res.ok) {
+        try {
+          const d = await res.json();
+          if (d && d.error && d.error.message) detail = String(d.error.message).slice(0, 140);
+        } catch (e) {}
+      }
+      const hint = STATUS_HINTS[res.status] || (res.ok ? "OK" : res.status >= 500 ? "Groq server error" : "Request failed");
+      const summary = res.status + " " + hint + (res.ok ? " (" + model.replace("openai/", "") + ", " + ms + " ms)" : detail ? " — " + detail : "");
+      return { ok: res.ok, status: res.status, ms: ms, summary: summary };
+    } catch (e) {
+      const aborted = !!(e && e.name === "AbortError");
+      return { ok: false, status: 0, ms: Date.now() - started, summary: aborted ? "Timed out after 15s" : "Network error · " + ((e && e.message) || "unknown") };
     } finally {
       if (timer) clearTimeout(timer);
     }
@@ -1493,6 +1563,8 @@
     const native = !!(TableRowGroup && TableSwitchRow && TableRow);
 
     const [newKey, setNewKey] = React.useState("");
+    const [testState, setTestState] = React.useState({}); // key id -> { busy, ok, text }
+    const [testingAll, setTestingAll] = React.useState(false);
     const [duration, setDuration] = React.useState(Number(storage.typingDuration != null ? storage.typingDuration : 3));
     const [durationText, setDurationText] = React.useState(String(storage.typingDuration != null ? storage.typingDuration : 3));
     const [customPrompt, setCustomPrompt] = React.useState(
@@ -1526,6 +1598,26 @@
       const nextId = list.reduce((m, x) => Math.max(m, (x && x.id) || 0), 0) + 1;
       storage.apiKeys = list.concat([{ id: nextId, key: k }]);
       setNewKey("");
+    };
+    const runKeyTests = async () => {
+      const list = (Array.isArray(storage.apiKeys) ? storage.apiKeys : []).filter((x) => x && typeof x.key === "string" && x.key.trim());
+      if (!list.length) return showToast("Add an API key first");
+      if (testingAll) return;
+      setTestingAll(true);
+      const busy = {};
+      list.forEach((k) => { busy[k.id] = { busy: true, ok: false, text: "Testing…" }; });
+      setTestState(busy);
+      let good = 0;
+      for (let i = 0; i < list.length; i++) {
+        const k = list[i];
+        const r = await testGroqKey(k.key.trim());
+        if (r.ok) good++;
+        log("key test #" + k.id + ":", r.status, r.ok ? "ok" : r.summary);
+        setTestState((prev) => Object.assign({}, prev, { [k.id]: { busy: false, ok: r.ok, text: (r.ok ? "✅ " : "❌ ") + r.summary } }));
+        if (list.length === 1) showToast((r.ok ? "✅ " : "❌ ") + "Key #" + k.id + ": " + r.summary);
+      }
+      if (list.length > 1) showToast((good === list.length ? "✅ " : "⚠️ ") + good + "/" + list.length + " keys working");
+      setTestingAll(false);
     };
     const removeKey = (id) => {
       storage.apiKeys = (storage.apiKeys || []).filter((x) => x && x.id !== id);
@@ -1735,6 +1827,20 @@
         },
       });
     };
+    const chipColors0 = () => ({ accent: "#5865f2", input: isLightTheme() ? "#e3e5e8" : "#2b2d31", muted: P.muted });
+    const ctxWindowOn = storage.ctxWindow !== false;
+    const ctxPanel = ctxWindowOn
+      ? h(View, { style: { paddingHorizontal: 16, paddingTop: 12, paddingBottom: 6, backgroundColor: ROW_BG } },
+          h(View, { style: { marginBottom: 6 } },
+            h(Text, { style: { color: P.muted, fontSize: 12, fontWeight: "700", textTransform: "uppercase", marginBottom: 8 } }, "Messages before the target"),
+            Chips(CTX_BEFORE_OPTIONS, ctxSize("ctxBefore", CTX_BEFORE_DEF), (n) => { storage.ctxBefore = n; }, chipColors0(), null)
+          ),
+          h(View, { style: { marginBottom: 6 } },
+            h(Text, { style: { color: P.muted, fontSize: 12, fontWeight: "700", textTransform: "uppercase", marginBottom: 8 } }, "Messages after the target"),
+            Chips(CTX_AFTER_OPTIONS, ctxSize("ctxAfter", CTX_AFTER_DEF), (n) => { storage.ctxAfter = n; }, chipColors0(), null)
+          )
+        )
+      : null;
     const effort = getGenParams().effort;
     const chipColors = { accent: "#5865f2", input: isLightTheme() ? "#e3e5e8" : "#2b2d31", muted: P.muted };
     const advancedOn = storage.advancedEnabled === true;
@@ -1770,6 +1876,15 @@
         ...PERSONALITY_OPTIONS.map((opt) => pick(opt, opt === personality, () => { storage.personality = opt; })),
         customField,
       ]),
+      group("Reply Context 💬", [
+        sw("Messages around reply target", ctxWindowOn, (v) => { storage.ctxWindow = v; },
+          "Look up channel messages around the replied-to message ID and send them to the AI"),
+        ctxWindowOn
+          ? sw("Include other people", storage.ctxIncludeOthers !== false, (v) => { storage.ctxIncludeOthers = v; },
+              storage.ctxIncludeOthers !== false ? "Messages from everyone nearby, not just the reply target" : "Only the reply target's messages")
+          : null,
+        ctxPanel,
+      ]),
       group("Advanced 🛠️", [
         sw("Advanced settings", advancedOn, onAdvancedToggle,
           advancedOn ? "Custom values are in use" : "Unlock temperature, max tokens, and more"),
@@ -1788,6 +1903,7 @@
         keys.length === 0 ? h(TableRow, { label: "No API keys yet" }) : null,
         ...keys.map((k) => h(TableRow, {
           label: "#" + k.id + "  " + mask(k.key),
+          subLabel: testState[k.id] ? testState[k.id].text : undefined,
           trailing: button("Delete", RED, () => confirmRemoveKey(k), true),
         })),
         h(View, { style: { paddingHorizontal: 16, paddingVertical: 12, backgroundColor: ROW_BG } },
@@ -1803,6 +1919,11 @@
         h(View, { style: { paddingHorizontal: 16, paddingBottom: 16, paddingTop: 4, backgroundColor: ROW_BG } },
           button("Add API key", GREEN, addKey, false)
         ),
+        keys.length > 0
+          ? h(View, { style: { paddingHorizontal: 16, paddingBottom: 16, backgroundColor: ROW_BG } },
+              button(testingAll ? "Testing…" : "Test API keys", "#5865f2", runKeyTests, false)
+            )
+          : null,
       ]),
     ];
 
@@ -1912,6 +2033,10 @@
     if (typeof storage.skipBotCommands !== "boolean") storage.skipBotCommands = true;
     if (typeof storage.debugToasts !== "boolean") storage.debugToasts = false;
     if (typeof storage.logToFile !== "boolean") storage.logToFile = false;
+    if (typeof storage.ctxWindow !== "boolean") storage.ctxWindow = true;
+    if (typeof storage.ctxIncludeOthers !== "boolean") storage.ctxIncludeOthers = true;
+    if (!Number.isFinite(parseInt(storage.ctxBefore, 10))) storage.ctxBefore = CTX_BEFORE_DEF;
+    if (!Number.isFinite(parseInt(storage.ctxAfter, 10))) storage.ctxAfter = CTX_AFTER_DEF;
     Object.keys(ADV_SPEC).forEach((k) => {
       if (!Number.isFinite(parseFloat(storage[ADV_SPEC[k].key]))) storage[ADV_SPEC[k].key] = ADV_SPEC[k].def;
     });
