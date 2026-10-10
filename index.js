@@ -1032,14 +1032,15 @@
 
   function GroqSettingsPage() {
     useProxy(storage);
-    const { ScrollView, Text, View, TextInput, TouchableOpacity, Switch } = RN;
-    const Forms = (vendetta.ui && vendetta.ui.components && vendetta.ui.components.Forms) || {};
-    const FormSection = Forms.FormSection;
-    const FormSwitchRow = Forms.FormSwitchRow;
-    const FormDivider = Forms.FormDivider;
-    const FormInput = Forms.FormInput;
-    const FormText = Forms.FormText;
-    const native = !!(FormSection && FormSwitchRow && FormDivider);
+    const { ScrollView, Text, View, TextInput, Switch } = RN;
+    const Table = metro.findByProps("TableRowGroup", "TableSwitchRow", "TableRow") || {};
+    const TableRowGroup = Table.TableRowGroup;
+    const TableSwitchRow = Table.TableSwitchRow;
+    const TableRow = Table.TableRow;
+    const TableRadioGroup = Table.TableRadioGroup;
+    const TableRadioRow = Table.TableRadioRow;
+    const Stack = Table.Stack;
+    const native = !!(TableRowGroup && TableSwitchRow && TableRow);
 
     const [newKey, setNewKey] = React.useState("");
     const [duration, setDuration] = React.useState(String(storage.typingDuration != null ? storage.typingDuration : 3));
@@ -1078,118 +1079,111 @@
     const personality = PERSONALITY_OPTIONS.includes(storage.personality) ? storage.personality : "Casual/Slang";
 
     if (!native) {
-      log("Forms missing, settings page limited");
+      return h(ScrollView, { style: { flex: 1, padding: 16 } },
+        h(Text, null, "Discord table settings components were not found.")
+      );
     }
 
-    const textOf = (t) => {
-      if (typeof t === "string") return t;
-      if (t && typeof t === "object" && typeof t.nativeEvent === "object" && typeof t.nativeEvent.text === "string") return t.nativeEvent.text;
-      if (t && typeof t.target === "object" && typeof t.target.value === "string") return t.target.value;
-      return t == null ? "" : String(t);
-    };
+    const group = (title, rows) => h(TableRowGroup, { title: title }, rows);
+    const sw = (label, value, onValueChange, subLabel) =>
+      h(TableSwitchRow, { label: label, subLabel: subLabel, value: !!value, onValueChange: onValueChange });
 
-    const switchRow = (label, value, onValueChange, subLabel) =>
-      native
-        ? h(FormSwitchRow, { label: label, subLabel: subLabel, value: !!value, onValueChange: onValueChange })
-        : h(View, null, h(Text, null, label));
+    const modelRows = MODELS.map((m) =>
+      h(TableRadioRow || TableRow, {
+        key: m,
+        label: m.replace("openai/", ""),
+        selected: m === model,
+        trailing: m === model ? h(Text, { style: { color: "#5865f2", fontWeight: "700" } }, "✓") : undefined,
+        onPress: () => { storage.model = m; },
+      })
+    );
 
-    const divider = () => (native ? h(FormDivider) : null);
+    const personalityRows = PERSONALITY_OPTIONS.map((opt) =>
+      h(TableRadioRow || TableRow, {
+        key: opt,
+        label: opt,
+        selected: opt === personality,
+        trailing: opt === personality ? h(Text, { style: { color: "#5865f2", fontWeight: "700" } }, "✓") : undefined,
+        onPress: () => { storage.personality = opt; },
+      })
+    );
 
-    const pickRow = (label, selected, onPress) =>
-      h(
-        FormRow || View,
-        {
-          label,
-          trailing: selected ? h(Text, { style: { color: "#5865f2", fontWeight: "700" } }, "✓") : undefined,
-          onPress,
-        }
-      );
+    const keyRows = keys.map((k) =>
+      h(TableRow, {
+        key: "key-" + k.id,
+        label: "#" + k.id + "  " + mask(k.key),
+        trailing: h(Text, { style: { color: "#da373c", fontWeight: "600" } }, "Delete"),
+        onPress: () => removeKey(k.id),
+      })
+    );
 
-    const children = [
-      native ? h(FormSection, { title: "General" }, [
-        switchRow("Auto-rewrite all messages", storage.autoRewrite, (v) => { storage.autoRewrite = v; }, "No /groq needed"),
-        divider(),
-        switchRow("Auto-answer questions", storage.answerQuestions !== false, (v) => { storage.answerQuestions = v; }, "Math, translations, and other answers"),
-        divider(),
-        switchRow("Preview before sending", storage.previewBeforeSend !== false, (v) => { storage.previewBeforeSend = v; }, "Send / Edit / Copy prompt / Cancel"),
-      ]) : null,
-
-      native ? h(FormSection, { title: "Timing" }, [
-        FormInput
-          ? h(FormInput, {
-              title: "Typing duration (seconds)",
-              value: duration,
-              placeholder: "3",
-              keyboardType: "numeric",
-              onChange: (t) => {
-                const clean = textOf(t).replace(/[^0-9.]/g, "");
-                setDuration(clean);
-                const n = parseFloat(clean);
-                storage.typingDuration = Number.isFinite(n) && n >= 0 ? n : 0;
-              },
-            })
+    const body = [
+      group("General", [
+        sw("Auto-rewrite all messages", storage.autoRewrite, (v) => { storage.autoRewrite = v; }, "No /groq needed"),
+        sw("Auto-answer questions", storage.answerQuestions !== false, (v) => { storage.answerQuestions = v; }, "Math, translations, and other answers"),
+        sw("Preview before sending", storage.previewBeforeSend !== false, (v) => { storage.previewBeforeSend = v; }, "Send / Edit / Copy prompt / Cancel"),
+      ]),
+      group("Timing", [
+        h(View, { style: { paddingHorizontal: 16, paddingVertical: 10 } },
+          h(Text, { style: { color: "#f2f3f5", fontSize: 16, marginBottom: 6 } }, "Typing duration (seconds)"),
+          h(TextInput, {
+            value: duration,
+            keyboardType: "numeric",
+            placeholder: "3",
+            placeholderTextColor: "#b5bac1",
+            style: { color: "#f2f3f5", fontSize: 16, paddingVertical: 4 },
+            onChangeText: (t) => {
+              const clean = String(t || "").replace(/[^0-9.]/g, "");
+              setDuration(clean);
+              const n = parseFloat(clean);
+              storage.typingDuration = Number.isFinite(n) && n >= 0 ? n : 0;
+            },
+          })
+        ),
+      ]),
+      group("AI Model", modelRows),
+      group("AI Personality", [
+        ...personalityRows,
+        personality === "Custom"
+          ? h(View, { style: { paddingHorizontal: 16, paddingBottom: 12 } },
+              h(Text, { style: { color: "#b5bac1", fontSize: 12, marginBottom: 6 } }, "Custom prompt"),
+              h(TextInput, {
+                value: customPrompt,
+                multiline: true,
+                placeholder: "Custom prompt guidelines...",
+                placeholderTextColor: "#b5bac1",
+                style: { color: "#f2f3f5", fontSize: 15, minHeight: 90, textAlignVertical: "top" },
+                onChangeText: onCustomPromptChange,
+              })
+            )
           : null,
-      ]) : null,
-
-      native ? h(FormSection, { title: "AI Model" }, MODELS.reduce((rows, m, i) => {
-        if (i) rows.push(divider());
-        rows.push(pickRow(m.replace("openai/", ""), m === model, () => { storage.model = m; }));
-        return rows;
-      }, [])) : null,
-
-      native ? h(FormSection, { title: "AI Personality" }, [
-        ...PERSONALITY_OPTIONS.reduce((rows, opt, i) => {
-          if (i) rows.push(divider());
-          rows.push(pickRow(opt, opt === personality, () => { storage.personality = opt; }));
-          return rows;
-        }, []),
-        personality === "Custom" ? divider() : null,
-        personality === "Custom" && FormInput
-          ? h(FormInput, {
-              title: "Custom prompt",
-              value: customPrompt,
-              placeholder: "Custom prompt guidelines...",
-              multiline: true,
-              onChange: (t) => onCustomPromptChange(textOf(t)),
-            })
-          : null,
-      ]) : null,
-
-      native ? h(FormSection, { title: "Groq API Keys" }, [
+      ]),
+      group("Groq API Keys", [
         keys.length === 0
-          ? h(FormText || Text, { style: { color: "#b5bac1", padding: 16 } }, "No API keys yet.")
+          ? h(TableRow, { label: "No API keys yet" })
           : null,
-        ...keys.reduce((rows, k, i) => {
-          if (i) rows.push(divider());
-          rows.push(h(FormRow || View, {
-            label: "#" + k.id + "  " + mask(k.key),
-            trailing: h(Text, { style: { color: "#da373c", fontWeight: "600" } }, "Delete"),
-            onPress: () => removeKey(k.id),
-          }));
-          return rows;
-        }, []),
-        keys.length ? divider() : null,
-        FormInput
-          ? h(FormInput, {
-              title: "Add key",
-              value: newKey,
-              placeholder: "gsk_...",
-              onChange: (t) => setNewKey(textOf(t)),
-              onSubmitEditing: addKey,
-            })
-          : null,
-        h(FormRow || View, {
-          label: "Add API key",
-          onPress: addKey,
-        }),
-      ]) : null,
-
-      native && FormText
-        ? h(FormText, { style: { paddingHorizontal: 16, paddingVertical: 12, color: "#b5bac1" } }, keys.length + " key" + (keys.length === 1 ? "" : "s") + " saved")
-        : null,
+        ...keyRows,
+        h(View, { style: { paddingHorizontal: 16, paddingVertical: 10 } },
+          h(TextInput, {
+            value: newKey,
+            placeholder: "gsk_...",
+            placeholderTextColor: "#b5bac1",
+            autoCapitalize: "none",
+            autoCorrect: false,
+            style: { color: "#f2f3f5", fontSize: 15, paddingVertical: 4 },
+            onChangeText: setNewKey,
+            onSubmitEditing: addKey,
+          })
+        ),
+        h(TableRow, { label: "Add API key", onPress: addKey }),
+      ]),
     ];
 
-    return h(ScrollView, { style: { flex: 1 } }, children);
+    const content = Stack
+      ? h(Stack, { spacing: 12 }, body)
+      : h(View, { style: { gap: 12 } }, body);
+
+    return h(ScrollView, { style: { flex: 1 }, contentContainerStyle: { padding: 12, paddingBottom: 48 } }, content);
   }
 
   function openGroqPage() {
