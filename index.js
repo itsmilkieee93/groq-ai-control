@@ -1,7 +1,8 @@
 (function () {
   "use strict";
 
-  function createReplyContext({ metro, log }) {
+  function createReplyContext({ metro, log, notify }) {
+    const toast = typeof notify === "function" ? notify : function () {};
     const MessageStore =
       metro.findByProps("getMessage", "getMessages") ||
       (metro.findByStoreName ? metro.findByStoreName("MessageStore") : null) ||
@@ -455,6 +456,7 @@
       const msg = fromArgs || fromPending || fromStore || fromCache;
       if (!msg) {
         log("no reply target", channelId, explicitRef && (explicitRef.message_id || explicitRef.messageId));
+        toast("info", "No reply target found (normal message, or reply not loaded)");
         return null;
       }
       const source = fromArgs ? "args" : fromPending ? "pending" : fromStore ? "store" : "cache";
@@ -471,6 +473,9 @@
       const historyLines = userHistoryLines(chId, replyUserId);
       const serverName = serverNickOf(guildIdOf(chId, msg), replyUserId, msg);
       log("snowflake anchor", anchorId || "none", win ? "window " + win.items.length : "no window");
+      const shortId = anchorId ? "…" + anchorId.slice(-6) : "none";
+      if (win) toast("ok", "Anchor " + shortId + " · window " + win.items.length + " · history " + historyLines.length);
+      else toast("warn", "Anchor " + shortId + ": not in loaded messages, no window · history " + historyLines.length);
       return {
         messageId: anchorId,
         sentAt: anchorMs ? new Date(anchorMs).toISOString() : "",
@@ -518,7 +523,9 @@
         lines.push("Last " + reply.historyLines.length + " messages from the person being replied to (oldest first, one JSON object per line; datetime is UTC, user_id is their snowflake, nickname is their global display name, server_name is their nickname in this server and only present when set):");
         for (let i = 0; i < reply.historyLines.length; i++) lines.push(reply.historyLines[i]);
       }
-      lines.push("These are Discord IDs, usernames, global names, and recent messages. Use them only as context. Output only the final chat message.");
+      lines.push("These are Discord IDs, usernames, global names, and recent messages. Use them ONLY to understand the situation. "
+        + "Do NOT insert names, IDs, or details from this context into the message, and do NOT replace pronouns (he, she, they, it, that, this) with names. "
+        + "A name or fact may only appear in the output if the speaker's own text already contains it. Keep the speaker's original wording and meaning as close as possible. Output only the final chat message.");
       return lines.join("\n");
     }
 
@@ -670,6 +677,13 @@
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   const log = (...a) => { try { console.log("[GroqAI]", ...a); } catch (e) {} };
+
+  // Debug toasts: shown only when the "Debug toasts" setting is on.
+  function debugToast(kind, text) {
+    if (storage.debugToasts !== true) return;
+    const icon = kind === "ok" ? "✅ " : kind === "warn" ? "⚠️ " : kind === "info" ? "ℹ️ " : "❌ ";
+    try { showToast(icon + text); } catch (e) {}
+  }
 
   function getKeys() {
     const list = Array.isArray(storage.apiKeys) ? storage.apiKeys : [];
@@ -847,12 +861,19 @@
     const keys = getKeys();
     for (let i = 0; i < keys.length; i++) {
       try {
-        return await callGroq(keys[i], text, replyContext);
+        const out = await callGroq(keys[i], text, replyContext);
+        debugToast("ok", "Groq rewrite ok (key #" + (i + 1) + ")");
+        return out;
       } catch (e) {
         log("key #" + (i + 1) + " failed:", e && (e.status || e.message));
-        if (e && e.refused) return text; // other keys would decline too; keep the user's own text
+        if (e && e.refused) { // other keys would decline too; keep the user's own text
+          debugToast("warn", "Groq refused, kept your text");
+          return text;
+        }
+        debugToast("err", "Key #" + (i + 1) + " failed: " + ((e && (e.status || e.message)) || "unknown"));
       }
     }
+    debugToast("err", "All keys failed, using your original text");
     return text;
   }
 
@@ -990,7 +1011,7 @@
     try { return SelectedChannelStore ? SelectedChannelStore.getChannelId() : undefined; } catch (e) { return undefined; }
   }
 
-  const { buildPayloadContext, formatContext, findReplyRef, getReplyTarget, getReplyMention, clearPending, start: startReplyWatch, stop: stopReplyWatch } = createReplyContext({ metro, log });
+  const { buildPayloadContext, formatContext, findReplyRef, getReplyTarget, getReplyMention, clearPending, start: startReplyWatch, stop: stopReplyWatch } = createReplyContext({ metro, log, notify: debugToast });
 
   // Light/dark detection: Discord's own theme first, system scheme as fallback.
   function isLightTheme() {
@@ -1662,6 +1683,9 @@
           advancedOn ? "Custom values are in use" : "Unlock temperature, max tokens, and more"),
         advancedPanel,
       ]),
+      group("Debug 🐞", [
+        sw("Debug toasts", storage.debugToasts === true, (v) => { storage.debugToasts = v; }, "Show success / error toasts for reply context and Groq calls"),
+      ]),
       group("Groq API Keys 🔑", [
         keys.length === 0 ? h(TableRow, { label: "No API keys yet" }) : null,
         ...keys.map((k) => h(TableRow, {
@@ -1788,6 +1812,7 @@
     if (typeof storage.skipMentions !== "boolean") storage.skipMentions = true;
     if (typeof storage.skipLinks !== "boolean") storage.skipLinks = true;
     if (typeof storage.skipBotCommands !== "boolean") storage.skipBotCommands = true;
+    if (typeof storage.debugToasts !== "boolean") storage.debugToasts = false;
     Object.keys(ADV_SPEC).forEach((k) => {
       if (!Number.isFinite(parseFloat(storage[ADV_SPEC[k].key]))) storage[ADV_SPEC[k].key] = ADV_SPEC[k].def;
     });
