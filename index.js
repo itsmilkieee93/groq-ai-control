@@ -746,10 +746,31 @@
 
   const { buildPayloadContext, formatContext, findReplyRef, getReplyTarget, getReplyMention, clearPending, start: startReplyWatch, stop: stopReplyWatch } = createReplyContext({ metro, log });
 
+  // Light/dark detection: Discord's own theme first, system scheme as fallback.
+  function isLightTheme() {
+    try {
+      const store = metro.findByStoreName ? metro.findByStoreName("ThemeStore") : null;
+      const t = store && typeof store.theme === "string" ? store.theme : null;
+      if (t) return t === "light";
+    } catch (e) {}
+    try {
+      const scheme = RN.Appearance && typeof RN.Appearance.getColorScheme === "function" ? RN.Appearance.getColorScheme() : null;
+      if (scheme) return scheme === "light";
+    } catch (e) {}
+    return false;
+  }
+
+  function getPalette() {
+    return isLightTheme()
+      ? { rowBg: "#ffffff", border: "#d4d7dc", text: "#060607", title: "#313338", muted: "#4e5058", placeholder: "#80848e", card: "#f2f3f5" }
+      : { rowBg: "#151517", border: "#303136", text: "#f2f3f5", title: "#dbdee1", muted: "#b5bac1", placeholder: "#80848e", card: "#2b2d31" };
+  }
+
   function PreviewSheet(props) {
     const { View, Text, TextInput, TouchableOpacity, ScrollView } = RN;
     const { original, finalText, finish, startEditing, onShown } = props;
-    const C = { text: "#f2f3f5", muted: "#b5bac1", card: "#2b2d31", accent: "#5865f2", danger: "#da373c", neutral: "#4e5058" };
+    const P = getPalette();
+    const C = { text: P.text, muted: P.muted, card: P.card, accent: "#5865f2", danger: "#da373c", neutral: "#4e5058" };
 
     React.useEffect(() => () => finish({ action: "cancel", text: original }), []);
     React.useEffect(() => { if (typeof onShown === "function") onShown(); }, []);
@@ -1154,24 +1175,26 @@
     const group = (title, rows) => h(TableRowGroup, { title: title }, rows.filter(Boolean));
 
     // Labelled text field drawn as a real input box (own column/row), not bare text.
+    const P = getPalette();
+    const ROW_BG = P.rowBg; // same fill as the option rows (TableRow)
     const BOX = {
-      backgroundColor: "#1e1f22",
+      backgroundColor: ROW_BG,
       borderRadius: 10,
       borderWidth: 1,
-      borderColor: "#3f4147",
+      borderColor: P.border,
       paddingHorizontal: 12,
       paddingVertical: 8,
     };
     const inputField = (label, props, boxStyle) =>
       h(View, null,
         label
-          ? h(Text, { style: { color: "#b5bac1", fontSize: 12, fontWeight: "700", textTransform: "uppercase", marginBottom: 6 } }, label)
+          ? h(Text, { style: { color: P.muted, fontSize: 12, fontWeight: "700", textTransform: "uppercase", marginBottom: 6 } }, label)
           : null,
         h(View, { style: Object.assign({}, BOX, boxStyle || {}) },
           h(TextInput, Object.assign(
-            { placeholderTextColor: "#80848e" },
+            { placeholderTextColor: P.placeholder },
             props,
-            { style: Object.assign({ color: "#f2f3f5", fontSize: 15, padding: 0 }, props.style || {}) }
+            { style: Object.assign({ color: P.text, fontSize: 15, padding: 0 }, props.style || {}) }
           ))
         )
       );
@@ -1187,7 +1210,7 @@
 
     const durationContent = h(View, { style: { padding: 0, gap: 12 } },
       h(View, { style: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" } },
-        h(Text, { variant: "heading-md/semibold", style: { color: "#dbdee1", flexShrink: 1 } }, "Typing duration (seconds)"),
+        h(Text, { variant: "heading-md/semibold", style: { color: P.title, flexShrink: 1 } }, "Typing duration (seconds)"),
         inputField(null, {
           placeholder: "0",
           value: durationText,
@@ -1221,10 +1244,10 @@
     );
     const durationRow = Card
       ? h(Card, null, durationContent)
-      : h(View, { style: { backgroundColor: "#2b2d31", borderRadius: 16, overflow: "hidden", padding: 12 } }, durationContent);
+      : h(View, { style: { backgroundColor: P.card, borderRadius: 16, overflow: "hidden", padding: 12 } }, durationContent);
 
     const customField = personality === "Custom"
-      ? h(View, { style: { paddingHorizontal: 16, paddingVertical: 12 } },
+      ? h(View, { style: { paddingHorizontal: 16, paddingVertical: 12, backgroundColor: ROW_BG } },
           inputField("Custom prompt", {
             value: customPrompt,
             multiline: true,
@@ -1254,7 +1277,7 @@
           trailing: h(Text, { style: { color: "#da373c", fontWeight: "600" } }, "Delete"),
           onPress: () => removeKey(k.id),
         })),
-        h(View, { style: { paddingHorizontal: 16, paddingVertical: 12 } },
+        h(View, { style: { paddingHorizontal: 16, paddingVertical: 12, backgroundColor: ROW_BG } },
           inputField("New API key", {
             value: newKey,
             placeholder: "gsk_...",
