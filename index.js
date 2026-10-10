@@ -1032,18 +1032,19 @@
 
   function GroqSettingsPage() {
     useProxy(storage);
-    const { ScrollView, Text, View, TextInput, Switch } = RN;
+    const { ScrollView, Text, View, TextInput } = RN;
     const Table = metro.findByProps("TableRowGroup", "TableSwitchRow", "TableRow") || {};
     const TableRowGroup = Table.TableRowGroup;
     const TableSwitchRow = Table.TableSwitchRow;
     const TableRow = Table.TableRow;
-    const TableRadioGroup = Table.TableRadioGroup;
-    const TableRadioRow = Table.TableRadioRow;
     const Stack = Table.Stack;
+    const SliderMod = metro.findByProps("Slider");
+    const Slider = (SliderMod && typeof SliderMod.Slider === "function") ? SliderMod.Slider
+      : (typeof RN.Slider === "function" ? RN.Slider : null);
     const native = !!(TableRowGroup && TableSwitchRow && TableRow);
 
     const [newKey, setNewKey] = React.useState("");
-    const [duration, setDuration] = React.useState(String(storage.typingDuration != null ? storage.typingDuration : 3));
+    const [duration, setDuration] = React.useState(Number(storage.typingDuration != null ? storage.typingDuration : 3));
     const [customPrompt, setCustomPrompt] = React.useState(
       typeof storage.customPrompt === "string" ? storage.customPrompt : ""
     );
@@ -1084,38 +1085,66 @@
       );
     }
 
-    const group = (title, rows) => h(TableRowGroup, { title: title }, rows);
+    const group = (title, rows) => h(TableRowGroup, { title: title }, rows.filter(Boolean));
     const sw = (label, value, onValueChange, subLabel) =>
       h(TableSwitchRow, { label: label, subLabel: subLabel, value: !!value, onValueChange: onValueChange });
 
-    const modelRows = MODELS.map((m) =>
-      h(TableRadioRow || TableRow, {
-        key: m,
-        label: m.replace("openai/", ""),
-        selected: m === model,
-        trailing: m === model ? h(Text, { style: { color: "#5865f2", fontWeight: "700" } }, "✓") : undefined,
-        onPress: () => { storage.model = m; },
-      })
-    );
-
-    const personalityRows = PERSONALITY_OPTIONS.map((opt) =>
-      h(TableRadioRow || TableRow, {
-        key: opt,
-        label: opt,
-        selected: opt === personality,
-        trailing: opt === personality ? h(Text, { style: { color: "#5865f2", fontWeight: "700" } }, "✓") : undefined,
-        onPress: () => { storage.personality = opt; },
-      })
-    );
-
-    const keyRows = keys.map((k) =>
+    const pick = (label, selected, onPress) =>
       h(TableRow, {
-        key: "key-" + k.id,
-        label: "#" + k.id + "  " + mask(k.key),
-        trailing: h(Text, { style: { color: "#da373c", fontWeight: "600" } }, "Delete"),
-        onPress: () => removeKey(k.id),
-      })
+        label: label,
+        trailing: selected ? h(Text, { style: { color: "#5865f2", fontWeight: "700", fontSize: 18 } }, "✓") : undefined,
+        onPress: onPress,
+      });
+
+    const durationRow = h(View, { style: { paddingHorizontal: 16, paddingVertical: 12 } },
+      h(View, { style: { flexDirection: "row", justifyContent: "space-between", marginBottom: 8 } },
+        h(Text, { style: { color: "#f2f3f5", fontSize: 16 } }, "Typing duration"),
+        h(Text, { style: { color: "#b5bac1", fontSize: 16 } }, duration.toFixed(1).replace(/\.0$/, "") + "s")
+      ),
+      Slider
+        ? h(Slider, {
+            value: duration,
+            minimumValue: 0,
+            maximumValue: 15,
+            step: 0.5,
+            minimumTrackTintColor: "#5865f2",
+            maximumTrackTintColor: "#4e5058",
+            thumbTintColor: "#ffffff",
+            onValueChange: (v) => {
+              const n = Math.round(Number(v) * 2) / 2;
+              setDuration(n);
+              storage.typingDuration = n;
+            },
+            onSlidingComplete: (v) => {
+              const n = Math.round(Number(v) * 2) / 2;
+              setDuration(n);
+              storage.typingDuration = n;
+            },
+          })
+        : h(TextInput, {
+            value: String(duration),
+            keyboardType: "numeric",
+            style: { color: "#f2f3f5", fontSize: 16 },
+            onChangeText: (t) => {
+              const n = parseFloat(String(t).replace(/[^0-9.]/g, ""));
+              if (Number.isFinite(n)) { setDuration(n); storage.typingDuration = n; }
+            },
+          })
     );
+
+    const customField = personality === "Custom"
+      ? h(View, { style: { paddingHorizontal: 16, paddingBottom: 12 } },
+          h(Text, { style: { color: "#b5bac1", fontSize: 12, marginBottom: 6 } }, "Custom prompt"),
+          h(TextInput, {
+            value: customPrompt,
+            multiline: true,
+            placeholder: "Custom prompt guidelines...",
+            placeholderTextColor: "#b5bac1",
+            style: { color: "#f2f3f5", fontSize: 15, minHeight: 90, textAlignVertical: "top" },
+            onChangeText: onCustomPromptChange,
+          })
+        )
+      : null;
 
     const body = [
       group("General", [
@@ -1123,54 +1152,27 @@
         sw("Auto-answer questions", storage.answerQuestions !== false, (v) => { storage.answerQuestions = v; }, "Math, translations, and other answers"),
         sw("Preview before sending", storage.previewBeforeSend !== false, (v) => { storage.previewBeforeSend = v; }, "Send / Edit / Copy prompt / Cancel"),
       ]),
-      group("Timing", [
-        h(View, { style: { paddingHorizontal: 16, paddingVertical: 10 } },
-          h(Text, { style: { color: "#f2f3f5", fontSize: 16, marginBottom: 6 } }, "Typing duration (seconds)"),
-          h(TextInput, {
-            value: duration,
-            keyboardType: "numeric",
-            placeholder: "3",
-            placeholderTextColor: "#b5bac1",
-            style: { color: "#f2f3f5", fontSize: 16, paddingVertical: 4 },
-            onChangeText: (t) => {
-              const clean = String(t || "").replace(/[^0-9.]/g, "");
-              setDuration(clean);
-              const n = parseFloat(clean);
-              storage.typingDuration = Number.isFinite(n) && n >= 0 ? n : 0;
-            },
-          })
-        ),
-      ]),
-      group("AI Model", modelRows),
+      group("Timing", [durationRow]),
+      group("AI Model", MODELS.map((m) => pick(m.replace("openai/", ""), m === model, () => { storage.model = m; }))),
       group("AI Personality", [
-        ...personalityRows,
-        personality === "Custom"
-          ? h(View, { style: { paddingHorizontal: 16, paddingBottom: 12 } },
-              h(Text, { style: { color: "#b5bac1", fontSize: 12, marginBottom: 6 } }, "Custom prompt"),
-              h(TextInput, {
-                value: customPrompt,
-                multiline: true,
-                placeholder: "Custom prompt guidelines...",
-                placeholderTextColor: "#b5bac1",
-                style: { color: "#f2f3f5", fontSize: 15, minHeight: 90, textAlignVertical: "top" },
-                onChangeText: onCustomPromptChange,
-              })
-            )
-          : null,
+        ...PERSONALITY_OPTIONS.map((opt) => pick(opt, opt === personality, () => { storage.personality = opt; })),
+        customField,
       ]),
       group("Groq API Keys", [
-        keys.length === 0
-          ? h(TableRow, { label: "No API keys yet" })
-          : null,
-        ...keyRows,
-        h(View, { style: { paddingHorizontal: 16, paddingVertical: 10 } },
+        keys.length === 0 ? h(TableRow, { label: "No API keys yet" }) : null,
+        ...keys.map((k) => h(TableRow, {
+          label: "#" + k.id + "  " + mask(k.key),
+          trailing: h(Text, { style: { color: "#da373c", fontWeight: "600" } }, "Delete"),
+          onPress: () => removeKey(k.id),
+        })),
+        h(View, { style: { paddingHorizontal: 16, paddingVertical: 8 } },
           h(TextInput, {
             value: newKey,
             placeholder: "gsk_...",
             placeholderTextColor: "#b5bac1",
             autoCapitalize: "none",
             autoCorrect: false,
-            style: { color: "#f2f3f5", fontSize: 15, paddingVertical: 4 },
+            style: { color: "#f2f3f5", fontSize: 15, paddingVertical: 6 },
             onChangeText: setNewKey,
             onSubmitEditing: addKey,
           })
