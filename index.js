@@ -42,13 +42,14 @@
           type !== "DELETE_PENDING_REPLY" && type !== "CLEAR_PENDING_REPLY") return;
       const channelId = action.channelId || action.channel_id || (action.channel && action.channel.id);
       if (type === "DELETE_PENDING_REPLY" || type === "CLEAR_PENDING_REPLY") {
-        // Keep the cached message until send reads it. Discord clears the
-        // pending reply as the send starts, which is before our hook runs.
         return;
       }
       const message = action.message || action.referencedMessage || action.referenced_message;
+      if (message && !message.id && (action.messageId || action.message_id)) {
+        message.id = action.messageId || action.message_id;
+      }
       rememberPending(channelId, message);
-      if (message) log("cached swipe reply", channelId, textOfMessage(message).slice(0, 80));
+      if (message) log("cached swipe reply", channelId, message.id, textOfMessage(message).slice(0, 80));
     }
 
     function start() {
@@ -986,9 +987,11 @@
         const channelId = ctx && ctx.channel ? ctx.channel.id : undefined;
         if (!original.trim()) return;
 
-        // Same reply resolution as auto-rewrite (pending reply / swipe cache / store)
+        // Capture the reply target NOW, before the API call. Slash UI clears the pending reply.
+        const replyTarget = getReplyTarget(channelId);
         const replyContext = buildPayloadContext(channelId, [], null);
         log("payload context (/groq):", replyContext.replace(/\n/g, " | ").slice(0, 180));
+        log("slash target:", replyTarget && replyTarget.id);
 
         const finalText = await produceFinalText(original, channelId, false, replyContext);
         if (finalText === null) return;
@@ -1000,26 +1003,23 @@
             invalidEmojis: [],
             validNonShortcutEmojis: [],
           };
-          // Keep Discord reply UI if user was swiping a message
-          try {
-            const target = getReplyTarget(channelId);
-            if (target && target.id) {
-              payload.messageReference = {
-                message_id: String(target.id),
-                channel_id: String(target.channel_id || target.channelId || channelId),
-                guild_id: target.guild_id || target.guildId || undefined,
-                type: 0,
-              };
-              log("slash reply ref", payload.messageReference.message_id);
-            } else {
-              log("slash: no reply target for", channelId);
-            }
-          } catch (e) {}
+          if (replyTarget && replyTarget.id) {
+            const ref = {
+              message_id: String(replyTarget.id),
+              channel_id: String(replyTarget.channel_id || replyTarget.channelId || channelId),
+              guild_id: replyTarget.guild_id || replyTarget.guildId || undefined,
+              type: 0,
+            };
+            payload.messageReference = ref;
+            payload.message_reference = ref;
+            log("slash reply ref", ref.message_id);
+          } else {
+            log("slash: no reply target for", channelId);
+          }
           MessageModules.sendMessage(channelId, payload);
         } catch (e) {
           showToast("Groq: failed to send message");
         }
-        // nothing returned -> Discord won't send a second copy
       },
     });
   }
@@ -1035,10 +1035,13 @@
     const SliderMod = metro.findByProps("Slider");
     const Slider = (SliderMod && typeof SliderMod.Slider === "function") ? SliderMod.Slider
       : (typeof RN.Slider === "function" ? RN.Slider : null);
+    const CardMod = metro.findByProps("Card");
+    const Card = CardMod && CardMod.Card;
     const native = !!(TableRowGroup && TableSwitchRow && TableRow);
 
     const [newKey, setNewKey] = React.useState("");
     const [duration, setDuration] = React.useState(Number(storage.typingDuration != null ? storage.typingDuration : 3));
+    const [durationText, setDurationText] = React.useState(String(storage.typingDuration != null ? storage.typingDuration : 3));
     const [customPrompt, setCustomPrompt] = React.useState(
       typeof storage.customPrompt === "string" ? storage.customPrompt : ""
     );
@@ -1090,41 +1093,46 @@
         onPress: onPress,
       });
 
-    const durationRow = h(View, { style: { paddingHorizontal: 16, paddingVertical: 12 } },
-      h(View, { style: { flexDirection: "row", justifyContent: "space-between", marginBottom: 8 } },
-        h(Text, { style: { color: "#f2f3f5", fontSize: 16 } }, "Typing duration"),
-        h(Text, { style: { color: "#b5bac1", fontSize: 16 } }, duration.toFixed(1).replace(/\.0$/, "") + "s")
+    const durationContent = h(View, { style: { padding: 0, gap: 12 } },
+      h(View, { style: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" } },
+        h(Text, { variant: "heading-md/semibold", style: { color: "#dbdee1", flexShrink: 1 } }, "Typing duration (seconds)"),
+        h(View, { style: { width: 80 } },
+          h(TextInput, {
+            placeholder: "0",
+            value: durationText,
+            keyboardType: "numeric",
+            size: "sm",
+            style: { color: "#f2f3f5", fontSize: 14, textAlign: "center" },
+            onChangeText: (t) => {
+              setDurationText(t);
+              if (t === "" || t.endsWith(".")) return;
+              const n = parseFloat(t);
+              if (Number.isFinite(n) && n >= 0 && n <= 15) {
+                setDuration(n);
+                storage.typingDuration = n;
+              }
+            },
+          })
+        )
       ),
       Slider
         ? h(Slider, {
-            value: duration,
+            value: Math.min(15, Math.max(0, duration)),
             minimumValue: 0,
             maximumValue: 15,
             step: 0.5,
-            minimumTrackTintColor: "#5865f2",
-            maximumTrackTintColor: "#4e5058",
-            thumbTintColor: "#ffffff",
             onValueChange: (v) => {
               const n = Math.round(Number(v) * 2) / 2;
               setDuration(n);
-              storage.typingDuration = n;
-            },
-            onSlidingComplete: (v) => {
-              const n = Math.round(Number(v) * 2) / 2;
-              setDuration(n);
+              setDurationText(String(n));
               storage.typingDuration = n;
             },
           })
-        : h(TextInput, {
-            value: String(duration),
-            keyboardType: "numeric",
-            style: { color: "#f2f3f5", fontSize: 16 },
-            onChangeText: (t) => {
-              const n = parseFloat(String(t).replace(/[^0-9.]/g, ""));
-              if (Number.isFinite(n)) { setDuration(n); storage.typingDuration = n; }
-            },
-          })
+        : null
     );
+    const durationRow = Card
+      ? h(Card, null, durationContent)
+      : h(View, { style: { backgroundColor: "#2b2d31", borderRadius: 16, overflow: "hidden", padding: 12 } }, durationContent);
 
     const customField = personality === "Custom"
       ? h(View, { style: { paddingHorizontal: 16, paddingBottom: 12 } },
