@@ -708,7 +708,7 @@
     try { return SelectedChannelStore ? SelectedChannelStore.getChannelId() : undefined; } catch (e) { return undefined; }
   }
 
-  const { buildPayloadContext, formatContext, findReplyRef, start: startReplyWatch, stop: stopReplyWatch } = createReplyContext({ metro, log });
+  const { buildPayloadContext, formatContext, findReplyRef, getReplyTarget, start: startReplyWatch, stop: stopReplyWatch } = createReplyContext({ metro, log });
 
   function PreviewSheet(props) {
     const { View, Text, TextInput, TouchableOpacity, ScrollView } = RN;
@@ -1002,23 +1002,17 @@
           };
           // Keep Discord reply UI if user was swiping a message
           try {
-            const PendingReplyStore =
-              (metro.findByStoreName && (
-                metro.findByStoreName("PendingReplyStore") ||
-                metro.findByStoreName("ReplyStore")
-              )) ||
-              metro.findByProps("getPendingReply") ||
-              null;
-            const pending = PendingReplyStore && typeof PendingReplyStore.getPendingReply === "function"
-              ? PendingReplyStore.getPendingReply(channelId)
-              : null;
-            const refMsg = pending && (pending.message || pending);
-            if (refMsg && refMsg.id) {
+            const target = getReplyTarget(channelId);
+            if (target && target.id) {
               payload.messageReference = {
-                message_id: String(refMsg.id),
-                channel_id: String(refMsg.channel_id || refMsg.channelId || channelId),
-                guild_id: refMsg.guild_id || refMsg.guildId || undefined,
+                message_id: String(target.id),
+                channel_id: String(target.channel_id || target.channelId || channelId),
+                guild_id: target.guild_id || target.guildId || undefined,
+                type: 0,
               };
+              log("slash reply ref", payload.messageReference.message_id);
+            } else {
+              log("slash: no reply target for", channelId);
             }
           } catch (e) {}
           MessageModules.sendMessage(channelId, payload);
