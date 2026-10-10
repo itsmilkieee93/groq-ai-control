@@ -986,16 +986,42 @@
         const channelId = ctx && ctx.channel ? ctx.channel.id : undefined;
         if (!original.trim()) return;
 
-        const finalText = await produceFinalText(original, channelId, false, formatContext(null));
+        // Same reply resolution as auto-rewrite (pending reply / swipe cache / store)
+        const replyContext = buildPayloadContext(channelId, [], null);
+        log("payload context (/groq):", replyContext.replace(/\n/g, " | ").slice(0, 180));
+
+        const finalText = await produceFinalText(original, channelId, false, replyContext);
         if (finalText === null) return;
 
         try {
-          MessageModules.sendMessage(channelId, {
+          const payload = {
             content: finalText,
             tts: false,
             invalidEmojis: [],
             validNonShortcutEmojis: [],
-          });
+          };
+          // Keep Discord reply UI if user was swiping a message
+          try {
+            const PendingReplyStore =
+              (metro.findByStoreName && (
+                metro.findByStoreName("PendingReplyStore") ||
+                metro.findByStoreName("ReplyStore")
+              )) ||
+              metro.findByProps("getPendingReply") ||
+              null;
+            const pending = PendingReplyStore && typeof PendingReplyStore.getPendingReply === "function"
+              ? PendingReplyStore.getPendingReply(channelId)
+              : null;
+            const refMsg = pending && (pending.message || pending);
+            if (refMsg && refMsg.id) {
+              payload.messageReference = {
+                message_id: String(refMsg.id),
+                channel_id: String(refMsg.channel_id || refMsg.channelId || channelId),
+                guild_id: refMsg.guild_id || refMsg.guildId || undefined,
+              };
+            }
+          } catch (e) {}
+          MessageModules.sendMessage(channelId, payload);
         } catch (e) {
           showToast("Groq: failed to send message");
         }
