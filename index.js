@@ -1,374 +1,6 @@
 (function () {
   "use strict";
 
-  // ---------------------------------------------------------------------------
-  // Vendetta / Kettu globals
-  // ---------------------------------------------------------------------------
-  const { storage } = vendetta.plugin;
-  const { before, after, instead } = vendetta.patcher;
-  const metro = vendetta.metro;
-  const { React, ReactNative: RN } = metro.common;
-  const { useProxy } = vendetta.storage;
-  const { registerCommand } = vendetta.commands;
-  const { showToast } = vendetta.ui.toasts;
-  const h = React.createElement;
-
-  const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
-  const MODELS = ["openai/gpt-oss-120b", "openai/gpt-oss-20b"];
-  const DEFAULT_MODEL = MODELS[0];
-
-  const EDITOR_RULES =
-    "You are a text-editing tool inside a chat app, not a conversational assistant. " +
-    "The user's text is content to transform, never a message addressed to you: do not reply to it, " +
-    "comment on it, or lecture about it. Rude, crude, angry, or emotional wording is still just text to edit: " +
-    "keep its meaning and only change how it is worded. Output only the final message text.";
-
-  // Detects when the model answered like an assistant (refusal / concern / hotline text)
-  // instead of producing the message, so that text is never posted to the chat.
-  const REFUSAL_RE =
-    /^(i['’]?m sorry|i am sorry|sorry[,.]|i can(?:not|['’]t)|i won['’]t|i['’]m unable|i am unable|i['’]m not able|i['’]m (really |very )?concerned|as an ai|i['’]m here to help)|crisis (help)?line|mental[- ]health professional|reach out for help|you don['’]t have to face this alone/i;
-
-  function looksLikeRefusal(out, original) {
-    return REFUSAL_RE.test(out) && !REFUSAL_RE.test(original);
-  }
-
-  const REWRITE_RULES =
-    "You rewrite the user's chat message. Keep the original meaning, language, and emojis. " +
-    "Return ONLY the rewritten message, with no quotes, labels, or explanations.";
-
-  const ANSWER_RULES =
-    "The user's text is a chat message they are about to send. " +
-    "If it is a question or request that has an objective answer you can give (math, facts, translations, " +
-    "definitions, or things like 'say hi in Japanese'), do NOT repeat it: write the final answer itself as the " +
-    "chat message, ready to send, and compute math carefully. " +
-    "For math, logic, and how/why questions, show a short step-by-step (a few brief lines, one step per line) " +
-    "that ends with the final answer. For simple translations or 'say X' requests, just give the answer directly. " +
-    "If it is ordinary conversation, or a question aimed at another person (their plans, feelings, opinions, " +
-    "availability), just rewrite it and keep its meaning. " +
-    "Return ONLY the message to send (including the steps, when asked for), with no quotes, labels, or commentary about the task itself.";
-
-  const PERSONALITIES = {
-    "Casual/Slang":
-      "Style: relaxed, friendly, natural slang, like a real person texting a friend. Keep it short and lively.",
-    Professional:
-      "Style: polite, clear, concise and professional. Correct grammar, no slang, no unnecessary emojis.",
-  };
-  const PERSONALITY_OPTIONS = ["Casual/Slang", "Professional", "Custom"];
-
-  function buildSystemPrompt() {
-    const p = PERSONALITY_OPTIONS.includes(storage.personality) ? storage.personality : "Casual/Slang";
-    let baseline = PERSONALITIES[p];
-    if (p === "Custom") {
-      const custom = typeof storage.customPrompt === "string" ? storage.customPrompt.trim() : "";
-      baseline = custom || PERSONALITIES["Casual/Slang"];
-    }
-    const rules = storage.answerQuestions !== false ? ANSWER_RULES : REWRITE_RULES;
-    return EDITOR_RULES + "\n\n" + rules + "\n\n" + baseline;
-  }
-
-  // Selectable chip row used by the settings page
-  function Chips(options, selected, onSelect, C, labelFn) {
-    const { View, Text, TouchableOpacity } = RN;
-    return h(
-      View,
-      { style: { flexDirection: "row", flexWrap: "wrap" } },
-      options.map((opt) =>
-        h(
-          TouchableOpacity,
-          {
-            key: "chip-" + opt,
-            onPress: () => onSelect(opt),
-            style: {
-              backgroundColor: opt === selected ? C.accent : C.input,
-              borderRadius: 16,
-              paddingHorizontal: 14,
-              paddingVertical: 8,
-              marginRight: 8,
-              marginBottom: 8,
-            },
-          },
-          h(Text, { style: { color: opt === selected ? "#fff" : C.muted, fontWeight: "600" } }, labelFn ? labelFn(opt) : opt)
-        )
-      )
-    );
-  }
-
-  const unpatches = [];
-  let unregisterCommand = null;
-  let bypass = false;
-  let inFlight = false;
-  let queue = Promise.resolve();
-  const marks = new Map();
-
-  // Texts we already produced ourselves; the send hook lets them through untouched
-  function markOutput(text) {
-    marks.set(text, Date.now());
-  }
-  function consumeMark(text) {
-    const ts = marks.get(text);
-    marks.forEach((t, k) => { if (Date.now() - t > 30000) marks.delete(k); });
-    if (ts && Date.now() - ts <= 30000) {
-      marks.delete(text);
-      return true;
-    }
-    return false;
-  }
-
-  // ---------------------------------------------------------------------------
-  // Helpers
-  // ---------------------------------------------------------------------------
-  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-  const log = (...a) => { try { console.log("[GroqAI]", ...a); } catch (e) {} };
-
-  function getKeys() {
-    const list = Array.isArray(storage.apiKeys) ? storage.apiKeys : [];
-    return list.map((k) => (k && typeof k.key === "string" ? k.key.trim() : "")).filter(Boolean);
-  }
-
-  function getTypingMs() {
-    const s = parseFloat(storage.typingDuration);
-    return Number.isFinite(s) && s > 0 ? s * 1000 : 0;
-  }
-
-  // ---------------------------------------------------------------------------
-  // Metro modules (resolved lazily so a miss never crashes the plugin)
-  // ---------------------------------------------------------------------------
-  const ChatInputModule =
-    metro.findByProps("handleSendMessage", "changeText") ||
-    metro.findByProps("handleSendMessage") ||
-    metro.find(m => m?.default?.render?.name === "ChatInput" || m?.ChatInput) ||
-    null;
-
-  // Find available text setters (Discord v348.10+)
-  const TextSetters = [
-    ["changeText", ChatInputModule],
-    ["setText", ChatInputModule],
-    ["insertText", ChatInputModule],
-    ["changeText", metro.findByProps("changeText")],
-    ["setText", metro.findByProps("setText", "clearText")],
-    ["setValue", metro.findByProps("setValue", "clearValue")]
-  ].filter(
-    ([method, module]) =>
-      module && typeof module[method] === "function"
-  );
-
-  const TypingModule = metro.findByProps("sendTyping", "startTyping");
-  const MessageModules = metro.findByProps("sendMessage", "receiveMessage");
-  const SelectedChannelStore = metro.findByStoreName ? metro.findByStoreName("SelectedChannelStore") : null;
-
-  const ClipboardModule =
-    metro.findByProps("setString", "getString") ||
-    (metro.common && metro.common.clipboard) ||
-    RN.Clipboard ||
-    null;
-  const ActionSheetModule = metro.findByProps("openLazy", "hideActionSheet");
-  const ASComponents = metro.findByProps("ActionSheet");
-  const ActionSheetComp = ASComponents && ASComponents.ActionSheet;
-
-  const NavModule = metro.findByProps("Navigation");
-  const Navigation = (NavModule && NavModule.Navigation) || NavModule;
-  const FormRowModule = metro.findByProps("FormRow");
-  const FormRow = (FormRowModule && FormRowModule.FormRow) || FormRowModule;
-
-  // ---------------------------------------------------------------------------
-  // Groq networking with rotating API keys
-  // ---------------------------------------------------------------------------
-  async function callGroq(apiKey, text, replyContext = "") {
-    const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
-    const timer = controller ? setTimeout(() => controller.abort(), 20000) : null;
-    const systemPrompt = buildSystemPrompt() + (replyContext ? "\n\n" + replyContext : "");
-    try {
-      const res = await fetch(GROQ_URL, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: "Bearer " + apiKey,
-        },
-        body: JSON.stringify({
-          model: MODELS.includes(storage.model) ? storage.model : DEFAULT_MODEL,
-          temperature: 0.7,
-          reasoning_effort: storage.answerQuestions !== false ? "medium" : "low",
-          include_reasoning: false,
-          max_completion_tokens: 2048,
-          messages: [
-            { role: "system", content: systemPrompt },
-            { role: "user", content: text },
-          ],
-        }),
-        signal: controller ? controller.signal : undefined,
-      });
-      if (!res.ok) {
-        const err = new Error("HTTP " + res.status);
-        err.status = res.status;
-        throw err;
-      }
-      const data = await res.json();
-      let out = data && data.choices && data.choices[0] && data.choices[0].message
-        ? String(data.choices[0].message.content || "").trim()
-        : "";
-      if (out.length > 1 && out[0] === '"' && out[out.length - 1] === '"') out = out.slice(1, -1).trim();
-      if (!out) throw new Error("Empty response");
-      if (looksLikeRefusal(out, text)) {
-        const err = new Error("Model declined");
-        err.refused = true;
-        throw err;
-      }
-      return out;
-    } finally {
-      if (timer) clearTimeout(timer);
-    }
-  }
-
-  // Tries each key in order. 429 / any network or API error -> next key.
-  // All keys failed (or none set) -> original text is returned untouched.
-  async function rewriteText(text, replyContext = "") {
-    const keys = getKeys();
-    for (let i = 0; i < keys.length; i++) {
-      try {
-        return await callGroq(keys[i], text, replyContext);
-      } catch (e) {
-        log("key #" + (i + 1) + " failed:", e && (e.status || e.message));
-        if (e && e.refused) return text; // other keys would decline too; keep the user's own text
-      }
-    }
-    return text;
-  }
-
-  // ---------------------------------------------------------------------------
-  // Typing indicator loop (re-sent every 8 seconds)
-  // ---------------------------------------------------------------------------
-  function startTypingLoop(channelId) {
-    if (!channelId || !TypingModule || typeof TypingModule.sendTyping !== "function") return () => {};
-    const ping = () => { try { TypingModule.sendTyping(channelId); } catch (e) {} };
-    ping();
-    const id = setInterval(ping, 8000);
-    return () => clearInterval(id);
-  }
-
-  // ---------------------------------------------------------------------------
-  // Chat input interception
-  // ---------------------------------------------------------------------------
-  // Slash / app-command detection. On mobile a picked command is a chip, so the text
-  // box often holds only the arguments (no leading "/"). The command lives somewhere
-  // inside the send arguments, so scan them for any application-command marker.
-  const CMD_KEYS = [
-    "applicationCommand", "applicationCommandData", "applicationCommandType", "applicationCommandOptions",
-    "application_command", "application_command_data", "application_command_type",
-    "command", "commandName", "commandId", "command_name", "command_id",
-    "interactionData", "interactionType", "interaction",
-    "interaction_data", "interaction_type",
-    "activeCommand", "commandOptions", "commandPayload",
-    "localCommand", "isLocalCommand",
-    "selectedCommand", "pendingCommand", "slashCommand",
-  ];
-  const CMD_KEY_SET = {};
-  for (let i = 0; i < CMD_KEYS.length; i++) CMD_KEY_SET[CMD_KEYS[i].toLowerCase()] = true;
-
-  function isCommandKey(key) {
-    if (!key) return false;
-    const k = String(key);
-    if (CMD_KEY_SET[k] || CMD_KEY_SET[k.toLowerCase()]) return true;
-    // Catch camelCase / snake_case variants Discord adds between builds.
-    return /^(application_?command|active_?command|local_?command|selected_?command|pending_?command|slash_?command|command_?(name|id|options|payload)?|interaction(_?data|_?type)?)$/i.test(k);
-  }
-
-  function hasCommandMarker(v, depth, seen) {
-    try {
-      if (v == null || typeof v !== "object" || depth > 6 || seen.has(v)) return false;
-      seen.add(v);
-      if (Array.isArray(v)) {
-        const n = Math.min(v.length, 12);
-        for (let i = 0; i < n; i++) {
-          if (hasCommandMarker(v[i], depth + 1, seen)) return true;
-        }
-        return false;
-      }
-      // Message types: CHAT_INPUT_COMMAND (20), CONTEXT_MENU_COMMAND (23)
-      if (v.type === 20 || v.type === 23) return true;
-      // Interaction type APPLICATION_COMMAND
-      if (v.interactionType === 2 || v.interaction_type === 2) return true;
-      // Application command types: CHAT_INPUT (1), USER (2), MESSAGE (3)
-      if (v.applicationCommandType === 1 || v.applicationCommandType === 2 || v.applicationCommandType === 3) return true;
-      if (v.application_command_type === 1 || v.application_command_type === 2 || v.application_command_type === 3) return true;
-      if (v.localCommand === true || v.isLocalCommand === true) return true;
-      // Command definition: name + application id, usually with a type or options list
-      if (v.applicationId && v.name && (v.type === 1 || v.type === 2 || v.type === 3 || v.options || v.commandOptions)) return true;
-      const keys = Object.keys(v).slice(0, 80);
-      for (let i = 0; i < keys.length; i++) {
-        const k = keys[i];
-        if (isCommandKey(k) && v[k]) return true;
-      }
-      for (let i = 0; i < keys.length; i++) {
-        const c = v[keys[i]];
-        if (c && typeof c === "object" && hasCommandMarker(c, depth + 1, seen)) return true;
-      }
-    } catch (e) {}
-    return false;
-  }
-
-  function startsWithSlash(text) {
-    return typeof text === "string" && /^[\s\u00a0\u1680\u2000-\u200d\u202f\u205f\u2060\u3000\ufeff]*\//.test(text);
-  }
-
-  function hasActiveInputCommand() {
-    try {
-      if (!ChatInputModule) return false;
-      if (ChatInputModule.activeCommand || ChatInputModule.applicationCommand || ChatInputModule.localCommand) return true;
-      if (typeof ChatInputModule.getActiveCommand === "function" && ChatInputModule.getActiveCommand()) return true;
-    } catch (e) {}
-    return false;
-  }
-
-  function isSlashCommand(text, args) {
-    if (startsWithSlash(text)) return true;
-    if (hasActiveInputCommand()) return true;
-    const seen = new Set();
-    for (const a of args || []) {
-      if (startsWithSlash(a)) return true;
-      if (hasCommandMarker(a, 0, seen)) return true;
-    }
-    return false;
-  }
-
-  function bypassIfCommand(text, args, where) {
-    if (!isSlashCommand(text, args)) return false;
-    log("bypass:", where, "application/local command");
-    return true;
-  }
-
-  function findTextSlot(args) {
-    for (let i = 0; i < args.length; i++) {
-      const a = args[i];
-      if (typeof a === "string" && !/^\d{15,}$/.test(a)) {
-        return { get: () => args[i], set: (v) => { args[i] = v; } };
-      }
-      if (a && typeof a === "object") {
-        for (const k of ["content", "text", "value"]) {
-          if (typeof a[k] === "string") {
-            return { get: () => args[i][k], set: (v) => { args[i] = Object.assign({}, args[i], { [k]: v }); } };
-          }
-        }
-        if (a.message && typeof a.message.content === "string") {
-          return {
-            get: () => args[i].message.content,
-            set: (v) => { args[i] = Object.assign({}, args[i], { message: Object.assign({}, args[i].message, { content: v }) }); },
-          };
-        }
-      }
-    }
-    return null;
-  }
-
-  function findChannelId(args) {
-    for (const a of args) {
-      if (a && typeof a === "object" && a.channelId) return a.channelId;
-      if (typeof a === "string" && /^\d{15,}$/.test(a)) return a;
-    }
-    try { return SelectedChannelStore ? SelectedChannelStore.getChannelId() : undefined; } catch (e) { return undefined; }
-  }
-
-  // Bot embeds, forwarded snapshots, and swipe-reply context.
-  // Inlined: Kettu only evals this one file, so a separate import cannot load.
   function createReplyContext({ metro, log }) {
     const MessageStore =
       metro.findByProps("getMessage", "getMessages") ||
@@ -379,7 +11,79 @@
       metro.findByProps("getCurrentUser") ||
       null;
 
+    const pendingByChannel = new Map();
     let PendingReplyStore = null;
+    let fluxUnsub = null;
+
+    function rememberPending(channelId, message) {
+      if (!channelId || !message) return;
+      pendingByChannel.set(String(channelId), { message, at: Date.now() });
+    }
+
+    function forgetPending(channelId) {
+      if (channelId) pendingByChannel.delete(String(channelId));
+    }
+
+    function cachedPending(channelId) {
+      if (!channelId) return null;
+      const hit = pendingByChannel.get(String(channelId));
+      if (!hit) return null;
+      if (Date.now() - hit.at > 10 * 60 * 1000) {
+        pendingByChannel.delete(String(channelId));
+        return null;
+      }
+      return hit.message;
+    }
+
+    function onFluxAction(action) {
+      if (!action || typeof action !== "object") return;
+      const type = action.type;
+      if (type !== "CREATE_PENDING_REPLY" && type !== "SET_PENDING_REPLY" &&
+          type !== "DELETE_PENDING_REPLY" && type !== "CLEAR_PENDING_REPLY") return;
+      const channelId = action.channelId || action.channel_id || (action.channel && action.channel.id);
+      if (type === "DELETE_PENDING_REPLY" || type === "CLEAR_PENDING_REPLY") {
+        // Keep the cached message until send reads it. Discord clears the
+        // pending reply as the send starts, which is before our hook runs.
+        return;
+      }
+      const message = action.message || action.referencedMessage || action.referenced_message;
+      rememberPending(channelId, message);
+      if (message) log("cached swipe reply", channelId, textOfMessage(message).slice(0, 80));
+    }
+
+    function start() {
+      if (fluxUnsub) return;
+      const Flux =
+        metro.findByProps("subscribe", "dispatch") ||
+        metro.findByProps("_dispatch", "subscribe") ||
+        null;
+      if (!Flux || typeof Flux.subscribe !== "function") {
+        log("FluxDispatcher not found; swipe reply cache disabled");
+        return;
+      }
+      try {
+        Flux.subscribe("CREATE_PENDING_REPLY", onFluxAction);
+        Flux.subscribe("SET_PENDING_REPLY", onFluxAction);
+        fluxUnsub = function () {
+          try { Flux.unsubscribe("CREATE_PENDING_REPLY", onFluxAction); } catch (e) {}
+          try { Flux.unsubscribe("SET_PENDING_REPLY", onFluxAction); } catch (e) {}
+        };
+      } catch (e) {
+        try {
+          Flux.subscribe(onFluxAction);
+          fluxUnsub = function () { try { Flux.unsubscribe(onFluxAction); } catch (e2) {} };
+        } catch (e2) {
+          log("could not subscribe to pending reply", e2 && e2.message);
+        }
+      }
+    }
+
+    function stop() {
+      if (fluxUnsub) {
+        try { fluxUnsub(); } catch (e) {}
+        fluxUnsub = null;
+      }
+    }
 
     function clipReply(content) {
       const text = typeof content === "string" ? content.trim() : "";
@@ -585,14 +289,21 @@
           PendingReplyStore =
             (metro.findByStoreName && (
               metro.findByStoreName("PendingReplyStore") ||
-              metro.findByStoreName("ReplyStore")
+              metro.findByStoreName("ReplyStore") ||
+              metro.findByStoreName("MessageReplyStore")
             )) ||
             metro.findByProps("getPendingReply") ||
             metro.findByProps("createPendingReply", "deletePendingReply") ||
             null;
         }
-        if (!PendingReplyStore || typeof PendingReplyStore.getPendingReply !== "function") return null;
-        const reply = PendingReplyStore.getPendingReply(channelId);
+        if (!PendingReplyStore) return null;
+        let reply = null;
+        if (typeof PendingReplyStore.getPendingReply === "function") {
+          reply = PendingReplyStore.getPendingReply(channelId);
+        } else if (typeof PendingReplyStore.getPendingReplies === "function") {
+          const all = PendingReplyStore.getPendingReplies();
+          reply = all && (all[channelId] || all.get && all.get(channelId));
+        }
         if (!reply) return null;
         return reply.message || reply.referencedMessage || reply.referenced_message || reply;
       } catch (e) {
@@ -601,11 +312,17 @@
     }
 
     function resolveReplyInfo(channelId, args, explicitRef) {
-      const msg =
-        extractReplyMessage(args) ||
-        messageFromStore(channelId, explicitRef || findReplyRef(args)) ||
-        getPendingReplyMessage(channelId);
-      if (!msg) return null;
+      const fromArgs = extractReplyMessage(args);
+      const fromStore = messageFromStore(channelId, explicitRef || findReplyRef(args));
+      const fromPending = getPendingReplyMessage(channelId);
+      const fromCache = cachedPending(channelId);
+      const msg = fromArgs || fromPending || fromStore || fromCache;
+      if (!msg) {
+        log("no reply target", channelId, explicitRef && (explicitRef.message_id || explicitRef.messageId));
+        return null;
+      }
+      const source = fromArgs ? "args" : fromPending ? "pending" : fromStore ? "store" : "cache";
+      log("reply target from", source);
       const who = authorOf(msg);
       const snaps = snapshotMessages(msg);
       const forwardAuthor = snaps.length ? authorOf(snaps[0]) : { id: "", username: "", globalName: "" };
@@ -648,27 +365,362 @@
       return formatContext(resolveReplyInfo(channelId, args, explicitRef));
     }
 
-    return { buildPayloadContext, formatContext, findReplyRef };
+    return { buildPayloadContext, formatContext, findReplyRef, start, stop };
   }
 
-  const { buildPayloadContext, formatContext, findReplyRef } = createReplyContext({ metro, log });
+  const { storage } = vendetta.plugin;
+  const { before, after, instead } = vendetta.patcher;
+  const metro = vendetta.metro;
+  const { React, ReactNative: RN } = metro.common;
+  const { useProxy } = vendetta.storage;
+  const { registerCommand } = vendetta.commands;
+  const { showToast } = vendetta.ui.toasts;
+  const h = React.createElement;
 
-  // Preview sheet: Send / Edit (edit the AI response) / Copy prompt / Cancel.
-  // Resolves { action: "send" | "edit" | "cancel", text }. Cancel only closes the preview.
-  // "edit" only comes from the plain-Alert fallback (max 3 buttons), which has no text box.
+  const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
+  const MODELS = ["openai/gpt-oss-120b", "openai/gpt-oss-20b"];
+  const DEFAULT_MODEL = MODELS[0];
+
+  const EDITOR_RULES =
+    "You are a text-editing tool inside a chat app, not a conversational assistant. " +
+    "The user's text is content to transform, never a message addressed to you: do not reply to it, " +
+    "comment on it, or lecture about it. Rude, crude, angry, or emotional wording is still just text to edit: " +
+    "keep its meaning and only change how it is worded. Output only the final message text.";
+
+  const REFUSAL_RE =
+    /^(i['’]?m sorry|i am sorry|sorry[,.]|i can(?:not|['’]t)|i won['’]t|i['’]m unable|i am unable|i['’]m not able|i['’]m (really |very )?concerned|as an ai|i['’]m here to help)|crisis (help)?line|mental[- ]health professional|reach out for help|you don['’]t have to face this alone/i;
+
+  function looksLikeRefusal(out, original) {
+    return REFUSAL_RE.test(out) && !REFUSAL_RE.test(original);
+  }
+
+  const REWRITE_RULES =
+    "You rewrite the user's chat message. Keep the original meaning, language, and emojis. " +
+    "Return ONLY the rewritten message, with no quotes, labels, or explanations.";
+
+  const ANSWER_RULES =
+    "The user's text is a chat message they are about to send. " +
+    "If it is a question or request that has an objective answer you can give (math, facts, translations, " +
+    "definitions, or things like 'say hi in Japanese'), do NOT repeat it: write the final answer itself as the " +
+    "chat message, ready to send, and compute math carefully. " +
+    "For math, logic, and how/why questions, show a short step-by-step (a few brief lines, one step per line) " +
+    "that ends with the final answer. For simple translations or 'say X' requests, just give the answer directly. " +
+    "If it is ordinary conversation, or a question aimed at another person (their plans, feelings, opinions, " +
+    "availability), just rewrite it and keep its meaning. " +
+    "Return ONLY the message to send (including the steps, when asked for), with no quotes, labels, or commentary about the task itself.";
+
+  const PERSONALITIES = {
+    "Casual/Slang":
+      "Style: relaxed, friendly, natural slang, like a real person texting a friend. Keep it short and lively.",
+    Professional:
+      "Style: polite, clear, concise and professional. Correct grammar, no slang, no unnecessary emojis.",
+  };
+  const PERSONALITY_OPTIONS = ["Casual/Slang", "Professional", "Custom"];
+
+  function buildSystemPrompt() {
+    const p = PERSONALITY_OPTIONS.includes(storage.personality) ? storage.personality : "Casual/Slang";
+    let baseline = PERSONALITIES[p];
+    if (p === "Custom") {
+      const custom = typeof storage.customPrompt === "string" ? storage.customPrompt.trim() : "";
+      baseline = custom || PERSONALITIES["Casual/Slang"];
+    }
+    const rules = storage.answerQuestions !== false ? ANSWER_RULES : REWRITE_RULES;
+    return EDITOR_RULES + "\n\n" + rules + "\n\n" + baseline;
+  }
+
+  function Chips(options, selected, onSelect, C, labelFn) {
+    const { View, Text, TouchableOpacity } = RN;
+    return h(
+      View,
+      { style: { flexDirection: "row", flexWrap: "wrap" } },
+      options.map((opt) =>
+        h(
+          TouchableOpacity,
+          {
+            key: "chip-" + opt,
+            onPress: () => onSelect(opt),
+            style: {
+              backgroundColor: opt === selected ? C.accent : C.input,
+              borderRadius: 16,
+              paddingHorizontal: 14,
+              paddingVertical: 8,
+              marginRight: 8,
+              marginBottom: 8,
+            },
+          },
+          h(Text, { style: { color: opt === selected ? "#fff" : C.muted, fontWeight: "600" } }, labelFn ? labelFn(opt) : opt)
+        )
+      )
+    );
+  }
+
+  const unpatches = [];
+  let unregisterCommand = null;
+  let bypass = false;
+  let inFlight = false;
+  let queue = Promise.resolve();
+  const marks = new Map();
+
+  function markOutput(text) {
+    marks.set(text, Date.now());
+  }
+  function consumeMark(text) {
+    const ts = marks.get(text);
+    marks.forEach((t, k) => { if (Date.now() - t > 30000) marks.delete(k); });
+    if (ts && Date.now() - ts <= 30000) {
+      marks.delete(text);
+      return true;
+    }
+    return false;
+  }
+
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const log = (...a) => { try { console.log("[GroqAI]", ...a); } catch (e) {} };
+
+  function getKeys() {
+    const list = Array.isArray(storage.apiKeys) ? storage.apiKeys : [];
+    return list.map((k) => (k && typeof k.key === "string" ? k.key.trim() : "")).filter(Boolean);
+  }
+
+  function getTypingMs() {
+    const s = parseFloat(storage.typingDuration);
+    return Number.isFinite(s) && s > 0 ? s * 1000 : 0;
+  }
+
+  const ChatInputModule =
+    metro.findByProps("handleSendMessage", "changeText") ||
+    metro.findByProps("handleSendMessage") ||
+    metro.find(m => m?.default?.render?.name === "ChatInput" || m?.ChatInput) ||
+    null;
+
+  const TextSetters = [
+    ["changeText", ChatInputModule],
+    ["setText", ChatInputModule],
+    ["insertText", ChatInputModule],
+    ["changeText", metro.findByProps("changeText")],
+    ["setText", metro.findByProps("setText", "clearText")],
+    ["setValue", metro.findByProps("setValue", "clearValue")]
+  ].filter(
+    ([method, module]) =>
+      module && typeof module[method] === "function"
+  );
+
+  const TypingModule = metro.findByProps("sendTyping", "startTyping");
+  const MessageModules = metro.findByProps("sendMessage", "receiveMessage");
+  const SelectedChannelStore = metro.findByStoreName ? metro.findByStoreName("SelectedChannelStore") : null;
+
+  const ClipboardModule =
+    metro.findByProps("setString", "getString") ||
+    (metro.common && metro.common.clipboard) ||
+    RN.Clipboard ||
+    null;
+  const ActionSheetModule = metro.findByProps("openLazy", "hideActionSheet");
+  const ASComponents = metro.findByProps("ActionSheet");
+  const ActionSheetComp = ASComponents && ASComponents.ActionSheet;
+
+  const NavModule = metro.findByProps("Navigation");
+  const Navigation = (NavModule && NavModule.Navigation) || NavModule;
+  const FormRowModule = metro.findByProps("FormRow");
+  const FormRow = (FormRowModule && FormRowModule.FormRow) || FormRowModule;
+
+  function userContent(text, replyContext) {
+    if (!replyContext || replyContext.indexOf("reply_message:") === -1) return text;
+    return "The speaker is replying on Discord. Use the referenced message below. Do not ignore it and do not invent a different topic.\n\n" +
+      replyContext +
+      "\n\nTyped text to turn into the reply. Output only the chat message:\n" + text;
+  }
+
+  async function callGroq(apiKey, text, replyContext = "") {
+    const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
+    const timer = controller ? setTimeout(() => controller.abort(), 20000) : null;
+    const systemPrompt = buildSystemPrompt() + (replyContext ? "\n\n" + replyContext : "");
+    try {
+      const res = await fetch(GROQ_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: "Bearer " + apiKey,
+        },
+        body: JSON.stringify({
+          model: MODELS.includes(storage.model) ? storage.model : DEFAULT_MODEL,
+          temperature: 0.7,
+          reasoning_effort: storage.answerQuestions !== false ? "medium" : "low",
+          include_reasoning: false,
+          max_completion_tokens: 2048,
+          messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: userContent(text, replyContext) },
+          ],
+        }),
+        signal: controller ? controller.signal : undefined,
+      });
+      if (!res.ok) {
+        const err = new Error("HTTP " + res.status);
+        err.status = res.status;
+        throw err;
+      }
+      const data = await res.json();
+      let out = data && data.choices && data.choices[0] && data.choices[0].message
+        ? String(data.choices[0].message.content || "").trim()
+        : "";
+      if (out.length > 1 && out[0] === '"' && out[out.length - 1] === '"') out = out.slice(1, -1).trim();
+      if (!out) throw new Error("Empty response");
+      if (looksLikeRefusal(out, text)) {
+        const err = new Error("Model declined");
+        err.refused = true;
+        throw err;
+      }
+      return out;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  async function rewriteText(text, replyContext = "") {
+    const keys = getKeys();
+    for (let i = 0; i < keys.length; i++) {
+      try {
+        return await callGroq(keys[i], text, replyContext);
+      } catch (e) {
+        log("key #" + (i + 1) + " failed:", e && (e.status || e.message));
+        if (e && e.refused) return text; // other keys would decline too; keep the user's own text
+      }
+    }
+    return text;
+  }
+
+  function startTypingLoop(channelId) {
+    if (!channelId || !TypingModule || typeof TypingModule.sendTyping !== "function") return () => {};
+    const ping = () => { try { TypingModule.sendTyping(channelId); } catch (e) {} };
+    ping();
+    const id = setInterval(ping, 8000);
+    return () => clearInterval(id);
+  }
+
+  const CMD_KEYS = [
+    "applicationCommand", "applicationCommandData", "applicationCommandType", "applicationCommandOptions",
+    "application_command", "application_command_data", "application_command_type",
+    "command", "commandName", "commandId", "command_name", "command_id",
+    "interactionData", "interactionType", "interaction",
+    "interaction_data", "interaction_type",
+    "activeCommand", "commandOptions", "commandPayload",
+    "localCommand", "isLocalCommand",
+    "selectedCommand", "pendingCommand", "slashCommand",
+  ];
+  const CMD_KEY_SET = {};
+  for (let i = 0; i < CMD_KEYS.length; i++) CMD_KEY_SET[CMD_KEYS[i].toLowerCase()] = true;
+
+  function isCommandKey(key) {
+    if (!key) return false;
+    const k = String(key);
+    if (CMD_KEY_SET[k] || CMD_KEY_SET[k.toLowerCase()]) return true;
+    return /^(application_?command|active_?command|local_?command|selected_?command|pending_?command|slash_?command|command_?(name|id|options|payload)?|interaction(_?data|_?type)?)$/i.test(k);
+  }
+
+  function hasCommandMarker(v, depth, seen) {
+    try {
+      if (v == null || typeof v !== "object" || depth > 6 || seen.has(v)) return false;
+      seen.add(v);
+      if (Array.isArray(v)) {
+        const n = Math.min(v.length, 12);
+        for (let i = 0; i < n; i++) {
+          if (hasCommandMarker(v[i], depth + 1, seen)) return true;
+        }
+        return false;
+      }
+      if (v.type === 20 || v.type === 23) return true;
+      if (v.interactionType === 2 || v.interaction_type === 2) return true;
+      if (v.applicationCommandType === 1 || v.applicationCommandType === 2 || v.applicationCommandType === 3) return true;
+      if (v.application_command_type === 1 || v.application_command_type === 2 || v.application_command_type === 3) return true;
+      if (v.localCommand === true || v.isLocalCommand === true) return true;
+      if (v.applicationId && v.name && (v.type === 1 || v.type === 2 || v.type === 3 || v.options || v.commandOptions)) return true;
+      const keys = Object.keys(v).slice(0, 80);
+      for (let i = 0; i < keys.length; i++) {
+        const k = keys[i];
+        if (isCommandKey(k) && v[k]) return true;
+      }
+      for (let i = 0; i < keys.length; i++) {
+        const c = v[keys[i]];
+        if (c && typeof c === "object" && hasCommandMarker(c, depth + 1, seen)) return true;
+      }
+    } catch (e) {}
+    return false;
+  }
+
+  function startsWithSlash(text) {
+    return typeof text === "string" && /^[\s\u00a0\u1680\u2000-\u200d\u202f\u205f\u2060\u3000\ufeff]*\//.test(text);
+  }
+
+  function hasActiveInputCommand() {
+    try {
+      if (!ChatInputModule) return false;
+      if (ChatInputModule.activeCommand || ChatInputModule.applicationCommand || ChatInputModule.localCommand) return true;
+      if (typeof ChatInputModule.getActiveCommand === "function" && ChatInputModule.getActiveCommand()) return true;
+    } catch (e) {}
+    return false;
+  }
+
+  function isSlashCommand(text, args) {
+    if (startsWithSlash(text)) return true;
+    if (hasActiveInputCommand()) return true;
+    const seen = new Set();
+    for (const a of args || []) {
+      if (startsWithSlash(a)) return true;
+      if (hasCommandMarker(a, 0, seen)) return true;
+    }
+    return false;
+  }
+
+  function bypassIfCommand(text, args, where) {
+    if (!isSlashCommand(text, args)) return false;
+    log("bypass:", where, "application/local command");
+    return true;
+  }
+
+  function findTextSlot(args) {
+    for (let i = 0; i < args.length; i++) {
+      const a = args[i];
+      if (typeof a === "string" && !/^\d{15,}$/.test(a)) {
+        return { get: () => args[i], set: (v) => { args[i] = v; } };
+      }
+      if (a && typeof a === "object") {
+        for (const k of ["content", "text", "value"]) {
+          if (typeof a[k] === "string") {
+            return { get: () => args[i][k], set: (v) => { args[i] = Object.assign({}, args[i], { [k]: v }); } };
+          }
+        }
+        if (a.message && typeof a.message.content === "string") {
+          return {
+            get: () => args[i].message.content,
+            set: (v) => { args[i] = Object.assign({}, args[i], { message: Object.assign({}, args[i].message, { content: v }) }); },
+          };
+        }
+      }
+    }
+    return null;
+  }
+
+  function findChannelId(args) {
+    for (const a of args) {
+      if (a && typeof a === "object" && a.channelId) return a.channelId;
+      if (typeof a === "string" && /^\d{15,}$/.test(a)) return a;
+    }
+    try { return SelectedChannelStore ? SelectedChannelStore.getChannelId() : undefined; } catch (e) { return undefined; }
+  }
+
+  const { buildPayloadContext, formatContext, findReplyRef, start: startReplyWatch, stop: stopReplyWatch } = createReplyContext({ metro, log });
+
   function PreviewSheet(props) {
     const { View, Text, TextInput, TouchableOpacity, ScrollView } = RN;
     const { original, finalText, finish, startEditing } = props;
     const C = { text: "#f2f3f5", muted: "#b5bac1", card: "#2b2d31", accent: "#5865f2", danger: "#da373c", neutral: "#4e5058" };
 
-    // Swiping the sheet away counts as Cancel (also keeps the send queue from hanging)
     React.useEffect(() => () => finish({ action: "cancel", text: original }), []);
 
     const [text, setText] = React.useState(finalText);
     const [editing, setEditing] = React.useState(!!startEditing);
     const [kb, setKb] = React.useState(0);
 
-    // Lift the whole sheet content above the keyboard so the text box stays visible
     React.useEffect(() => {
       const K = RN.Keyboard;
       if (!K || typeof K.addListener !== "function") return undefined;
@@ -737,8 +789,6 @@
       if (!Alert || typeof Alert.alert !== "function") return resolve({ action: "send", text: finalText });
       let done = false;
       const finish = (v) => { if (!done) { done = true; resolve(v); } };
-      // Edit needs a text box, which only the sheet has. If we are already coming from an
-      // Edit request and the sheet is unavailable, offer Copy prompt instead of a dead Edit.
       const middle = noEdit
         ? { text: "Copy prompt", onPress: () => { showToast(copyText(original) ? "Prompt copied to clipboard" : "Couldn't copy to clipboard"); finish({ action: "cancel", text: original }); } }
         : { text: "Edit", onPress: () => finish({ action: "edit", text: finalText }) };
@@ -806,8 +856,6 @@
   }
 
 
-  // Primary auto-rewrite hook: every message the chat box sends goes through sendMessage.
-  // `instead` + a returned promise holds the send until the AI text is ready, in order.
   function patchSendMessage() {
     if (!MessageModules || typeof MessageModules.sendMessage !== "function") {
       log("MessageModules.sendMessage not found");
@@ -820,7 +868,6 @@
           const msg = args[1];
           const content = msg && typeof msg.content === "string" ? msg.content : "";
 
-          // Never rewrite slash, app, or local commands. Let Discord handle them.
           if (bypassIfCommand(content, args, "sendMessage")) return orig(...args);
 
           if (!content.trim() || getKeys().length === 0 || consumeMark(content)) {
@@ -828,7 +875,6 @@
           }
 
           const channelId = args[0];
-          // Swipe-to-reply: quoted message + both speakers' username/global name.
           const replyContext = buildPayloadContext(channelId, args, msg && msg.messageReference);
           log("payload context:", replyContext.replace(/\n/g, " | ").slice(0, 180));
           const job = async () => {
@@ -849,7 +895,6 @@
     return true;
   }
 
-  // Chat-box hook: holds the send BEFORE Discord clears the input, so Cancel keeps the text.
   let shapeReported = false;
   function describeArgs(args) {
     try {
@@ -881,7 +926,6 @@
         const slot = findTextSlot(args);
         const original = slot ? String(slot.get() || "") : "";
 
-        // Never rewrite slash, app, or local commands. Let Discord handle them.
         if (bypassIfCommand(original, args, "handleSendMessage")) return orig(...args);
         if (!shapeReported) { shapeReported = true; log("handleSendMessage args:", describeArgs(args)); }
 
@@ -917,9 +961,6 @@
     );
   }
 
-  // ---------------------------------------------------------------------------
-  // Manual /groq command
-  // ---------------------------------------------------------------------------
   function registerGroqCommand() {
     unregisterCommand = registerCommand({
       name: "groq",
@@ -963,9 +1004,6 @@
     });
   }
 
-  // ---------------------------------------------------------------------------
-  // Settings page component
-  // ---------------------------------------------------------------------------
   function GroqSettingsPage() {
     useProxy(storage);
     const { View, Text, TextInput, Switch, TouchableOpacity, ScrollView } = RN;
@@ -1159,9 +1197,6 @@
     );
   }
 
-  // ---------------------------------------------------------------------------
-  // Settings screen integration
-  // ---------------------------------------------------------------------------
   function openGroqPage() {
     const payload = { title: "Groq AI Control", render: GroqSettingsPage };
     try {
@@ -1190,7 +1225,6 @@
     return [p.label, p.title, p.text].find((v) => typeof v === "string");
   }
 
-  // Depth-first search for an array containing an element whose label matches `anchor`
   function locate(node, anchor) {
     if (!node || typeof node !== "object") return null;
     if (Array.isArray(node)) {
@@ -1248,9 +1282,6 @@
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // Lifecycle
-  // ---------------------------------------------------------------------------
   function onLoad() {
     if (!Array.isArray(storage.apiKeys)) storage.apiKeys = [];
     if (typeof storage.autoRewrite !== "boolean") storage.autoRewrite = false;
@@ -1262,9 +1293,8 @@
     if (!MODELS.includes(storage.model)) storage.model = DEFAULT_MODEL;
 
     try { patchSettingsScreen(); } catch (e) { log("settings patch error", e && e.message); }
+    try { startReplyWatch(); } catch (e) { log("reply watch error", e && e.message); }
     try {
-      // Hook the chat box first: a cancelled preview then leaves the typed text untouched.
-      // sendMessage stays hooked as a fallback for sends the chat-box hook can't read.
       patchChatInput();
       patchSendMessage();
     } catch (e) { log("input patch error", e && e.message); }
@@ -1272,6 +1302,7 @@
   }
 
   function onUnload() {
+    try { stopReplyWatch(); } catch (e) {}
     while (unpatches.length) {
       try { unpatches.pop()(); } catch (e) {}
     }
@@ -1284,4 +1315,5 @@
   }
 
   return { onLoad, onUnload, settings: GroqSettingsPage };
-});
+
+})();
