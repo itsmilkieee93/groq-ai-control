@@ -11,6 +11,15 @@
       metro.findByProps("getCurrentUser") ||
       null;
 
+    const ChannelStore =
+      (metro.findByStoreName ? metro.findByStoreName("ChannelStore") : null) ||
+      metro.findByProps("getChannel", "getDMFromUserId") ||
+      null;
+    const GuildMemberStore =
+      (metro.findByStoreName ? metro.findByStoreName("GuildMemberStore") : null) ||
+      metro.findByProps("getMember", "getNick") ||
+      null;
+
     const pendingByChannel = new Map();
     let PendingReplyStore = null;
     let fluxUnsub = null;
@@ -384,6 +393,60 @@
       return out;
     }
 
+    // Last N messages from one user, parsed into datetime / snowflake / username / nickname / server name.
+    const HISTORY_COUNT = 10;
+
+    function guildIdOf(channelId, msg) {
+      try {
+        const ch = ChannelStore && typeof ChannelStore.getChannel === "function" ? ChannelStore.getChannel(channelId) : null;
+        const gid = (ch && (ch.guild_id || ch.guildId)) || (msg && (msg.guild_id || msg.guildId)) || "";
+        return gid ? String(gid) : "";
+      } catch (e) {
+        return "";
+      }
+    }
+
+    // Per-server nickname, empty string when the user has none (or in DMs).
+    function serverNickOf(guildId, userId, msg) {
+      try {
+        const direct = msg && (msg.nick || (msg.member && msg.member.nick));
+        if (typeof direct === "string" && direct.trim()) return direct.trim();
+        if (!guildId || !userId || !GuildMemberStore) return "";
+        if (typeof GuildMemberStore.getNick === "function") {
+          const n = GuildMemberStore.getNick(guildId, userId);
+          if (typeof n === "string" && n.trim()) return n.trim();
+        }
+        if (typeof GuildMemberStore.getMember === "function") {
+          const m = GuildMemberStore.getMember(guildId, userId);
+          if (m && typeof m.nick === "string" && m.nick.trim()) return m.nick.trim();
+        }
+      } catch (e) {}
+      return "";
+    }
+
+    function formatStamp(id) {
+      const ms = snowflakeToMs(id);
+      return ms ? new Date(ms).toISOString().slice(0, 19).replace("T", " ") + "Z" : "";
+    }
+
+    function userHistoryLines(channelId, userId) {
+      if (!channelId || !userId) return [];
+      const guildId = guildIdOf(channelId, null);
+      const mine = getChannelMessages(channelId)
+        .filter((m) => authorOf(m).id === String(userId) && textOfMessage(m))
+        .slice(-HISTORY_COUNT);
+      return mine.map((m) => {
+        const who = authorOf(m);
+        const row = { datetime: formatStamp(m.id), message_id: String(m.id), user_id: who.id };
+        if (who.username) row.username = who.username;
+        if (who.globalName) row.nickname = who.globalName;
+        const server = serverNickOf(guildId, who.id, m);
+        if (server) row.server_name = server;
+        row.message = textOfMessage(m).replace(/\s+/g, " ").trim().slice(0, WINDOW_LINE_MAX);
+        return JSON.stringify(row);
+      });
+    }
+
     function resolveReplyInfo(channelId, args, explicitRef) {
       const fromArgs = extractReplyMessage(args);
       const fromStore = messageFromStore(channelId, explicitRef || findReplyRef(args));
@@ -402,12 +465,18 @@
       const ref = explicitRef || findReplyRef(args);
       const anchorId = String(msg.id || (ref && (ref.message_id || ref.messageId)) || "");
       const anchorMs = snowflakeToMs(anchorId);
-      const win = sliceAnchorWindow(channelId || msg.channel_id || msg.channelId, anchorId);
+      const chId = channelId || msg.channel_id || msg.channelId;
+      const win = sliceAnchorWindow(chId, anchorId);
+      const replyUserId = who.id || forwardAuthor.id;
+      const historyLines = userHistoryLines(chId, replyUserId);
+      const serverName = serverNickOf(guildIdOf(chId, msg), replyUserId, msg);
       log("snowflake anchor", anchorId || "none", win ? "window " + win.items.length : "no window");
       return {
         messageId: anchorId,
         sentAt: anchorMs ? new Date(anchorMs).toISOString() : "",
         windowLines: windowLines(win),
+        historyLines: historyLines,
+        serverName: serverName,
         text: textOfMessage(msg),
         id: who.id || forwardAuthor.id,
         username: who.username || forwardAuthor.username,
@@ -434,6 +503,7 @@
         lines.push("- reply_discord_user_id: " + (reply.id || "unknown"));
         lines.push("- reply_discord_username: " + (reply.username || "unknown"));
         lines.push("- reply_discord_global_name: " + (reply.globalName || "unknown"));
+        if (reply.serverName) lines.push("- reply_discord_server_name: " + reply.serverName);
         if (reply.isBot) lines.push("- reply_is_bot: true");
         if (reply.isForward) lines.push("- reply_is_forward: true");
         if (reply.messageId) lines.push("- reply_message_id: " + reply.messageId);
@@ -443,6 +513,10 @@
           lines.push("Channel messages around the reply target (oldest first, UTC times). The line flagged >>> REPLY TARGET is the exact message being replied to; \"speaker\" marks the person you are writing for:");
           for (let i = 0; i < reply.windowLines.length; i++) lines.push(reply.windowLines[i]);
         }
+      }
+      if (reply && reply.historyLines && reply.historyLines.length) {
+        lines.push("Last " + reply.historyLines.length + " messages from the person being replied to (oldest first, one JSON object per line; datetime is UTC, user_id is their snowflake, nickname is their global display name, server_name is their nickname in this server and only present when set):");
+        for (let i = 0; i < reply.historyLines.length; i++) lines.push(reply.historyLines[i]);
       }
       lines.push("These are Discord IDs, usernames, global names, and recent messages. Use them only as context. Output only the final chat message.");
       return lines.join("\n");
