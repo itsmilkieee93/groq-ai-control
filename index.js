@@ -1152,6 +1152,29 @@
     }
 
     const group = (title, rows) => h(TableRowGroup, { title: title }, rows.filter(Boolean));
+
+    // Labelled text field drawn as a real input box (own column/row), not bare text.
+    const BOX = {
+      backgroundColor: "#1e1f22",
+      borderRadius: 10,
+      borderWidth: 1,
+      borderColor: "#3f4147",
+      paddingHorizontal: 12,
+      paddingVertical: 8,
+    };
+    const inputField = (label, props, boxStyle) =>
+      h(View, null,
+        label
+          ? h(Text, { style: { color: "#b5bac1", fontSize: 12, fontWeight: "700", textTransform: "uppercase", marginBottom: 6 } }, label)
+          : null,
+        h(View, { style: Object.assign({}, BOX, boxStyle || {}) },
+          h(TextInput, Object.assign(
+            { placeholderTextColor: "#80848e" },
+            props,
+            { style: Object.assign({ color: "#f2f3f5", fontSize: 15, padding: 0 }, props.style || {}) }
+          ))
+        )
+      );
     const sw = (label, value, onValueChange, subLabel) =>
       h(TableSwitchRow, { label: label, subLabel: subLabel, value: !!value, onValueChange: onValueChange });
 
@@ -1165,24 +1188,21 @@
     const durationContent = h(View, { style: { padding: 0, gap: 12 } },
       h(View, { style: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" } },
         h(Text, { variant: "heading-md/semibold", style: { color: "#dbdee1", flexShrink: 1 } }, "Typing duration (seconds)"),
-        h(View, { style: { width: 80 } },
-          h(TextInput, {
-            placeholder: "0",
-            value: durationText,
-            keyboardType: "numeric",
-            size: "sm",
-            style: { color: "#f2f3f5", fontSize: 14, textAlign: "center" },
-            onChangeText: (t) => {
-              setDurationText(t);
-              if (t === "" || t.endsWith(".")) return;
-              const n = parseFloat(t);
-              if (Number.isFinite(n) && n >= 0 && n <= 15) {
-                setDuration(n);
-                storage.typingDuration = n;
-              }
-            },
-          })
-        )
+        inputField(null, {
+          placeholder: "0",
+          value: durationText,
+          keyboardType: "numeric",
+          style: { textAlign: "center", fontSize: 14 },
+          onChangeText: (t) => {
+            setDurationText(t);
+            if (t === "" || t.endsWith(".")) return;
+            const n = parseFloat(t);
+            if (Number.isFinite(n) && n >= 0 && n <= 15) {
+              setDuration(n);
+              storage.typingDuration = n;
+            }
+          },
+        }, { width: 80, paddingVertical: 6 })
       ),
       Slider
         ? h(Slider, {
@@ -1204,14 +1224,12 @@
       : h(View, { style: { backgroundColor: "#2b2d31", borderRadius: 16, overflow: "hidden", padding: 12 } }, durationContent);
 
     const customField = personality === "Custom"
-      ? h(View, { style: { paddingHorizontal: 16, paddingBottom: 12 } },
-          h(Text, { style: { color: "#b5bac1", fontSize: 12, marginBottom: 6 } }, "Custom prompt"),
-          h(TextInput, {
+      ? h(View, { style: { paddingHorizontal: 16, paddingVertical: 12 } },
+          inputField("Custom prompt", {
             value: customPrompt,
             multiline: true,
             placeholder: "Custom prompt guidelines...",
-            placeholderTextColor: "#b5bac1",
-            style: { color: "#f2f3f5", fontSize: 15, minHeight: 90, textAlignVertical: "top" },
+            style: { minHeight: 120, textAlignVertical: "top" },
             onChangeText: onCustomPromptChange,
           })
         )
@@ -1236,14 +1254,12 @@
           trailing: h(Text, { style: { color: "#da373c", fontWeight: "600" } }, "Delete"),
           onPress: () => removeKey(k.id),
         })),
-        h(View, { style: { paddingHorizontal: 16, paddingVertical: 8 } },
-          h(TextInput, {
+        h(View, { style: { paddingHorizontal: 16, paddingVertical: 12 } },
+          inputField("New API key", {
             value: newKey,
             placeholder: "gsk_...",
-            placeholderTextColor: "#b5bac1",
             autoCapitalize: "none",
             autoCorrect: false,
-            style: { color: "#f2f3f5", fontSize: 15, paddingVertical: 6 },
             onChangeText: setNewKey,
             onSubmitEditing: addKey,
           })
