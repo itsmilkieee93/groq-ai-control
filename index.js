@@ -566,9 +566,81 @@
       "\n\nTyped text to turn into the reply. Output only the chat message:\n" + text;
   }
 
+  // ---- Advanced generation settings (unlocked from the settings page) ----
+  const REASONING_OPTIONS = ["low", "medium", "high"];
+  const ADV_SPEC = {
+    temperature: { key: "advTemperature", label: "Temperature", min: 0, max: 2, int: false, def: 0.7,
+      hint: "0 to 2. Higher is more creative, lower is more focused. Default 0.7" },
+    maxTokens: { key: "advMaxTokens", label: "Max tokens", min: 64, max: 16384, int: true, def: 2048,
+      hint: "64 to 16384. Includes reasoning tokens, so a very low value can give empty replies. Default 2048" },
+    topP: { key: "advTopP", label: "Top P", min: 0.01, max: 1, int: false, def: 1,
+      hint: "0.01 to 1. Lower narrows word choice. Default 1" },
+    timeout: { key: "advTimeout", label: "Request timeout (seconds)", min: 5, max: 120, int: true, def: 20,
+      hint: "5 to 120. How long to wait for Groq before trying the next key. Default 20" },
+  };
+
+  function readAdv(spec) {
+    const n = parseFloat(storage[spec.key]);
+    if (!Number.isFinite(n)) return spec.def;
+    const c = Math.min(spec.max, Math.max(spec.min, n));
+    return spec.int ? Math.round(c) : c;
+  }
+
+  function getGenParams() {
+    const defaultEffort = storage.answerQuestions !== false ? "medium" : "low";
+    if (storage.advancedEnabled !== true) {
+      return { temperature: 0.7, maxTokens: 2048, topP: null, effort: defaultEffort, timeoutMs: 20000 };
+    }
+    return {
+      temperature: readAdv(ADV_SPEC.temperature),
+      maxTokens: readAdv(ADV_SPEC.maxTokens),
+      topP: readAdv(ADV_SPEC.topP),
+      effort: REASONING_OPTIONS.includes(storage.advReasoning) ? storage.advReasoning : defaultEffort,
+      timeoutMs: readAdv(ADV_SPEC.timeout) * 1000,
+    };
+  }
+
+  // Discord-style confirmation popup (Vendetta alert), with a native Alert fallback.
+  // If neither can be shown, nothing is confirmed.
+  function confirmDialog(opts) {
+    const cancelText = opts.cancelText || "Cancel";
+    const cancel = () => { try { if (typeof opts.onCancel === "function") opts.onCancel(); } catch (e) {} };
+    try {
+      const alerts = vendetta.ui && vendetta.ui.alerts;
+      if (alerts && typeof alerts.showConfirmationAlert === "function") {
+        log("confirm via Discord alert");
+        alerts.showConfirmationAlert({
+          title: opts.title,
+          content: opts.body,
+          confirmText: opts.confirmText,
+          confirmColor: opts.confirmColor || "brand",
+          cancelText: cancelText,
+          onConfirm: opts.onConfirm,
+          onCancel: cancel,
+        });
+        return true;
+      }
+    } catch (e) {
+      log("showConfirmationAlert failed:", e && e.message);
+    }
+    try {
+      log("confirm via native Alert");
+      RN.Alert.alert(opts.title, opts.body, [
+        { text: cancelText, style: "cancel", onPress: cancel },
+        { text: opts.confirmText, style: opts.confirmColor === "red" ? "destructive" : "default", onPress: opts.onConfirm },
+      ], { cancelable: true, onDismiss: cancel });
+      return true;
+    } catch (e) {
+      showToast("Groq: couldn't open the confirmation dialog");
+      cancel();
+      return false;
+    }
+  }
+
   async function callGroq(apiKey, text, replyContext = "") {
     const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
-    const timer = controller ? setTimeout(() => controller.abort(), 20000) : null;
+    const gen = getGenParams();
+    const timer = controller ? setTimeout(() => controller.abort(), gen.timeoutMs) : null;
     const systemPrompt = buildSystemPrompt() + (replyContext ? "\n\n" + replyContext : "");
     try {
       const res = await fetch(GROQ_URL, {
@@ -579,10 +651,11 @@
         },
         body: JSON.stringify({
           model: MODELS.includes(storage.model) ? storage.model : DEFAULT_MODEL,
-          temperature: 0.7,
-          reasoning_effort: storage.answerQuestions !== false ? "medium" : "low",
+          temperature: gen.temperature,
+          top_p: gen.topP == null ? undefined : gen.topP,
+          reasoning_effort: gen.effort,
           include_reasoning: false,
-          max_completion_tokens: 2048,
+          max_completion_tokens: gen.maxTokens,
           messages: [
             { role: "system", content: systemPrompt },
             { role: "user", content: userContent(text, replyContext) },
@@ -670,6 +743,8 @@
       if (v.application_command_type === 1 || v.application_command_type === 2 || v.application_command_type === 3) return true;
       if (v.localCommand === true || v.isLocalCommand === true) return true;
       if (v.applicationId && v.name && (v.type === 1 || v.type === 2 || v.type === 3 || v.options || v.commandOptions)) return true;
+      // Slash command option payloads look like [{ type, name, value }]
+      if (Array.isArray(v.options) && v.options.some((o) => o && typeof o === "object" && o.name && o.value !== undefined)) return true;
       const keys = Object.keys(v).slice(0, 80);
       for (let i = 0; i < keys.length; i++) {
         const k = keys[i];
@@ -705,6 +780,19 @@
       if (hasCommandMarker(a, 0, seen)) return true;
     }
     return false;
+  }
+
+  // Messages auto-rewrite should leave alone. Each category can be turned off in settings.
+  const MENTION_RE = /<@[!&]?\d+>|@everyone|@here/i;
+  const LINK_RE = /(?:https?:\/\/|www\.)\S+|\b(?:discord\.gg|discord(?:app)?\.com\/invite)\/\S+/i;
+  const PREFIX_CMD_RE = /^\s*[!$%;.?+~][a-z]/i;
+
+  function skipReason(text) {
+    if (typeof text !== "string" || !text) return null;
+    if (storage.skipMentions !== false && MENTION_RE.test(text)) return "ping";
+    if (storage.skipLinks !== false && LINK_RE.test(text)) return "link";
+    if (storage.skipBotCommands !== false && PREFIX_CMD_RE.test(text)) return "bot command";
+    return null;
   }
 
   function bypassIfCommand(text, args, where) {
@@ -943,6 +1031,8 @@
           const content = msg && typeof msg.content === "string" ? msg.content : "";
 
           if (bypassIfCommand(content, args, "sendMessage")) return orig(...args);
+          const skipWhy = skipReason(content);
+          if (skipWhy) { log("skip auto-rewrite (" + skipWhy + ")"); return orig(...args); }
 
           if (!content.trim() || getKeys().length === 0 || consumeMark(content)) {
             return orig(...args);
@@ -1001,6 +1091,8 @@
         const original = slot ? String(slot.get() || "") : "";
 
         if (bypassIfCommand(original, args, "handleSendMessage")) return orig(...args);
+        const skipWhy = skipReason(original);
+        if (skipWhy) { log("skip auto-rewrite (" + skipWhy + ")"); return orig(...args); }
         if (!shapeReported) { shapeReported = true; log("handleSendMessage args:", describeArgs(args)); }
 
         if (!slot || !original.trim() || getKeys().length === 0) {
@@ -1136,6 +1228,12 @@
       typeof storage.customPrompt === "string" ? storage.customPrompt : ""
     );
     const customPromptTimer = React.useRef(null);
+    const [, forceRender] = React.useReducer((x) => x + 1, 0);
+    const [advText, setAdvText] = React.useState(() => {
+      const o = {};
+      Object.keys(ADV_SPEC).forEach((k) => { o[k] = String(readAdv(ADV_SPEC[k])); });
+      return o;
+    });
 
     React.useEffect(() => {
       return () => {
@@ -1162,30 +1260,59 @@
       storage.apiKeys = (storage.apiKeys || []).filter((x) => x && x.id !== id);
     };
     const confirmRemoveKey = (k) => {
-      const title = "Delete API key?";
-      const body = "Key #" + k.id + " (" + mask(k.key) + ") will be removed. This can't be undone.";
-      try {
-        const alerts = vendetta.ui && vendetta.ui.alerts;
-        if (alerts && typeof alerts.showConfirmationAlert === "function") {
-          alerts.showConfirmationAlert({
-            title: title,
-            content: body,
-            confirmText: "Delete",
-            confirmColor: "red",
-            cancelText: "Cancel",
-            onConfirm: () => removeKey(k.id),
-          });
-          return;
-        }
-      } catch (e) {}
-      try {
-        RN.Alert.alert(title, body, [
-          { text: "Cancel", style: "cancel" },
-          { text: "Delete", style: "destructive", onPress: () => removeKey(k.id) },
-        ]);
-      } catch (e) {
-        removeKey(k.id);
-      }
+      confirmDialog({
+        title: "Delete API key?",
+        body: "Key #" + k.id + " (" + mask(k.key) + ") will be removed. This can't be undone.",
+        confirmText: "Delete",
+        confirmColor: "red",
+        onConfirm: () => removeKey(k.id),
+      });
+    };
+    const onAdvancedToggle = (v) => {
+      if (!v) { storage.advancedEnabled = false; return; }
+      confirmDialog({
+        title: "Unlock advanced settings?",
+        body:
+          "Changing these values can break the AI. For example:\n" +
+          "- Max tokens that is too low can cut replies off or return nothing\n" +
+          "- A high temperature can produce messy or off-topic text\n" +
+          "- A very short timeout makes requests fail before Groq answers\n" +
+          "- High reasoning effort makes every reply slower\n\n" +
+          "Your custom values are used for every rewrite once unlocked. You can use Reset to defaults or turn this off to go back to the normal values.",
+        confirmText: "Unlock",
+        confirmColor: "red",
+        onConfirm: () => { storage.advancedEnabled = true; },
+        onCancel: () => forceRender(),
+      });
+      // The switch flipped visually; re-render so it snaps back until confirmed.
+      setTimeout(forceRender, 0);
+    };
+    const onAutoRewriteToggle = (v) => {
+      if (!v) { storage.autoRewrite = false; return; }
+      const previewOff = storage.previewBeforeSend === false;
+      const skipped = [];
+      const notSkipped = [];
+      (storage.skipMentions !== false ? skipped : notSkipped).push("pings");
+      (storage.skipLinks !== false ? skipped : notSkipped).push("links");
+      (storage.skipBotCommands !== false ? skipped : notSkipped).push("bot commands like !help");
+      confirmDialog({
+        title: "Enable auto-rewrite?",
+        body:
+          "Every message you send, in any channel, will be rewritten by Groq AI before it is posted, not only messages sent with /groq. " +
+          "Your message text is sent to Groq's API, and sending will be slower." +
+          "\n\nSlash commands are never rewritten." +
+          (skipped.length ? "\nAlso left alone: messages with " + skipped.join(", ") + "." : "") +
+          (notSkipped.length ? "\nWill be rewritten (skipping is off): " + notSkipped.join(", ") + ". Rewriting can break them." : "") +
+          (previewOff
+            ? "\n\nPreview before sending is OFF, so rewritten messages will be posted without you reviewing them."
+            : "\n\nKeep Preview before sending on if you want to review each rewrite first."),
+        confirmText: "Enable",
+        confirmColor: "red",
+        onConfirm: () => { storage.autoRewrite = true; },
+        onCancel: () => forceRender(),
+      });
+      // The switch flipped visually; re-render so it snaps back until confirmed.
+      setTimeout(forceRender, 0);
     };
     const mask = (k) => (k.length > 12 ? k.slice(0, 8) + "…" + k.slice(-4) : k);
     const keys = Array.isArray(storage.apiKeys) ? storage.apiKeys : [];
@@ -1301,17 +1428,81 @@
         )
       : null;
 
+    const advField = (id) => {
+      const spec = ADV_SPEC[id];
+      const commit = (t) => {
+        setAdvText((prev) => Object.assign({}, prev, { [id]: t }));
+        const n = parseFloat(t);
+        if (Number.isFinite(n) && n >= spec.min && n <= spec.max) storage[spec.key] = spec.int ? Math.round(n) : n;
+      };
+      return h(View, { key: "adv-" + id, style: { marginBottom: 14 } },
+        inputField(spec.label, {
+          value: advText[id],
+          keyboardType: spec.int ? "number-pad" : "decimal-pad",
+          onChangeText: commit,
+          onBlur: () => {
+            const v = readAdv(spec);
+            storage[spec.key] = v;
+            setAdvText((prev) => Object.assign({}, prev, { [id]: String(v) }));
+          },
+        }),
+        h(Text, { style: { color: P.muted, fontSize: 12, marginTop: 6 } }, spec.hint)
+      );
+    };
+    const resetAdvanced = () => {
+      confirmDialog({
+        title: "Reset advanced settings?",
+        body: "Temperature, max tokens, top P, reasoning effort and timeout go back to their defaults.",
+        confirmText: "Reset",
+        confirmColor: "red",
+        onConfirm: () => {
+          Object.keys(ADV_SPEC).forEach((k) => { storage[ADV_SPEC[k].key] = ADV_SPEC[k].def; });
+          storage.advReasoning = "";
+          const o = {};
+          Object.keys(ADV_SPEC).forEach((k) => { o[k] = String(ADV_SPEC[k].def); });
+          setAdvText(o);
+        },
+      });
+    };
+    const effort = getGenParams().effort;
+    const chipColors = { accent: "#5865f2", input: isLightTheme() ? "#e3e5e8" : "#2b2d31", muted: P.muted };
+    const advancedOn = storage.advancedEnabled === true;
+    const advancedPanel = advancedOn
+      ? h(View, { style: { paddingHorizontal: 16, paddingTop: 12, paddingBottom: 6, backgroundColor: ROW_BG } },
+          advField("temperature"),
+          advField("maxTokens"),
+          advField("topP"),
+          h(View, { style: { marginBottom: 14 } },
+            h(Text, { style: { color: P.muted, fontSize: 12, fontWeight: "700", textTransform: "uppercase", marginBottom: 8 } }, "Reasoning effort"),
+            Chips(REASONING_OPTIONS, effort, (opt) => { storage.advReasoning = opt; }, chipColors, (o) => o.charAt(0).toUpperCase() + o.slice(1)),
+            h(Text, { style: { color: P.muted, fontSize: 12, marginTop: 2 } }, "Higher thinks longer before answering and is slower.")
+          ),
+          advField("timeout"),
+          h(View, { style: { marginBottom: 10 } }, button("Reset to defaults", "#4e5058", resetAdvanced, false))
+        )
+      : null;
+
     const body = [
       group("General ⚙️", [
-        sw("Auto-rewrite all messages", storage.autoRewrite, (v) => { storage.autoRewrite = v; }, "No /groq needed"),
+        sw("Auto-rewrite all messages", storage.autoRewrite, onAutoRewriteToggle, "No /groq needed"),
         sw("Auto-answer questions", storage.answerQuestions !== false, (v) => { storage.answerQuestions = v; }, "Math, translations, and other answers"),
         sw("Preview before sending", storage.previewBeforeSend !== false, (v) => { storage.previewBeforeSend = v; }, "Send / Edit / Copy prompt / Cancel"),
+      ]),
+      group("Skip auto-rewrite for 🚫", [
+        sw("Pings", storage.skipMentions !== false, (v) => { storage.skipMentions = v; }, "@user, @role, @everyone, @here"),
+        sw("Links", storage.skipLinks !== false, (v) => { storage.skipLinks = v; }, "http(s) links, www., Discord invites"),
+        sw("Bot commands", storage.skipBotCommands !== false, (v) => { storage.skipBotCommands = v; }, "Prefix commands like !help, .play, $work"),
       ]),
       group("Timing ⏱️", [durationRow]),
       group("AI Model 🧠", MODELS.map((m) => pick(m.replace("openai/", ""), m === model, () => { storage.model = m; }))),
       group("AI Personality 🎨", [
         ...PERSONALITY_OPTIONS.map((opt) => pick(opt, opt === personality, () => { storage.personality = opt; })),
         customField,
+      ]),
+      group("Advanced 🛠️", [
+        sw("Advanced settings", advancedOn, onAdvancedToggle,
+          advancedOn ? "Custom values are in use" : "Unlock temperature, max tokens, and more"),
+        advancedPanel,
       ]),
       group("Groq API Keys 🔑", [
         keys.length === 0 ? h(TableRow, { label: "No API keys yet" }) : null,
@@ -1435,6 +1626,13 @@
     if (storage.typingDuration == null) storage.typingDuration = 3;
     if (!PERSONALITY_OPTIONS.includes(storage.personality)) storage.personality = "Casual/Slang";
     if (typeof storage.customPrompt !== "string") storage.customPrompt = "";
+    if (typeof storage.advancedEnabled !== "boolean") storage.advancedEnabled = false;
+    if (typeof storage.skipMentions !== "boolean") storage.skipMentions = true;
+    if (typeof storage.skipLinks !== "boolean") storage.skipLinks = true;
+    if (typeof storage.skipBotCommands !== "boolean") storage.skipBotCommands = true;
+    Object.keys(ADV_SPEC).forEach((k) => {
+      if (!Number.isFinite(parseFloat(storage[ADV_SPEC[k].key]))) storage[ADV_SPEC[k].key] = ADV_SPEC[k].def;
+    });
     if (!MODELS.includes(storage.model)) storage.model = DEFAULT_MODEL;
 
     try { patchSettingsScreen(); } catch (e) { log("settings patch error", e && e.message); }
