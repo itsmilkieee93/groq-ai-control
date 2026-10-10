@@ -676,7 +676,92 @@
   }
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-  const log = (...a) => { try { console.log("[GroqAI]", ...a); } catch (e) {} };
+  const log = (...a) => {
+    try { console.log("[GroqAI]", ...a); } catch (e) {}
+    try { pushLog(a); } catch (e) {}
+  };
+
+  // In-memory log buffer (last LOG_MAX lines). Can be written to a file or shared from settings.
+  const LOG_MAX = 500;
+  const LOG_FILE = "groq-ai-control.log";
+  const logBuffer = [];
+  let logFlushTimer = null;
+
+  function logPart(v) {
+    if (typeof v === "string") return v;
+    if (v && typeof v === "object" && v.message) return String(v.message);
+    try { return JSON.stringify(v); } catch (e) { return String(v); }
+  }
+
+  function pushLog(parts) {
+    logBuffer.push(new Date().toISOString() + " " + parts.map(logPart).join(" "));
+    if (logBuffer.length > LOG_MAX) logBuffer.splice(0, logBuffer.length - LOG_MAX);
+    if (storage.logToFile === true) scheduleLogFlush();
+  }
+
+  function getFileManager() {
+    const names = ["DCDFileManager", "NativeFileModule", "RTNFileManager"];
+    const sources = [];
+    try { if (typeof nativeModuleProxy !== "undefined" && nativeModuleProxy) sources.push(nativeModuleProxy); } catch (e) {}
+    try { if (globalThis.nativeModuleProxy) sources.push(globalThis.nativeModuleProxy); } catch (e) {}
+    try { if (RN.NativeModules) sources.push(RN.NativeModules); } catch (e) {}
+    for (let i = 0; i < sources.length; i++) {
+      for (let j = 0; j < names.length; j++) {
+        try {
+          const m = sources[i][names[j]];
+          if (m && typeof m.writeFile === "function") return m;
+        } catch (e) {}
+      }
+    }
+    return null;
+  }
+
+  // Writes the whole in-memory log to LOG_FILE. Resolves with the file location, rejects on failure.
+  async function writeLogFile() {
+    const fm = getFileManager();
+    if (!fm) throw new Error("file manager not available");
+    await fm.writeFile("documents", LOG_FILE, logBuffer.join("\n") + "\n", "utf8");
+    let where = "documents/" + LOG_FILE;
+    try {
+      const c = typeof fm.getConstants === "function" ? fm.getConstants() : null;
+      if (c && c.DocumentsDirPath) where = c.DocumentsDirPath + "/" + LOG_FILE;
+    } catch (e) {}
+    return where;
+  }
+
+  // Debounced auto-write. Must not call log() (that would retrigger itself).
+  function scheduleLogFlush() {
+    if (logFlushTimer) return;
+    logFlushTimer = setTimeout(() => {
+      logFlushTimer = null;
+      writeLogFile().catch((e) => debugToast("err", "Log write failed: " + ((e && e.message) || "unknown")));
+    }, 3000);
+  }
+
+  async function uiWriteLog() {
+    try {
+      showToast("Log written: " + (await writeLogFile()));
+    } catch (e) {
+      showToast("Couldn't write log: " + ((e && e.message) || "unknown"));
+    }
+  }
+
+  // The file lives in the app's private storage, so sharing (or copying) is the way to get it out.
+  async function uiShareLog() {
+    const text = logBuffer.slice(-300).join("\n") || "(log is empty)";
+    try {
+      if (RN.Share && typeof RN.Share.share === "function") {
+        await RN.Share.share({ message: text, title: "Groq AI Control log" });
+        return;
+      }
+    } catch (e) {}
+    showToast(copyText(text) ? "Log copied to clipboard" : "Couldn't share or copy log");
+  }
+
+  function uiClearLog() {
+    logBuffer.length = 0;
+    showToast("Log cleared");
+  }
 
   // Debug toasts: shown only when the "Debug toasts" setting is on.
   function debugToast(kind, text) {
@@ -1685,6 +1770,12 @@
       ]),
       group("Debug 🐞", [
         sw("Debug toasts", storage.debugToasts === true, (v) => { storage.debugToasts = v; }, "Show success / error toasts for reply context and Groq calls"),
+        sw("Save log to file", storage.logToFile === true, (v) => { storage.logToFile = v; if (v) scheduleLogFlush(); }, "Auto-write the in-memory log to " + LOG_FILE),
+        h(View, { style: { flexDirection: "row", paddingHorizontal: 16, paddingVertical: 12, backgroundColor: ROW_BG } },
+          h(View, { style: { flex: 1, marginRight: 8 } }, button("Write log", GREEN, uiWriteLog, true)),
+          h(View, { style: { flex: 1, marginRight: 8 } }, button("Share log", "#4e5058", uiShareLog, true)),
+          h(View, { style: { flex: 1 } }, button("Clear log", RED, uiClearLog, true))
+        ),
       ]),
       group("Groq API Keys 🔑", [
         keys.length === 0 ? h(TableRow, { label: "No API keys yet" }) : null,
@@ -1813,6 +1904,7 @@
     if (typeof storage.skipLinks !== "boolean") storage.skipLinks = true;
     if (typeof storage.skipBotCommands !== "boolean") storage.skipBotCommands = true;
     if (typeof storage.debugToasts !== "boolean") storage.debugToasts = false;
+    if (typeof storage.logToFile !== "boolean") storage.logToFile = false;
     Object.keys(ADV_SPEC).forEach((k) => {
       if (!Number.isFinite(parseFloat(storage[ADV_SPEC[k].key]))) storage[ADV_SPEC[k].key] = ADV_SPEC[k].def;
     });
@@ -1829,6 +1921,7 @@
 
   function onUnload() {
     try { stopReplyWatch(); } catch (e) {}
+    if (logFlushTimer) { clearTimeout(logFlushTimer); logFlushTimer = null; }
     while (unpatches.length) {
       try { unpatches.pop()(); } catch (e) {}
     }
