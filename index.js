@@ -314,6 +314,76 @@
       }
     }
 
+    // 🌸 Snowflake anchor: the replied-to message's ID pins a slice of the channel history,
+    // so the AI sees the exact conversation around what is being replied to.
+    const DISCORD_EPOCH = 1420070400000;
+    const WINDOW_BEFORE = 4; // messages before the anchor
+    const WINDOW_AFTER = 6;  // messages after the anchor
+    const WINDOW_LINE_MAX = 200;
+
+    function snowflakeToMs(id) {
+      const n = Number(String(id || ""));
+      if (!Number.isFinite(n) || n <= 0) return null;
+      return Math.floor(n / 4194304) + DISCORD_EPOCH;
+    }
+
+    // Snowflakes compared as strings (same length -> lexicographic) to avoid precision loss.
+    function compareSnowflake(a, b) {
+      const x = String(a || ""), y = String(b || "");
+      if (x.length !== y.length) return x.length - y.length;
+      return x < y ? -1 : x > y ? 1 : 0;
+    }
+
+    function getChannelMessages(channelId) {
+      try {
+        if (!channelId || !MessageStore || typeof MessageStore.getMessages !== "function") return [];
+        const col = MessageStore.getMessages(channelId);
+        if (!col) return [];
+        let arr = null;
+        if (typeof col.toArray === "function") arr = col.toArray();
+        else if (Array.isArray(col._array)) arr = col._array;
+        else if (Array.isArray(col)) arr = col;
+        if (!Array.isArray(arr)) return [];
+        return arr.filter((m) => m && m.id).sort((a, b) => compareSnowflake(a.id, b.id));
+      } catch (e) {
+        return [];
+      }
+    }
+
+    function sliceAnchorWindow(channelId, anchorId) {
+      if (!channelId || !anchorId) return null;
+      const all = getChannelMessages(channelId);
+      const idx = all.findIndex((m) => String(m.id) === String(anchorId));
+      if (idx === -1) return null;
+      const start = Math.max(0, idx - WINDOW_BEFORE);
+      const end = Math.min(all.length, idx + 1 + WINDOW_AFTER);
+      return { items: all.slice(start, end), anchorId: String(anchorId), hiddenBefore: start, hiddenAfter: all.length - end };
+    }
+
+    function windowLines(win) {
+      if (!win || !win.items.length) return [];
+      const selfId = getSelfIdentity().id;
+      const out = [];
+      if (win.hiddenBefore > 0) out.push("... (" + win.hiddenBefore + " earlier messages not shown)");
+      for (let i = 0; i < win.items.length; i++) {
+        const m = win.items[i];
+        const isAnchor = String(m.id) === win.anchorId;
+        const text = textOfMessage(m).replace(/\s+/g, " ").trim().slice(0, WINDOW_LINE_MAX);
+        if (!text && !isAnchor) continue;
+        const who = authorOf(m);
+        const name = who.globalName || who.username || who.id || "unknown";
+        const ms = snowflakeToMs(m.id);
+        const when = ms ? new Date(ms).toISOString().slice(11, 16) + "Z" : "";
+        const flags = [];
+        if (isAnchor) flags.push(">>> REPLY TARGET");
+        if (selfId && who.id === selfId) flags.push("speaker");
+        if (isBotMessage(m)) flags.push("bot");
+        out.push("- " + (flags.length ? "[" + flags.join(", ") + "] " : "") + (when ? when + " " : "") + name + ": " + (text || "(no text)"));
+      }
+      if (win.hiddenAfter > 0) out.push("... (" + win.hiddenAfter + " newer messages not shown)");
+      return out;
+    }
+
     function resolveReplyInfo(channelId, args, explicitRef) {
       const fromArgs = extractReplyMessage(args);
       const fromStore = messageFromStore(channelId, explicitRef || findReplyRef(args));
@@ -329,7 +399,15 @@
       const who = authorOf(msg);
       const snaps = snapshotMessages(msg);
       const forwardAuthor = snaps.length ? authorOf(snaps[0]) : { id: "", username: "", globalName: "" };
+      const ref = explicitRef || findReplyRef(args);
+      const anchorId = String(msg.id || (ref && (ref.message_id || ref.messageId)) || "");
+      const anchorMs = snowflakeToMs(anchorId);
+      const win = sliceAnchorWindow(channelId || msg.channel_id || msg.channelId, anchorId);
+      log("snowflake anchor", anchorId || "none", win ? "window " + win.items.length : "no window");
       return {
+        messageId: anchorId,
+        sentAt: anchorMs ? new Date(anchorMs).toISOString() : "",
+        windowLines: windowLines(win),
         text: textOfMessage(msg),
         id: who.id || forwardAuthor.id,
         username: who.username || forwardAuthor.username,
@@ -347,7 +425,7 @@
         "- discord_username: " + (self.username || "unknown"),
         "- discord_global_name: " + (self.globalName || "unknown"),
       ];
-      if (reply && (reply.text || reply.id || reply.username || reply.globalName || reply.isBot || reply.isForward)) {
+      if (reply && (reply.text || reply.id || reply.messageId || reply.username || reply.globalName || reply.isBot || reply.isForward)) {
         lines.push(reply.isForward
           ? "The speaker is replying to this forwarded Discord message:"
           : reply.isBot
@@ -358,9 +436,15 @@
         lines.push("- reply_discord_global_name: " + (reply.globalName || "unknown"));
         if (reply.isBot) lines.push("- reply_is_bot: true");
         if (reply.isForward) lines.push("- reply_is_forward: true");
+        if (reply.messageId) lines.push("- reply_message_id: " + reply.messageId);
+        if (reply.sentAt) lines.push("- reply_sent_at: " + reply.sentAt);
         if (reply.text) lines.push("- reply_message: \"" + reply.text.replace(/"/g, "'") + "\"");
+        if (reply.windowLines && reply.windowLines.length) {
+          lines.push("Channel messages around the reply target (oldest first, UTC times). The line flagged >>> REPLY TARGET is the exact message being replied to; \"speaker\" marks the person you are writing for:");
+          for (let i = 0; i < reply.windowLines.length; i++) lines.push(reply.windowLines[i]);
+        }
       }
-      lines.push("These are Discord user IDs, usernames, and global names. Use them only as context. Output only the final chat message.");
+      lines.push("These are Discord IDs, usernames, global names, and recent messages. Use them only as context. Output only the final chat message.");
       return lines.join("\n");
     }
 
