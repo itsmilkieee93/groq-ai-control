@@ -785,7 +785,7 @@
     const text = logBuffer.slice(-300).join("\n") || "(log is empty)";
     try {
       if (RN.Share && typeof RN.Share.share === "function") {
-        await RN.Share.share({ message: text, title: "Groq AI Control log" });
+        await RN.Share.share({ message: text, title: "Persona Chat log" });
         return;
       }
     } catch (e) {}
@@ -953,7 +953,7 @@
       ], { cancelable: true, onDismiss: cancel });
       return true;
     } catch (e) {
-      showToast("Groq: couldn't open the confirmation dialog");
+      showToast("Persona Chat: couldn't open the confirmation dialog");
       cancel();
       return false;
     }
@@ -1070,12 +1070,12 @@
     for (let i = 0; i < keys.length; i++) {
       try {
         const out = await callGroq(keys[i], text, replyContext, forceAnswer);
-        debugToast("ok", "Groq rewrite ok (key #" + (i + 1) + ")");
+        debugToast("ok", "Persona Chat rewrite ok (key #" + (i + 1) + ")");
         return out;
       } catch (e) {
         log("key #" + (i + 1) + " failed:", e && (e.status || e.message));
         if (e && e.refused) { // other keys would decline too; keep the user's own text
-          debugToast("warn", "Groq refused, kept your text");
+          debugToast("warn", "Persona Chat declined, kept your text");
           return text;
         }
         debugToast("err", "Key #" + (i + 1) + " failed: " + ((e && (e.status || e.message)) || "unknown"));
@@ -1425,7 +1425,7 @@
           if (skipWhy) { log("skip auto-rewrite (" + skipWhy + ")"); return orig(...args); }
 
           if (ans.forced && getKeys().length === 0) {
-            showToast("Groq: add an API key first. Sent without the AI.");
+            showToast("Persona Chat: add an API key first. Sent without the AI.");
             const plain = args.slice();
             plain[1] = Object.assign({}, msg, { content: content });
             return orig(...plain);
@@ -1494,7 +1494,7 @@
 
         if (!slot || !original.trim()) return orig(...args);
         if (getKeys().length === 0) {
-          if (ans.forced) { showToast("Groq: add an API key first"); return; } // keep the text in the box
+          if (ans.forced) { showToast("Persona Chat: add an API key first"); return; } // keep the text in the box
           return orig(...args);
         }
 
@@ -1528,10 +1528,10 @@
 
   function registerGroqCommand() {
     unregisterCommand = registerCommand({
-      name: "groq",
-      displayName: "groq",
-      description: "Rewrite your message with Groq AI and send it",
-      displayDescription: "Rewrite your message with Groq AI and send it",
+      name: "persona-chat",
+      displayName: "persona-chat",
+      description: "Rewrite your message with Persona Chat and send it",
+      displayDescription: "Rewrite your message with Persona Chat and send it",
       applicationId: "-1",
       inputType: 1,
       type: 1,
@@ -1565,7 +1565,7 @@
           log("reply capture failed:", e && e.message);
           try { replyContext = formatContext(null, ans.forced); } catch (e2) {}
         }
-        log("payload context (/groq):", replyContext.replace(/\n/g, " | ").slice(0, 180));
+        log("payload context (/persona-chat):", replyContext.replace(/\n/g, " | ").slice(0, 180));
         log("slash target:", replyTarget && replyTarget.id);
 
         try {
@@ -1600,8 +1600,8 @@
           MessageModules.sendMessage(channelId, payload, undefined, extra);
           clearPending(channelId);
         } catch (e) {
-          log("/groq failed:", e && e.message);
-          showToast("Groq: " + ((e && e.message) || "failed to send message"));
+          log("/persona-chat failed:", e && e.message);
+          showToast("Persona Chat: " + ((e && e.message) || "failed to send message"));
         }
       },
     });
@@ -1734,7 +1734,7 @@
       confirmDialog({
         title: "Enable auto-rewrite?",
         body:
-          "Every message you send, in any channel, will be rewritten by Groq AI before it is posted, not only messages sent with /groq. " +
+          "Every message you send, in any channel, will be rewritten by Persona Chat before it is posted, not only messages sent with /persona-chat. " +
           "Your message text is sent to Groq's API, and sending will be slower." +
           "\n\nSlash commands are never rewritten." +
           (skipped.length ? "\nAlso left alone: messages with " + skipped.join(", ") + "." : "") +
@@ -1932,9 +1932,49 @@
         )
       : null;
 
+    // ---- Footer: getting a Groq API key, links, and privacy ----
+    const LINK = "#00a8fc";
+    const openUrl = (url) => {
+      try {
+        const p = RN.Linking && RN.Linking.openURL ? RN.Linking.openURL(url) : null;
+        if (p && typeof p.catch === "function") p.catch(() => showToast("Couldn't open " + url));
+        else if (!p) showToast("Couldn't open " + url);
+      } catch (e) { showToast("Couldn't open " + url); }
+    };
+    const link = (label, url) =>
+      h(Text, { style: { color: LINK, textDecorationLine: "underline" }, onPress: () => openUrl(url), suppressHighlighting: true }, label);
+    const noteText = { color: P.muted, fontSize: 13, lineHeight: 19 };
+    const noteHead = { color: P.title, fontSize: 14, fontWeight: "700", marginBottom: 6 };
+    const footer = h(View, { style: { paddingHorizontal: 6, paddingTop: 8, gap: 16 } },
+      h(View, null,
+        h(Text, { style: noteHead }, "How to get a Groq API key"),
+        h(Text, { style: noteText },
+          "1. Open ", link("console.groq.com", "https://console.groq.com"), " and sign up or log in. The free tier doesn't need a credit card.\n" +
+          "2. Open the ", link("API Keys page", "https://console.groq.com/keys"), " and tap Create API Key.\n" +
+          "3. Give it a name and copy the key. It starts with gsk_ and is shown only once, so copy it right away.\n" +
+          "4. Paste it into New API key above, tap Add API key, then Test.\n\n" +
+          "You can add several keys. If one is rate limited or fails, the next one is tried. See the ",
+          link("rate limits", "https://console.groq.com/docs/rate-limits"), " for the free tier."
+        )
+      ),
+      h(View, null,
+        h(Text, { style: noteHead }, "Privacy"),
+        h(Text, { style: noteText },
+          "Persona Chat sends your typed text, plus the reply context you enabled (the replied-to message, nearby messages and their usernames), " +
+          "to Groq's API using your own key. It doesn't contact any other server, and your keys stay in this plugin's storage on your device.\n\n" +
+          "How Groq handles that data is set by Groq, not by this plugin. Its docs describe a standard retention period (up to 30 days at the time of writing) " +
+          "unless Zero Data Retention is turned on in Data Controls. Check the pages below for the current terms:\n"
+        ),
+        h(Text, { style: noteText }, "• ", link("Groq Privacy Policy", "https://groq.com/privacy-policy")),
+        h(Text, { style: noteText }, "• ", link("Your Data in GroqCloud (retention)", "https://console.groq.com/docs/your-data")),
+        h(Text, { style: noteText }, "• ", link("Data Controls (Zero Data Retention)", "https://console.groq.com/settings/data-controls")),
+        h(Text, { style: Object.assign({}, noteText, { marginTop: 8 }) }, "Avoid putting passwords or other private details in messages you send through Persona Chat.")
+      )
+    );
+
     const body = [
       group("General ⚙️", [
-        sw("Auto-rewrite all messages", storage.autoRewrite, onAutoRewriteToggle, "No /groq needed"),
+        sw("Auto-rewrite all messages", storage.autoRewrite, onAutoRewriteToggle, "No /persona-chat needed"),
         sw("Auto-answer questions", storage.answerQuestions !== false, (v) => { storage.answerQuestions = v; }, "Math, translations, and other answers. Start a message with !~{ans} or [Answer] to force it for that message"),
         sw("Preview before sending", storage.previewBeforeSend !== false, (v) => { storage.previewBeforeSend = v; }, "Send / Edit / Copy prompt / Cancel"),
       ]),
@@ -1964,7 +2004,7 @@
         advancedPanel,
       ]),
       group("Debug 🐞", [
-        sw("Debug toasts", storage.debugToasts === true, (v) => { storage.debugToasts = v; }, "Show success / error toasts for reply context and Groq calls"),
+        sw("Debug toasts", storage.debugToasts === true, (v) => { storage.debugToasts = v; }, "Show success / error toasts for reply context and AI calls"),
         sw("Save log to file", storage.logToFile === true, (v) => { storage.logToFile = v; if (v) scheduleLogFlush(); }, "Auto-write the in-memory log to " + LOG_FILE),
         h(View, { style: { flexDirection: "row", paddingHorizontal: 16, paddingVertical: 12, backgroundColor: ROW_BG } },
           h(View, { style: { flex: 1, marginRight: 8 } }, button("Write log", GREEN, uiWriteLog, true)),
@@ -2006,6 +2046,7 @@
             )
           : null,
       ]),
+      footer,
     ];
 
     const content = Stack
@@ -2018,7 +2059,7 @@
   const GROQ_KEY = "GROQ_AI_CONTROL";
 
   function openGroqPage() {
-    const payload = { title: "Groq AI Control", render: GroqSettingsPage };
+    const payload = { title: "Persona Chat", render: GroqSettingsPage };
     try {
       const navMod = metro.findByProps("getRootNavigationRef");
       const ref = navMod && navMod.getRootNavigationRef && navMod.getRootNavigationRef();
@@ -2033,7 +2074,7 @@
         return;
       }
     } catch (e) {}
-    showToast("Groq: unable to open settings page");
+    showToast("Persona Chat: unable to open settings page");
   }
 
   function patchSettingsScreen() {
@@ -2043,6 +2084,45 @@
     const Table = metro.findByProps("TableRowIcon") || {};
     const TableRowIcon = Table.TableRowIcon;
 
+    // Icons8 magic wand — transparent monochrome PNG. Color follows Discord theme.
+    // Falls back to Discord's native ic_wand (asset 3086) if Icons8 fails to load.
+    const ICON_ID = "xKAfx2KN4Ea6";
+    const WAND_ASSET = 3086;
+    let icons8Failed = false;
+    function iconUri() {
+      const hex = isLightTheme() ? "060607" : "F2F3F5";
+      return "https://img.icons8.com/?size=128&id=" + ICON_ID + "&format=png&color=" + hex;
+    }
+    function nativeWand() {
+      try {
+        const getAsset = (metro.findByProps("getAssetIDByName") || {}).getAssetIDByName;
+        if (typeof getAsset === "function") {
+          const id = getAsset("ic_wand") || getAsset("WandIcon");
+          if (id != null) return id;
+        }
+      } catch (e) {}
+      return WAND_ASSET;
+    }
+    function currentSource() {
+      return icons8Failed ? nativeWand() : { uri: iconUri() };
+    }
+    function onIconError() {
+      if (icons8Failed) return;
+      icons8Failed = true;
+      log("icons8 failed, using ic_wand", nativeWand());
+    }
+    function IconWithFallback() {
+      const src = currentSource();
+      if (TableRowIcon) {
+        return h(TableRowIcon, { source: src, onError: onIconError });
+      }
+      return h(RN.Image, {
+        source: src,
+        style: { width: 24, height: 24 },
+        onError: onIconError,
+      });
+    }
+
     if (!settingConstants) {
       log("SETTING_RENDERER_CONFIG not found");
       return;
@@ -2051,12 +2131,10 @@
     const row = {};
     row[GROQ_KEY] = {
       type: "pressable",
-      title: function () { return "Groq AI Control"; },
-      useTitle: function () { return "Groq AI Control"; },
-      icon: null,
-      IconComponent: TableRowIcon
-        ? function () { return h(TableRowIcon, { source: null }); }
-        : undefined,
+      title: function () { return "Persona Chat"; },
+      useTitle: function () { return "Persona Chat"; },
+      icon: { uri: iconUri() },
+      IconComponent: IconWithFallback,
       usePredicate: function () { return true; },
       onPress: openGroqPage,
       withArrow: true,
@@ -2086,8 +2164,8 @@
       if (!section) {
         const isMain = sections.some((x) => x && Array.isArray(x.settings) && x.settings.indexOf("ACCOUNT") !== -1);
         if (isMain) {
-          sections.unshift({ label: "Groq AI Control", title: "Groq AI Control", settings: [GROQ_KEY] });
-          log("added Groq section");
+          sections.unshift({ label: "Persona Chat", title: "Persona Chat", settings: [GROQ_KEY] });
+          log("added Persona Chat section");
         }
         return;
       }
