@@ -497,20 +497,23 @@
         isForward: isForwardedMessage(msg),
       };
     }
-    function formatContext(reply, forceAnswer) {
+
+    function formatContext(reply, forceAnswer, selfServerName) {
       const self = getSelfIdentity();
       const lines = [
-        "This is Discord. You are writing the outgoing Discord chat message for this speaker:",
+        "This is Discord. You are writing the outgoing Discord chat message for this speaker. In the speaker's own text, 'me', 'my', 'mine', 'myself' and 'I' mean THIS person:",
         "- discord_user_id: " + (self.id || "unknown"),
         "- discord_username: " + (self.username || "unknown"),
         "- discord_global_name: " + (self.globalName || "unknown"),
       ];
+      if (selfServerName) lines.push("- discord_server_name: " + selfServerName);
+      const replyWho = " (words like he, she, they, him, her in the speaker's text usually mean this person, never the speaker):";
       if (reply && (reply.text || reply.id || reply.messageId || reply.username || reply.globalName || reply.isBot || reply.isForward)) {
         lines.push(reply.isForward
-          ? "The speaker is replying to this forwarded Discord message:"
+          ? "The speaker is replying to this forwarded Discord message" + replyWho
           : reply.isBot
-            ? "The speaker is replying to this Discord bot message:"
-            : "The speaker is replying to this Discord message:");
+            ? "The speaker is replying to this Discord bot message" + replyWho
+            : "The speaker is replying to this Discord message" + replyWho);
         lines.push("- reply_discord_user_id: " + (reply.id || "unknown"));
         lines.push("- reply_discord_username: " + (reply.username || "unknown"));
         lines.push("- reply_discord_global_name: " + (reply.globalName || "unknown"));
@@ -533,6 +536,7 @@
         + "A name or fact may only appear in the output if the speaker's own text already contains it. Keep the speaker's original wording and meaning as close as possible. ";
       const footer = (forceAnswer === true || storage.answerQuestions !== false)
         ? "If the speaker's text is an instruction about the reply itself (for example 'reply to Quater', 'answer him', 'say yes', 'tell her no'), do not rewrite or repeat it: write the actual reply to the reply target from this context, in the speaker's own voice, ready to send. " +
+          "If the speaker asks about themselves (who am I, who's me, my name, my id, my nickname), answer directly from the speaker facts above, addressed to the speaker (for example 'You're <global name> (@<username>)'), and do not describe the reply target or add anything that is not listed. " +
           "If the speaker's text is a question about this conversation (what someone means, said, or is talking about, who someone is, what happened), answer it from this context in the speaker's own voice, ready to send; if the context cannot answer it, just rewrite the question without guessing. For any other message: " + strict
         : "Use them ONLY to understand the situation. " + strict;
       lines.push("These are Discord IDs, usernames, global names, and recent messages. " + footer + "Output only the final chat message.");
@@ -540,7 +544,12 @@
     }
 
     function buildPayloadContext(channelId, args, explicitRef, forceAnswer) {
-      return formatContext(resolveReplyInfo(channelId, args, explicitRef), forceAnswer);
+      let selfServerName = "";
+      try {
+        const me = getSelfIdentity();
+        selfServerName = serverNickOf(guildIdOf(channelId, null), me.id, null);
+      } catch (e) {}
+      return formatContext(resolveReplyInfo(channelId, args, explicitRef), forceAnswer, selfServerName);
     }
 
     function getReplyTarget(channelId) {
@@ -622,6 +631,11 @@
     "message, ready to send; if the context does not contain the answer, just rewrite the question instead of guessing. " +
     "If it is ordinary conversation, or a question aimed at another person (their plans, feelings, opinions, " +
     "availability), just rewrite it and keep its meaning. " +
+    "IDENTITY: in the speaker's text, 'me', 'my', 'mine', 'myself' and 'I' mean the SPEAKER (the discord_* fields in the context), " +
+    "and 'he', 'she', 'they', 'him', 'her' or 'that person' usually mean the REPLY TARGET (the reply_discord_* fields) unless the text names someone else. " +
+    "Other names in the channel messages are third parties. Never mix these people up. You are only the writer for the speaker: never talk about being an AI or a model, " +
+    "never answer as yourself, and never invent facts (real name, age, location, role, history, relationships) that are not written in the context. " +
+    "If the speaker asks about themselves ('who am I', 'who's me', 'what's my name', 'my id', 'my nickname'), answer plainly with only the speaker facts listed in the context. " +
     "INSTRUCTIONS (this overrides the text-editing rule above): if the text is not something to say but an instruction about the reply itself, " +
     "such as 'reply to Quater', 'answer him', 'respond to this', 'say yes', 'tell her no', 'agree', 'reply with a joke', or 'roast him', " +
     "do NOT rewrite, translate, or repeat the instruction. Write the actual message the speaker would send as a reply to the reply target, " +
@@ -836,15 +850,15 @@
   const FormRowModule = metro.findByProps("FormRow");
   const FormRow = (FormRowModule && FormRowModule.FormRow) || FormRowModule;
 
-  // Typing this at the very start of a message forces "answer" mode for that one message,
-  // even when Auto-answer questions is off or Auto-rewrite is off.
-  const ANS_PREFIX_RE = /^[\s\u00a0\u200b-\u200d\ufeff]*!~\{ans\}[\s\u00a0]*/i;
+  // Typing one of these at the very start of a message forces "answer" mode for that one message,
+  // even when Auto-answer questions is off or Auto-rewrite is off: !~{ans}, [Answer] or [ans] (any capitalisation).
+  const ANS_PREFIX_RE = /^[\s\u00a0\u200b-\u200d\ufeff]*(?:!~\{ans\}|\[(?:answer|ans)\]:?)[\s\u00a0]*/i;
   function parseAnsPrefix(text) {
     if (typeof text !== "string") return { forced: false, text: text };
     const m = ANS_PREFIX_RE.exec(text);
     if (!m) return { forced: false, text: text };
     const rest = text.slice(m[0].length);
-    // A bare "!~{ans}" with nothing after it is just a normal message.
+    // A bare prefix with nothing after it is just a normal message.
     return rest.trim() ? { forced: true, text: rest } : { forced: false, text: text };
   }
 
@@ -853,7 +867,7 @@
     const tag = forceAnswer === true
       ? "The speaker tagged the typed text below as an instruction or question to ANSWER, not a message to rewrite. " +
         "Carry it out (answer the question, or write the reply it asks for) and output only the resulting chat message. " +
-        "Never repeat or paraphrase the instruction itself.\n\n"
+        "Never repeat or paraphrase the instruction itself. In the typed text, \"me\", \"my\" and \"I\" mean the speaker described in the Discord context, never you.\n\n"
       : "";
     if (!replyContext || replyContext.indexOf("reply_message:") === -1) return tag ? tag + "Typed text:\n" + text : text;
     return tag + "The speaker is replying on Discord. Use the referenced message below. Do not ignore it and do not invent a different topic.\n\n" +
@@ -996,7 +1010,8 @@
   const STATUS_HINTS = {
     200: "OK · working",
     400: "Bad request · model or params rejected",
-    401: "Unauthorized · invalid API key",    403: "Forbidden · key blocked or no access",
+    401: "Unauthorized · invalid API key",
+    403: "Forbidden · key blocked or no access",
     404: "Not found · model unavailable for this key",
     413: "Request too large",
     429: "Too many requests · rate limit or quota hit (key is valid)",
@@ -1495,6 +1510,7 @@
           try {
             if (typeof ChatInputModule.changeText === "function") ChatInputModule.changeText(finalText);
           } catch (e) {}
+
           try {
             slot.set(finalText);
             bypass = true;
@@ -1919,7 +1935,7 @@
     const body = [
       group("General ⚙️", [
         sw("Auto-rewrite all messages", storage.autoRewrite, onAutoRewriteToggle, "No /groq needed"),
-        sw("Auto-answer questions", storage.answerQuestions !== false, (v) => { storage.answerQuestions = v; }, "Math, translations, and other answers. Start a message with !~{ans} to force it for that message"),
+        sw("Auto-answer questions", storage.answerQuestions !== false, (v) => { storage.answerQuestions = v; }, "Math, translations, and other answers. Start a message with !~{ans} or [Answer] to force it for that message"),
         sw("Preview before sending", storage.previewBeforeSend !== false, (v) => { storage.previewBeforeSend = v; }, "Send / Edit / Copy prompt / Cancel"),
       ]),
       group("Skip auto-rewrite for 🚫", [
@@ -1995,6 +2011,7 @@
     const content = Stack
       ? h(Stack, { spacing: 12 }, body)
       : h(View, { style: { gap: 12 } }, body);
+
     return h(ScrollView, { style: { flex: 1 }, contentContainerStyle: { padding: 12, paddingBottom: 48 } }, content);
   }
 
