@@ -534,7 +534,10 @@
       }
       const strict = "Do NOT insert names, IDs, or details from this context into the message, and do NOT replace pronouns (he, she, they, it, that, this) with names. "
         + "A name or fact may only appear in the output if the speaker's own text already contains it. Keep the speaker's original wording and meaning as close as possible. ";
-      const footer = (forceAnswer === true || storage.answerQuestions !== false)
+      const footer = forceAnswer === true
+        ? "Use this context to answer the speaker's typed text. If it asks about the speaker themselves (who am I, who's me, my name, my id, my nickname), answer directly from the speaker facts above, addressed to the speaker. " +
+          "Quote or name people from the context freely when that makes the answer clearer, but state only what the context actually shows. "
+        : storage.answerQuestions !== false
         ? "If the speaker's text is an instruction about the reply itself (for example 'reply to Quater', 'answer him', 'say yes', 'tell her no'), do not rewrite or repeat it: write the actual reply to the reply target from this context, in the speaker's own voice, ready to send. " +
           "If the speaker asks about themselves (who am I, who's me, my name, my id, my nickname), answer directly from the speaker facts above, addressed to the speaker (for example 'You're <global name> (@<username>)'), and do not describe the reply target or add anything that is not listed. " +
           "If the speaker's text is a question about this conversation (what someone means, said, or is talking about, who someone is, what happened), answer it from this context in the speaker's own voice, ready to send; if the context cannot answer it, just rewrite the question without guessing. For any other message: " + strict
@@ -644,6 +647,25 @@
     "If there is no reply target or context to answer from, treat the text as an ordinary message and rewrite it. " +
     "Return ONLY the message to send (including the steps, when asked for), with no quotes, labels, or commentary about the task itself.";
 
+  // Used instead of EDITOR_RULES + ANSWER_RULES when the speaker typed an answer tag ([Answer], [ans] or !~{ans}).
+  // Those two rule sets lean towards rewriting, which is exactly what the tag is meant to switch off.
+  const FORCED_ANSWER_RULES =
+    "You write the outgoing Discord chat message for the speaker. The speaker put an answer tag on their typed text, so it is NOT a message to polish or reword. " +
+    "It is a question, request or instruction, and your output is the ANSWER or REPLY itself, written as the message they will send, in their own voice. " +
+    "Words like 'reply,', 'answer,', 'respond,' or 'say' at the start are instructions, not part of the question. " +
+    "Never repeat, restate, or lightly rephrase the typed text, and never answer with the same question back. " +
+    "Lead with the answer. Use the Discord context (the reply target, nearby messages, who said what) together with ordinary general knowledge. " +
+    "For math or logic show a few short lines ending with the final answer; for translations or 'say X' requests just give the result. " +
+    "If the context only partly covers a question about a person or an event, say what the messages actually show, in a natural casual voice " +
+    "(for example 'from what i can see...'). Do not refuse and do not echo the question. " +
+    "If neither the context nor general knowledge can answer it, say so in one short natural line (for example 'no clue tbh'). " +
+    "Never invent facts about real people such as their job, age, location or history. " +
+    "IDENTITY: 'me', 'my', 'mine', 'myself' and 'I' in the typed text mean the SPEAKER (the discord_* fields in the context), " +
+    "and 'he', 'she', 'they', 'him', 'her' or 'that person' usually mean the REPLY TARGET (the reply_discord_* fields) unless a name is given. " +
+    "Never mix these people up, never talk about being an AI or a model, and never answer as yourself. " +
+    "If the speaker asks about themselves ('who am I', 'who's me', 'my name', 'my id', 'my nickname'), answer plainly with only the speaker facts in the context. " +
+    "Return ONLY the message to send, with no quotes, labels, or commentary about the task.";
+
   const PERSONALITIES = {
     "Casual/Slang":
       "Style: relaxed, friendly, natural slang, like a real person texting a friend. Keep it short and lively.",
@@ -659,7 +681,8 @@
       const custom = typeof storage.customPrompt === "string" ? storage.customPrompt.trim() : "";
       baseline = custom || PERSONALITIES["Casual/Slang"];
     }
-    const rules = (forceAnswer === true || storage.answerQuestions !== false) ? ANSWER_RULES : REWRITE_RULES;
+    if (forceAnswer === true) return FORCED_ANSWER_RULES + "\n\n" + baseline;
+    const rules = storage.answerQuestions !== false ? ANSWER_RULES : REWRITE_RULES;
     return EDITOR_RULES + "\n\n" + rules + "\n\n" + baseline;
   }
 
@@ -867,7 +890,8 @@
     const tag = forceAnswer === true
       ? "The speaker tagged the typed text below as an instruction or question to ANSWER, not a message to rewrite. " +
         "Carry it out (answer the question, or write the reply it asks for) and output only the resulting chat message. " +
-        "Never repeat or paraphrase the instruction itself. In the typed text, \"me\", \"my\" and \"I\" mean the speaker described in the Discord context, never you.\n\n"
+        "If it is a question, answer it from the Discord context and general knowledge; if the context only partly answers it, say what it shows. " +
+        "Never repeat, rephrase or echo the typed text. In the typed text, \"me\", \"my\" and \"I\" mean the speaker described in the Discord context, never you.\n\n"
       : "";
     if (!replyContext || replyContext.indexOf("reply_message:") === -1) return tag ? tag + "Typed text:\n" + text : text;
     return tag + "The speaker is replying on Discord. Use the referenced message below. Do not ignore it and do not invent a different topic.\n\n" +
@@ -959,12 +983,28 @@
     }
   }
 
+  // True when the model just handed the typed text back (ignoring case, punctuation and emoji).
+  function looksLikeEcho(out, typed) {
+    const norm = (t) => String(t || "").toLowerCase().replace(/[\ud800-\udfff]/g, "").replace(/[^a-z0-9\u00c0-\u024f\u0400-\u04ff]+/g, "");
+    const a = norm(out);
+    const b = norm(typed);
+    if (a.length < 8 || b.length < 8) return false;
+    if (a === b) return true;
+    if (a.indexOf(b) !== -1) return a.length - b.length <= 8;
+    if (b.indexOf(a) !== -1) return b.length - a.length <= 8;
+    return false;
+  }
+
   async function callGroq(apiKey, text, replyContext = "", forceAnswer = false) {
     const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
     const gen = getGenParams(forceAnswer);
     const timer = controller ? setTimeout(() => controller.abort(), gen.timeoutMs) : null;
     const systemPrompt = buildSystemPrompt(forceAnswer) + (replyContext ? "\n\n" + replyContext : "");
-    try {
+    const baseMessages = [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userContent(text, replyContext, forceAnswer) },
+    ];
+    const ask = async (messages) => {
       const res = await fetch(GROQ_URL, {
         method: "POST",
         headers: {
@@ -978,10 +1018,7 @@
           reasoning_effort: gen.effort,
           include_reasoning: false,
           max_completion_tokens: gen.maxTokens,
-          messages: [
-            { role: "system", content: systemPrompt },
-            { role: "user", content: userContent(text, replyContext, forceAnswer) },
-          ],
+          messages: messages,
         }),
         signal: controller ? controller.signal : undefined,
       });
@@ -996,6 +1033,22 @@
         : "";
       if (out.length > 1 && out[0] === '"' && out[out.length - 1] === '"') out = out.slice(1, -1).trim();
       if (!out) throw new Error("Empty response");
+      return out;
+    };
+    try {
+      let out = await ask(baseMessages);
+      // Answer tag used but the model only repeated the text: ask once more, explicitly.
+      if (forceAnswer === true && looksLikeEcho(out, text)) {
+        log("forced answer came back as an echo, retrying once");
+        try {
+          out = await ask(baseMessages.concat([
+            { role: "assistant", content: out },
+            { role: "user", content: "That only repeated the typed text. Do not rewrite it. Write the actual answer or reply now, using the Discord context and general knowledge, and say what the context shows if it only partly answers. Output only the message." },
+          ]));
+        } catch (e2) {
+          log("echo retry failed", e2 && e2.message);
+        }
+      }
       if (looksLikeRefusal(out, text)) {
         const err = new Error("Model declined");
         err.refused = true;
@@ -1607,31 +1660,163 @@
     });
   }
 
-  function GroqSettingsPage() {
-    useProxy(storage);
-    const { ScrollView, Text, View, TextInput, TouchableOpacity } = RN;
+  // ---- Smoothness helpers ----
+  // Looking components up in metro on every render is slow, so resolve them once.
+  let uiModsCache = null;
+  function getUiMods() {
+    if (uiModsCache) return uiModsCache;
     const Table = metro.findByProps("TableRowGroup", "TableSwitchRow", "TableRow") || {};
-    const TableRowGroup = Table.TableRowGroup;
-    const TableSwitchRow = Table.TableSwitchRow;
-    const TableRow = Table.TableRow;
-    const Stack = Table.Stack;
     const SliderMod = metro.findByProps("Slider");
     const Slider = (SliderMod && typeof SliderMod.Slider === "function") ? SliderMod.Slider
       : (typeof RN.Slider === "function" ? RN.Slider : null);
     const CardMod = metro.findByProps("Card");
-    const Card = CardMod && CardMod.Card;
+    const mods = { Table: Table, Slider: Slider, Card: CardMod && CardMod.Card };
+    if (Table.TableRowGroup && Table.TableSwitchRow && Table.TableRow) uiModsCache = mods; // only cache a complete lookup
+    return mods;
+  }
+
+  // Own component with its own state, so dragging the slider only re-renders this card,
+  // not the whole settings page. The value is written to storage once the drag settles.
+  const TypingDurationRow = React.memo(function TypingDurationRow(props) {
+    const Slider = props.Slider;
+    const Card = props.Card;
+    const { View, Text, TextInput } = RN;
+    const P = getPalette();
+    const startRaw = Number(storage.typingDuration != null ? storage.typingDuration : 3);
+    const start = Number.isFinite(startRaw) ? startRaw : 3;
+    const [duration, setDuration] = React.useState(start);
+    const [text, setText] = React.useState(String(start));
+    const saveTimer = React.useRef(null);
+    const pending = React.useRef(null);
+
+    const commitNow = (n) => {
+      if (saveTimer.current) { clearTimeout(saveTimer.current); saveTimer.current = null; }
+      pending.current = null;
+      storage.typingDuration = n;
+    };
+    const saveSoon = (n) => {
+      pending.current = n;
+      if (saveTimer.current) clearTimeout(saveTimer.current);
+      saveTimer.current = setTimeout(() => commitNow(n), 300);
+    };
+    React.useEffect(() => () => {
+      if (saveTimer.current) clearTimeout(saveTimer.current);
+      if (pending.current != null) storage.typingDuration = pending.current; // don't lose the last value
+    }, []);
+
+    const snap = (v) => Math.round(Number(v) * 2) / 2;
+    const content = h(View, { style: { padding: 0, gap: 12 } },
+      h(View, { style: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" } },
+        h(Text, { variant: "heading-md/semibold", style: { color: P.title, flexShrink: 1 } }, "Typing duration (seconds)"),
+        h(View, { style: { width: 80, backgroundColor: P.rowBg, borderRadius: 10, borderWidth: 1, borderColor: P.border, paddingHorizontal: 12, paddingVertical: 6 } },
+          h(TextInput, {
+            placeholderTextColor: P.placeholder,
+            placeholder: "0",
+            value: text,
+            keyboardType: "numeric",
+            style: { color: P.text, fontSize: 14, padding: 0, textAlign: "center" },
+            onChangeText: (t) => {
+              setText(t);
+              if (t === "" || t.endsWith(".")) return;
+              const n = parseFloat(t);
+              if (Number.isFinite(n) && n >= 0 && n <= 15) { setDuration(n); saveSoon(n); }
+            },
+          })
+        )
+      ),
+      Slider
+        ? h(Slider, {
+            value: Math.min(15, Math.max(0, duration)),
+            minimumValue: 0,
+            maximumValue: 15,
+            step: 0.5,
+            onValueChange: (v) => { const n = snap(v); setDuration(n); setText(String(n)); saveSoon(n); },
+            onSlidingComplete: (v) => { const n = snap(v); setDuration(n); setText(String(n)); commitNow(n); },
+          })
+        : null
+    );
+    return Card
+      ? h(Card, null, content)
+      : h(View, { style: { backgroundColor: P.card, borderRadius: 16, overflow: "hidden", padding: 12 } }, content);
+  });
+
+  // Static text block. As its own memo component it is skipped whenever the page re-renders for a toggle.
+  const SettingsFooter = React.memo(function SettingsFooter() {
+    const { View, Text } = RN;
+    const P = getPalette();
+    const LINK = "#00a8fc";
+    const openUrl = (url) => {
+      try {
+        const r = RN.Linking && RN.Linking.openURL ? RN.Linking.openURL(url) : null;
+        if (r && typeof r.catch === "function") r.catch(() => showToast("Couldn't open " + url));
+        else if (!r) showToast("Couldn't open " + url);
+      } catch (e) { showToast("Couldn't open " + url); }
+    };
+    const link = (label, url) =>
+      h(Text, { style: { color: LINK, textDecorationLine: "underline" }, onPress: () => openUrl(url), suppressHighlighting: true }, label);
+    const noteText = { color: P.muted, fontSize: 13, lineHeight: 19 };
+    const noteHead = { color: P.title, fontSize: 14, fontWeight: "700", marginBottom: 6 };
+    return h(View, { style: { paddingHorizontal: 6, paddingTop: 8, gap: 16 } },
+      h(View, null,
+        h(Text, { style: noteHead }, "How to get a Groq API key"),
+        h(Text, { style: noteText },
+          "1. Open ", link("console.groq.com", "https://console.groq.com"), " and sign up or log in. The free tier doesn't need a credit card.\n" +
+          "2. Open the ", link("API Keys page", "https://console.groq.com/keys"), " and tap Create API Key.\n" +
+          "3. Give it a name and copy the key. It starts with gsk_ and is shown only once, so copy it right away.\n" +
+          "4. Paste it into New API key above, tap Add API key, then Test.\n\n" +
+          "You can add several keys. If one is rate limited or fails, the next one is tried. See the ",
+          link("rate limits", "https://console.groq.com/docs/rate-limits"), " for the free tier."
+        )
+      ),
+      h(View, null,
+        h(Text, { style: noteHead }, "Privacy"),
+        h(Text, { style: noteText },
+          "AI Writer Magic sends your typed text, plus the reply context you enabled (the replied-to message, nearby messages and their usernames), " +
+          "to Groq's API using your own key. It doesn't contact any other server, and your keys stay in this plugin's storage on your device.\n\n" +
+          "How Groq handles that data is set by Groq, not by this plugin. Its docs describe a standard retention period (up to 30 days at the time of writing) " +
+          "unless Zero Data Retention is turned on in Data Controls. Check the pages below for the current terms:\n"
+        ),
+        h(Text, { style: noteText }, "• ", link("Groq Privacy Policy", "https://groq.com/privacy-policy")),
+        h(Text, { style: noteText }, "• ", link("Your Data in GroqCloud (retention)", "https://console.groq.com/docs/your-data")),
+        h(Text, { style: noteText }, "• ", link("Data Controls (Zero Data Retention)", "https://console.groq.com/settings/data-controls")),
+        h(Text, { style: Object.assign({}, noteText, { marginTop: 8 }) }, "Avoid putting passwords or other private details in messages you send through AI Writer Magic.")
+      )
+    );
+  });
+
+  function GroqSettingsPage() {
+    useProxy(storage);
+    const { ScrollView, Text, View, TextInput, TouchableOpacity } = RN;
+    const ui = getUiMods();
+    const Table = ui.Table;
+    const TableRowGroup = Table.TableRowGroup;
+    const TableSwitchRow = Table.TableSwitchRow;
+    const TableRow = Table.TableRow;
+    const Stack = Table.Stack;
+    const Slider = ui.Slider;
+    const Card = ui.Card;
     const native = !!(TableRowGroup && TableSwitchRow && TableRow);
 
     const [newKey, setNewKey] = React.useState("");
     const [testState, setTestState] = React.useState({}); // key id -> { busy, ok, text }
     const [testingAll, setTestingAll] = React.useState(false);
-    const [duration, setDuration] = React.useState(Number(storage.typingDuration != null ? storage.typingDuration : 3));
-    const [durationText, setDurationText] = React.useState(String(storage.typingDuration != null ? storage.typingDuration : 3));
     const [customPrompt, setCustomPrompt] = React.useState(
       typeof storage.customPrompt === "string" ? storage.customPrompt : ""
     );
     const customPromptTimer = React.useRef(null);
     const [, forceRender] = React.useReducer((x) => x + 1, 0);
+    // Mount only the first groups while the page slides in, the rest right after (keeps the transition at full frame rate).
+    const [ready, setReady] = React.useState(false);
+    React.useEffect(() => {
+      let done = false;
+      const go = () => { if (!done) { done = true; setReady(true); } };
+      let task = null;
+      try {
+        task = RN.InteractionManager && RN.InteractionManager.runAfterInteractions ? RN.InteractionManager.runAfterInteractions(go) : null;
+      } catch (e) {}
+      const t = setTimeout(go, 450);
+      return () => { done = true; clearTimeout(t); try { if (task && task.cancel) task.cancel(); } catch (e) {} };
+    }, []);
     const [advText, setAdvText] = React.useState(() => {
       const o = {};
       Object.keys(ADV_SPEC).forEach((k) => { o[k] = String(readAdv(ADV_SPEC[k])); });
@@ -1814,43 +1999,7 @@
         onPress: onPress,
       });
 
-    const durationContent = h(View, { style: { padding: 0, gap: 12 } },
-      h(View, { style: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" } },
-        h(Text, { variant: "heading-md/semibold", style: { color: P.title, flexShrink: 1 } }, "Typing duration (seconds)"),
-        inputField(null, {
-          placeholder: "0",
-          value: durationText,
-          keyboardType: "numeric",
-          style: { textAlign: "center", fontSize: 14 },
-          onChangeText: (t) => {
-            setDurationText(t);
-            if (t === "" || t.endsWith(".")) return;
-            const n = parseFloat(t);
-            if (Number.isFinite(n) && n >= 0 && n <= 15) {
-              setDuration(n);
-              storage.typingDuration = n;
-            }
-          },
-        }, { width: 80, paddingVertical: 6 })
-      ),
-      Slider
-        ? h(Slider, {
-            value: Math.min(15, Math.max(0, duration)),
-            minimumValue: 0,
-            maximumValue: 15,
-            step: 0.5,
-            onValueChange: (v) => {
-              const n = Math.round(Number(v) * 2) / 2;
-              setDuration(n);
-              setDurationText(String(n));
-              storage.typingDuration = n;
-            },
-          })
-        : null
-    );
-    const durationRow = Card
-      ? h(Card, null, durationContent)
-      : h(View, { style: { backgroundColor: P.card, borderRadius: 16, overflow: "hidden", padding: 12 } }, durationContent);
+    const durationRow = h(TypingDurationRow, { Slider: Slider, Card: Card });
 
     const customField = personality === "Custom"
       ? h(View, { style: { paddingHorizontal: 16, paddingVertical: 12, backgroundColor: ROW_BG } },
@@ -1932,45 +2081,7 @@
         )
       : null;
 
-    // ---- Footer: getting a Groq API key, links, and privacy ----
-    const LINK = "#00a8fc";
-    const openUrl = (url) => {
-      try {
-        const p = RN.Linking && RN.Linking.openURL ? RN.Linking.openURL(url) : null;
-        if (p && typeof p.catch === "function") p.catch(() => showToast("Couldn't open " + url));
-        else if (!p) showToast("Couldn't open " + url);
-      } catch (e) { showToast("Couldn't open " + url); }
-    };
-    const link = (label, url) =>
-      h(Text, { style: { color: LINK, textDecorationLine: "underline" }, onPress: () => openUrl(url), suppressHighlighting: true }, label);
-    const noteText = { color: P.muted, fontSize: 13, lineHeight: 19 };
-    const noteHead = { color: P.title, fontSize: 14, fontWeight: "700", marginBottom: 6 };
-    const footer = h(View, { style: { paddingHorizontal: 6, paddingTop: 8, gap: 16 } },
-      h(View, null,
-        h(Text, { style: noteHead }, "How to get a Groq API key"),
-        h(Text, { style: noteText },
-          "1. Open ", link("console.groq.com", "https://console.groq.com"), " and sign up or log in. The free tier doesn't need a credit card.\n" +
-          "2. Open the ", link("API Keys page", "https://console.groq.com/keys"), " and tap Create API Key.\n" +
-          "3. Give it a name and copy the key. It starts with gsk_ and is shown only once, so copy it right away.\n" +
-          "4. Paste it into New API key above, tap Add API key, then Test.\n\n" +
-          "You can add several keys. If one is rate limited or fails, the next one is tried. See the ",
-          link("rate limits", "https://console.groq.com/docs/rate-limits"), " for the free tier."
-        )
-      ),
-      h(View, null,
-        h(Text, { style: noteHead }, "Privacy"),
-        h(Text, { style: noteText },
-          "AI Writer Magic sends your typed text, plus the reply context you enabled (the replied-to message, nearby messages and their usernames), " +
-          "to Groq's API using your own key. It doesn't contact any other server, and your keys stay in this plugin's storage on your device.\n\n" +
-          "How Groq handles that data is set by Groq, not by this plugin. Its docs describe a standard retention period (up to 30 days at the time of writing) " +
-          "unless Zero Data Retention is turned on in Data Controls. Check the pages below for the current terms:\n"
-        ),
-        h(Text, { style: noteText }, "• ", link("Groq Privacy Policy", "https://groq.com/privacy-policy")),
-        h(Text, { style: noteText }, "• ", link("Your Data in GroqCloud (retention)", "https://console.groq.com/docs/your-data")),
-        h(Text, { style: noteText }, "• ", link("Data Controls (Zero Data Retention)", "https://console.groq.com/settings/data-controls")),
-        h(Text, { style: Object.assign({}, noteText, { marginTop: 8 }) }, "Avoid putting passwords or other private details in messages you send through AI Writer Magic.")
-      )
-    );
+    const footer = h(SettingsFooter, { light: isLightTheme() });
 
     const body = [
       group("General ⚙️", [
@@ -2049,9 +2160,10 @@
       footer,
     ];
 
+    const shown = ready ? body : body.slice(0, 2);
     const content = Stack
-      ? h(Stack, { spacing: 12 }, body)
-      : h(View, { style: { gap: 12 } }, body);
+      ? h(Stack, { spacing: 12 }, shown)
+      : h(View, { style: { gap: 12 } }, shown);
 
     return h(ScrollView, { style: { flex: 1 }, contentContainerStyle: { padding: 12, paddingBottom: 48 } }, content);
   }
