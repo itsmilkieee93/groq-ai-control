@@ -497,8 +497,7 @@
         isForward: isForwardedMessage(msg),
       };
     }
-
-    function formatContext(reply) {
+    function formatContext(reply, forceAnswer) {
       const self = getSelfIdentity();
       const lines = [
         "This is Discord. You are writing the outgoing Discord chat message for this speaker:",
@@ -532,15 +531,16 @@
       }
       const strict = "Do NOT insert names, IDs, or details from this context into the message, and do NOT replace pronouns (he, she, they, it, that, this) with names. "
         + "A name or fact may only appear in the output if the speaker's own text already contains it. Keep the speaker's original wording and meaning as close as possible. ";
-      const footer = storage.answerQuestions !== false
-        ? "If the speaker's text is a question about this conversation (what someone means, said, or is talking about, who someone is, what happened), answer it from this context in the speaker's own voice, ready to send; if the context cannot answer it, just rewrite the question without guessing. For any other message: " + strict
+      const footer = (forceAnswer === true || storage.answerQuestions !== false)
+        ? "If the speaker's text is an instruction about the reply itself (for example 'reply to Quater', 'answer him', 'say yes', 'tell her no'), do not rewrite or repeat it: write the actual reply to the reply target from this context, in the speaker's own voice, ready to send. " +
+          "If the speaker's text is a question about this conversation (what someone means, said, or is talking about, who someone is, what happened), answer it from this context in the speaker's own voice, ready to send; if the context cannot answer it, just rewrite the question without guessing. For any other message: " + strict
         : "Use them ONLY to understand the situation. " + strict;
       lines.push("These are Discord IDs, usernames, global names, and recent messages. " + footer + "Output only the final chat message.");
       return lines.join("\n");
     }
 
-    function buildPayloadContext(channelId, args, explicitRef) {
-      return formatContext(resolveReplyInfo(channelId, args, explicitRef));
+    function buildPayloadContext(channelId, args, explicitRef, forceAnswer) {
+      return formatContext(resolveReplyInfo(channelId, args, explicitRef), forceAnswer);
     }
 
     function getReplyTarget(channelId) {
@@ -610,7 +610,7 @@
     "Return ONLY the rewritten message, with no quotes, labels, or explanations.";
 
   const ANSWER_RULES =
-    "The user's text is a chat message they are about to send. " +
+    "The user's text is either a chat message they are about to send, or a short instruction about what to reply (see INSTRUCTIONS below). " +
     "If it is a question or request that has an objective answer you can give (math, facts, translations, " +
     "definitions, or things like 'say hi in Japanese'), do NOT repeat it: write the final answer itself as the " +
     "chat message, ready to send, and compute math carefully. " +
@@ -622,6 +622,12 @@
     "message, ready to send; if the context does not contain the answer, just rewrite the question instead of guessing. " +
     "If it is ordinary conversation, or a question aimed at another person (their plans, feelings, opinions, " +
     "availability), just rewrite it and keep its meaning. " +
+    "INSTRUCTIONS (this overrides the text-editing rule above): if the text is not something to say but an instruction about the reply itself, " +
+    "such as 'reply to Quater', 'answer him', 'respond to this', 'say yes', 'tell her no', 'agree', 'reply with a joke', or 'roast him', " +
+    "do NOT rewrite, translate, or repeat the instruction. Write the actual message the speaker would send as a reply to the reply target, " +
+    "using the reply target's message and the surrounding Discord context, and follow any stance or tone the instruction gives (agree, refuse, joke, and so on). " +
+    "A name inside the instruction says who the reply is for; it is not part of the message. " +
+    "If there is no reply target or context to answer from, treat the text as an ordinary message and rewrite it. " +
     "Return ONLY the message to send (including the steps, when asked for), with no quotes, labels, or commentary about the task itself.";
 
   const PERSONALITIES = {
@@ -632,14 +638,14 @@
   };
   const PERSONALITY_OPTIONS = ["Casual/Slang", "Professional", "Custom"];
 
-  function buildSystemPrompt() {
+  function buildSystemPrompt(forceAnswer) {
     const p = PERSONALITY_OPTIONS.includes(storage.personality) ? storage.personality : "Casual/Slang";
     let baseline = PERSONALITIES[p];
     if (p === "Custom") {
       const custom = typeof storage.customPrompt === "string" ? storage.customPrompt.trim() : "";
       baseline = custom || PERSONALITIES["Casual/Slang"];
     }
-    const rules = storage.answerQuestions !== false ? ANSWER_RULES : REWRITE_RULES;
+    const rules = (forceAnswer === true || storage.answerQuestions !== false) ? ANSWER_RULES : REWRITE_RULES;
     return EDITOR_RULES + "\n\n" + rules + "\n\n" + baseline;
   }
 
@@ -830,11 +836,31 @@
   const FormRowModule = metro.findByProps("FormRow");
   const FormRow = (FormRowModule && FormRowModule.FormRow) || FormRowModule;
 
-  function userContent(text, replyContext) {
-    if (!replyContext || replyContext.indexOf("reply_message:") === -1) return text;
-    return "The speaker is replying on Discord. Use the referenced message below. Do not ignore it and do not invent a different topic.\n\n" +
+  // Typing this at the very start of a message forces "answer" mode for that one message,
+  // even when Auto-answer questions is off or Auto-rewrite is off.
+  const ANS_PREFIX_RE = /^[\s\u00a0\u200b-\u200d\ufeff]*!~\{ans\}[\s\u00a0]*/i;
+  function parseAnsPrefix(text) {
+    if (typeof text !== "string") return { forced: false, text: text };
+    const m = ANS_PREFIX_RE.exec(text);
+    if (!m) return { forced: false, text: text };
+    const rest = text.slice(m[0].length);
+    // A bare "!~{ans}" with nothing after it is just a normal message.
+    return rest.trim() ? { forced: true, text: rest } : { forced: false, text: text };
+  }
+
+  function userContent(text, replyContext, forceAnswer) {
+    const answerOn = forceAnswer === true || storage.answerQuestions !== false;
+    const tag = forceAnswer === true
+      ? "The speaker tagged the typed text below as an instruction or question to ANSWER, not a message to rewrite. " +
+        "Carry it out (answer the question, or write the reply it asks for) and output only the resulting chat message. " +
+        "Never repeat or paraphrase the instruction itself.\n\n"
+      : "";
+    if (!replyContext || replyContext.indexOf("reply_message:") === -1) return tag ? tag + "Typed text:\n" + text : text;
+    return tag + "The speaker is replying on Discord. Use the referenced message below. Do not ignore it and do not invent a different topic.\n\n" +
       replyContext +
-      "\n\nTyped text to turn into the reply. Output only the chat message:\n" + text;
+      (answerOn
+        ? "\n\nTyped text (the message to send, or an instruction about what to reply; if it is an instruction, write the actual reply to the message above instead of repeating it). Output only the chat message:\n"
+        : "\n\nTyped text to turn into the reply. Output only the chat message:\n") + text;
   }
 
   // ---- Advanced generation settings (unlocked from the settings page) ----
@@ -868,8 +894,8 @@
     return spec.int ? Math.round(c) : c;
   }
 
-  function getGenParams() {
-    const defaultEffort = storage.answerQuestions !== false ? "medium" : "low";
+  function getGenParams(forceAnswer) {
+    const defaultEffort = (forceAnswer === true || storage.answerQuestions !== false) ? "medium" : "low";
     if (storage.advancedEnabled !== true) {
       return { temperature: 0.7, maxTokens: 2048, topP: null, effort: defaultEffort, timeoutMs: 20000 };
     }
@@ -919,11 +945,11 @@
     }
   }
 
-  async function callGroq(apiKey, text, replyContext = "") {
+  async function callGroq(apiKey, text, replyContext = "", forceAnswer = false) {
     const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
-    const gen = getGenParams();
+    const gen = getGenParams(forceAnswer);
     const timer = controller ? setTimeout(() => controller.abort(), gen.timeoutMs) : null;
-    const systemPrompt = buildSystemPrompt() + (replyContext ? "\n\n" + replyContext : "");
+    const systemPrompt = buildSystemPrompt(forceAnswer) + (replyContext ? "\n\n" + replyContext : "");
     try {
       const res = await fetch(GROQ_URL, {
         method: "POST",
@@ -940,7 +966,7 @@
           max_completion_tokens: gen.maxTokens,
           messages: [
             { role: "system", content: systemPrompt },
-            { role: "user", content: userContent(text, replyContext) },
+            { role: "user", content: userContent(text, replyContext, forceAnswer) },
           ],
         }),
         signal: controller ? controller.signal : undefined,
@@ -970,8 +996,7 @@
   const STATUS_HINTS = {
     200: "OK · working",
     400: "Bad request · model or params rejected",
-    401: "Unauthorized · invalid API key",
-    403: "Forbidden · key blocked or no access",
+    401: "Unauthorized · invalid API key",    403: "Forbidden · key blocked or no access",
     404: "Not found · model unavailable for this key",
     413: "Request too large",
     429: "Too many requests · rate limit or quota hit (key is valid)",
@@ -1025,11 +1050,11 @@
     }
   }
 
-  async function rewriteText(text, replyContext = "") {
+  async function rewriteText(text, replyContext = "", forceAnswer = false) {
     const keys = getKeys();
     for (let i = 0; i < keys.length; i++) {
       try {
-        const out = await callGroq(keys[i], text, replyContext);
+        const out = await callGroq(keys[i], text, replyContext, forceAnswer);
         debugToast("ok", "Groq rewrite ok (key #" + (i + 1) + ")");
         return out;
       } catch (e) {
@@ -1328,12 +1353,12 @@
 
   // Rewrites/answers `original`, shows the typing indicator, (optionally) shows a preview,
   // then waits the typing delay. Resolves with the text to send, or null if the user cancelled.
-  async function produceFinalText(original, channelId, textStaysInBox, replyContext = "") {
+  async function produceFinalText(original, channelId, textStaysInBox, replyContext = "", forceAnswer = false) {
     const preview = storage.previewBeforeSend !== false;
     const stopTyping = startTypingLoop(channelId);
     let finalText = original;
     try {
-      finalText = await rewriteText(original, replyContext);
+      finalText = await rewriteText(original, replyContext, forceAnswer);
       if (!preview) {
         const delay = getTypingMs();
         if (delay > 0) await sleep(delay);
@@ -1373,23 +1398,32 @@
       instead("sendMessage", MessageModules, function (args, orig) {
         try {
           if (!sendShapeReported) { sendShapeReported = true; log("sendMessage args:", describeArgs(args)); }
-          if (bypass || !storage.autoRewrite) return orig(...args);
+          if (bypass) return orig(...args);
           const msg = args[1];
-          const content = msg && typeof msg.content === "string" ? msg.content : "";
+          const rawContent = msg && typeof msg.content === "string" ? msg.content : "";
+          const ans = parseAnsPrefix(rawContent);
+          if (!storage.autoRewrite && !ans.forced) return orig(...args);
+          const content = ans.forced ? ans.text : rawContent;
 
-          if (bypassIfCommand(content, args, "sendMessage")) return orig(...args);
-          const skipWhy = skipReason(content);
+          if (bypassIfCommand(rawContent, args, "sendMessage")) return orig(...args);
+          const skipWhy = ans.forced ? null : skipReason(rawContent);
           if (skipWhy) { log("skip auto-rewrite (" + skipWhy + ")"); return orig(...args); }
 
-          if (!content.trim() || getKeys().length === 0 || consumeMark(content)) {
+          if (ans.forced && getKeys().length === 0) {
+            showToast("Groq: add an API key first. Sent without the AI.");
+            const plain = args.slice();
+            plain[1] = Object.assign({}, msg, { content: content });
+            return orig(...plain);
+          }
+          if (!content.trim() || getKeys().length === 0 || consumeMark(rawContent)) {
             return orig(...args);
           }
 
           const channelId = args[0];
-          const replyContext = buildPayloadContext(channelId, args, msg && msg.messageReference);
+          const replyContext = buildPayloadContext(channelId, args, msg && msg.messageReference, ans.forced);
           log("payload context:", replyContext.replace(/\n/g, " | ").slice(0, 180));
           const job = async () => {
-            const finalText = await produceFinalText(content, channelId, false, replyContext);
+            const finalText = await produceFinalText(content, channelId, false, replyContext, ans.forced);
             if (finalText === null) return;
             const next = args.slice();
             next[1] = Object.assign({}, msg, { content: finalText });
@@ -1429,36 +1463,38 @@
     }
     unpatches.push(
       instead("handleSendMessage", ChatInputModule, function (args, orig) {
-        if (bypass || !storage.autoRewrite || inFlight) {
-          if (inFlight && !bypass) return;
-          return orig(...args);
-        }
+        if (bypass) return orig(...args);
+        if (inFlight) return;
 
         const slot = findTextSlot(args);
-        const original = slot ? String(slot.get() || "") : "";
+        const raw = slot ? String(slot.get() || "") : "";
+        const ans = parseAnsPrefix(raw);
+        if (!storage.autoRewrite && !ans.forced) return orig(...args);
+        const original = ans.forced ? ans.text : raw;
 
-        if (bypassIfCommand(original, args, "handleSendMessage")) return orig(...args);
-        const skipWhy = skipReason(original);
+        if (bypassIfCommand(raw, args, "handleSendMessage")) return orig(...args);
+        const skipWhy = ans.forced ? null : skipReason(raw);
         if (skipWhy) { log("skip auto-rewrite (" + skipWhy + ")"); return orig(...args); }
         if (!shapeReported) { shapeReported = true; log("handleSendMessage args:", describeArgs(args)); }
 
-        if (!slot || !original.trim() || getKeys().length === 0) {
+        if (!slot || !original.trim()) return orig(...args);
+        if (getKeys().length === 0) {
+          if (ans.forced) { showToast("Groq: add an API key first"); return; } // keep the text in the box
           return orig(...args);
         }
 
         const channelId = findChannelId(args);
-        const replyContext = buildPayloadContext(channelId, args, findReplyRef(args));
+        const replyContext = buildPayloadContext(channelId, args, findReplyRef(args), ans.forced);
         log("payload context:", replyContext.replace(/\n/g, " | ").slice(0, 180));
         inFlight = true;
 
         (async () => {
-          const finalText = await produceFinalText(original, channelId, true, replyContext);
+          const finalText = await produceFinalText(original, channelId, true, replyContext, ans.forced);
           if (finalText === null) { inFlight = false; return; }
 
           try {
             if (typeof ChatInputModule.changeText === "function") ChatInputModule.changeText(finalText);
           } catch (e) {}
-
           try {
             slot.set(finalText);
             bypass = true;
@@ -1495,7 +1531,9 @@
       ],
       execute: async function (args, ctx) {
         const opt = (args || []).find((a) => a.name === "text");
-        const original = opt && opt.value ? String(opt.value) : "";
+        const rawText = opt && opt.value ? String(opt.value) : "";
+        const ans = parseAnsPrefix(rawText);
+        const original = ans.forced ? ans.text : rawText;
         const channelId = ctx && ctx.channel ? ctx.channel.id : undefined;
         if (!original.trim()) return;
 
@@ -1506,10 +1544,10 @@
         try {
           replyTarget = getReplyTarget(channelId);
           replyMention = getReplyMention(channelId);
-          replyContext = buildPayloadContext(channelId, [], null);
+          replyContext = buildPayloadContext(channelId, [], null, ans.forced);
         } catch (e) {
           log("reply capture failed:", e && e.message);
-          try { replyContext = formatContext(null); } catch (e2) {}
+          try { replyContext = formatContext(null, ans.forced); } catch (e2) {}
         }
         log("payload context (/groq):", replyContext.replace(/\n/g, " | ").slice(0, 180));
         log("slash target:", replyTarget && replyTarget.id);
@@ -1518,7 +1556,7 @@
           // Let the slash UI close before the preview opens.
           if (RN.Keyboard && typeof RN.Keyboard.dismiss === "function") RN.Keyboard.dismiss();
           await sleep(300);
-          const finalText = await produceFinalText(original, channelId, false, replyContext);
+          const finalText = await produceFinalText(original, channelId, false, replyContext, ans.forced);
           if (finalText === null) return;
 
           const payload = {
@@ -1881,7 +1919,7 @@
     const body = [
       group("General ⚙️", [
         sw("Auto-rewrite all messages", storage.autoRewrite, onAutoRewriteToggle, "No /groq needed"),
-        sw("Auto-answer questions", storage.answerQuestions !== false, (v) => { storage.answerQuestions = v; }, "Math, translations, and other answers"),
+        sw("Auto-answer questions", storage.answerQuestions !== false, (v) => { storage.answerQuestions = v; }, "Math, translations, and other answers. Start a message with !~{ans} to force it for that message"),
         sw("Preview before sending", storage.previewBeforeSend !== false, (v) => { storage.previewBeforeSend = v; }, "Send / Edit / Copy prompt / Cancel"),
       ]),
       group("Skip auto-rewrite for 🚫", [
@@ -1957,7 +1995,6 @@
     const content = Stack
       ? h(Stack, { spacing: 12 }, body)
       : h(View, { style: { gap: 12 } }, body);
-
     return h(ScrollView, { style: { flex: 1 }, contentContainerStyle: { padding: 12, paddingBottom: 48 } }, content);
   }
 
