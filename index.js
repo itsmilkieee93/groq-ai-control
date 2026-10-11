@@ -2035,7 +2035,7 @@
   }
 
   const ROW_KEY = "groq-ai-control-row";
-  const ANCHORS = ["Commands", "Account Switcher", "Plugins", "Developer", "Kettu"];
+  const ANCHORS = ["Account Switcher", "Commands", "Developer", "Plugins", "Kettu"];
   const KETTU_KEY = "GROQ_AI_CONTROL";
 
   function labelOf(node) {
@@ -2063,24 +2063,100 @@
     return null;
   }
 
+  let tableRowMod = null;
   function injectRow(res) {
-    if (!res || !res.props || !FormRow) return;
+    if (!res || !res.props) return false;
+    if (!tableRowMod) { try { tableRowMod = metro.findByProps("TableRow"); } catch (e) {} }
+    const Row = (tableRowMod && tableRowMod.TableRow) || FormRow;
+    if (!Row) return false;
     for (const anchor of ANCHORS) {
       const hit = locate(res.props.children, anchor);
       if (!hit) continue;
-      if (hit.arr.some((el) => el && el.key === ROW_KEY)) return;
+      if (hit.arr.some((el) => el && el.key === ROW_KEY)) return true;
+      const Arrow = Row.Arrow || (FormRow && FormRow.Arrow);
       hit.arr.splice(
         hit.idx + 1,
         0,
-        h(FormRow, {
+        h(Row, {
           key: ROW_KEY,
           label: "Groq AI Control",
-          trailing: FormRow.Arrow ? h(FormRow.Arrow) : undefined,
+          trailing: Arrow ? h(Arrow) : undefined,
           onPress: openGroqPage,
         })
       );
+      return true;
+    }
+    return false;
+  }
+
+  // ---- Kettu builds its section when UserSettingsOverview renders, so hook that render too ----
+  let overviewHooked = false;
+  let treeDumped = false;
+
+  function findNode(node, pred, depth) {
+    if (!node || typeof node !== "object" || depth > 14) return null;
+    if (Array.isArray(node)) {
+      for (let i = 0; i < node.length; i++) {
+        const r = findNode(node[i], pred, depth + 1);
+        if (r) return r;
+      }
+      return null;
+    }
+    if (pred(node)) return node;
+    return node.props && node.props.children ? findNode(node.props.children, pred, depth + 1) : null;
+  }
+
+  function nodeType(node) {
+    const t = node && node.type;
+    return typeof t === "string" ? t : (t && (t.displayName || t.name)) || "?";
+  }
+
+  function collectLabels(node, out, depth) {
+    if (!node || typeof node !== "object" || out.length > 90 || depth > 14) return;
+    if (Array.isArray(node)) { node.forEach((n) => collectLabels(n, out, depth + 1)); return; }
+    const p = node.props;
+    if (!p) return;
+    const lab = labelOf(node);
+    if (lab) out.push(nodeType(node) + ":" + lab);
+    else if (Array.isArray(p.items)) {
+      out.push(nodeType(node) + ":items[" + p.items.slice(0, 12).map((i) => (i && (i.key || (typeof i.title === "string" ? i.title : "fn"))) || "?").join(",") + "]");
+    }
+    if (p.children) collectLabels(p.children, out, depth + 1);
+  }
+
+  function dumpTree(tag, res) {
+    try {
+      const out = [];
+      collectLabels(res, out, 0);
+      log("settings tree " + tag + ": " + out.join(" | ").slice(0, 1800));
+    } catch (e) {}
+  }
+
+  function hookOverviewClass(res) {
+    if (overviewHooked) return;
+    const el = findNode(res, (n) => n.type && (n.type.name === "UserSettingsOverview" || n.type.displayName === "UserSettingsOverview"), 0);
+    if (!el) {
+      if (!treeDumped) { treeDumped = true; dumpTree("(no UserSettingsOverview element)", res); }
       return;
     }
+    hookProto(el.type && el.type.prototype);
+  }
+
+  function hookProto(proto) {
+    if (overviewHooked) return;
+    if (!proto || typeof proto.render !== "function") {
+      log("UserSettingsOverview is not a class component, skipping render hook");
+      return;
+    }
+    overviewHooked = true;
+    unpatches.push(after("render", proto, function (a, ret) {
+      try {
+        const ok = injectRow(ret);
+        if (!treeDumped) { treeDumped = true; dumpTree("UserSettingsOverview.render inject=" + ok, ret); }
+      } catch (e) { log("overview render inject failed", e && e.message); }
+      return ret;
+    }));
+    log("hooked UserSettingsOverview.render");
   }
 
   function ensureKettuRow() {
@@ -2128,6 +2204,12 @@
   function patchSettingsScreen() {
     ensureKettuRow();
 
+    try {
+      const cls = metro.findByName ? metro.findByName("UserSettingsOverview", false) : null;
+      const proto = cls && (cls.prototype || (cls.default && cls.default.prototype));
+      if (proto) hookProto(proto);
+    } catch (e) { log("direct overview lookup failed", e && e.message); }
+
     const createListMod = metro.findByProps("createList");
     if (createListMod && typeof createListMod.createList === "function") {
       unpatches.push(before("createList", createListMod, function (args) {
@@ -2149,6 +2231,7 @@
           const sections = res && res.props && res.props.sections;
           if (sections) injectKettuSection(sections);
           injectRow(res);
+          hookOverviewClass(res);
         } catch (e) {}
         return res;
       };
@@ -2162,7 +2245,7 @@
       log("SettingsScreen not found");
       return;
     }
-    const cb = (args, res) => { try { injectRow(res); } catch (e) { log("inject failed", e && e.message); } return res; };
+    const cb = (args, res) => { try { injectRow(res); hookOverviewClass(res); } catch (e) { log("inject failed", e && e.message); } return res; };
 
     const comp = mod.default && mod.default.name === "SettingsScreen" ? mod.default : mod.SettingsScreen;
     if (comp && typeof comp.render === "function") {
