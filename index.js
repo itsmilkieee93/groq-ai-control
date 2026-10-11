@@ -981,36 +981,42 @@
     503: "Groq unavailable · try again later",
   };
 
-  // Sends a tiny real chat request with the selected model, so the result reflects what rewrites will hit.
+  // Validates the key against Groq itself (GET /models), not a chat completion.
+  // Confirms the key is accepted by Groq and that the selected rewrite model is available.
   async function testGroqKey(apiKey) {
     const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
     const timer = controller ? setTimeout(() => controller.abort(), 15000) : null;
     const model = MODELS.includes(storage.model) ? storage.model : DEFAULT_MODEL;
+    const modelsUrl = GROQ_URL.replace(/\/chat\/completions$/, "/models");
     const started = Date.now();
     try {
-      const res = await fetch(GROQ_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: "Bearer " + apiKey },
-        body: JSON.stringify({
-          model: model,
-          reasoning_effort: "low",
-          include_reasoning: false,
-          max_completion_tokens: 32,
-          messages: [{ role: "user", content: "Reply with the single word: OK" }],
-        }),
+      const res = await fetch(modelsUrl, {
+        method: "GET",
+        headers: { Authorization: "Bearer " + apiKey },
         signal: controller ? controller.signal : undefined,
       });
       const ms = Date.now() - started;
-      let detail = "";
       if (!res.ok) {
+        let detail = "";
         try {
           const d = await res.json();
           if (d && d.error && d.error.message) detail = String(d.error.message).slice(0, 140);
         } catch (e) {}
+        const hint = STATUS_HINTS[res.status] || (res.status >= 500 ? "Groq server error" : "Request failed");
+        return { ok: false, status: res.status, ms: ms, summary: res.status + " " + hint + (detail ? " — " + detail : "") };
       }
-      const hint = STATUS_HINTS[res.status] || (res.ok ? "OK" : res.status >= 500 ? "Groq server error" : "Request failed");
-      const summary = res.status + " " + hint + (res.ok ? " (" + model.replace("openai/", "") + ", " + ms + " ms)" : detail ? " — " + detail : "");
-      return { ok: res.ok, status: res.status, ms: ms, summary: summary };
+      let names = [];
+      try {
+        const d = await res.json();
+        const list = d && Array.isArray(d.data) ? d.data : [];
+        names = list.map((m) => m && m.id).filter(Boolean);
+      } catch (e) {}
+      const hasModel = names.indexOf(model) !== -1;
+      const short = model.replace("openai/", "");
+      const summary = hasModel
+        ? "OK · Groq key valid (" + names.length + " models, " + short + " available, " + ms + " ms)"
+        : "OK · Groq key valid (" + names.length + " models) but " + short + " not listed (" + ms + " ms)";
+      return { ok: hasModel, status: res.status, ms: ms, summary: summary };
     } catch (e) {
       const aborted = !!(e && e.name === "AbortError");
       return { ok: false, status: 0, ms: Date.now() - started, summary: aborted ? "Timed out after 15s" : "Network error · " + ((e && e.message) || "unknown") };
@@ -1599,6 +1605,20 @@
       storage.apiKeys = list.concat([{ id: nextId, key: k }]);
       setNewKey("");
     };
+    // Tests one key and writes the result into the row. Returns the result (or null for an empty key).
+    const testOneKey = async (k) => {
+      if (!k || typeof k.key !== "string" || !k.key.trim()) return null;
+      setTestState((prev) => Object.assign({}, prev, { [k.id]: { busy: true, ok: false, text: "Testing…" } }));
+      const r = await testGroqKey(k.key.trim());
+      log("key test #" + k.id + ":", r.status, r.ok ? "ok" : r.summary);
+      setTestState((prev) => Object.assign({}, prev, { [k.id]: { busy: false, ok: r.ok, text: (r.ok ? "✅ " : "❌ ") + r.summary } }));
+      return r;
+    };
+    const testSingleKey = async (k) => {
+      if (testingAll || (testState[k.id] && testState[k.id].busy)) return;
+      const r = await testOneKey(k);
+      if (r) showToast((r.ok ? "✅ " : "❌ ") + "Key #" + k.id + ": " + r.summary);
+    };
     const runKeyTests = async () => {
       const list = (Array.isArray(storage.apiKeys) ? storage.apiKeys : []).filter((x) => x && typeof x.key === "string" && x.key.trim());
       if (!list.length) return showToast("Add an API key first");
@@ -1610,10 +1630,9 @@
       let good = 0;
       for (let i = 0; i < list.length; i++) {
         const k = list[i];
-        const r = await testGroqKey(k.key.trim());
+        const r = await testOneKey(k);
+        if (!r) continue;
         if (r.ok) good++;
-        log("key test #" + k.id + ":", r.status, r.ok ? "ok" : r.summary);
-        setTestState((prev) => Object.assign({}, prev, { [k.id]: { busy: false, ok: r.ok, text: (r.ok ? "✅ " : "❌ ") + r.summary } }));
         if (list.length === 1) showToast((r.ok ? "✅ " : "❌ ") + "Key #" + k.id + ": " + r.summary);
       }
       if (list.length > 1) showToast((good === list.length ? "✅ " : "⚠️ ") + good + "/" + list.length + " keys working");
@@ -1901,11 +1920,19 @@
       ]),
       group("Groq API Keys 🔑", [
         keys.length === 0 ? h(TableRow, { label: "No API keys yet" }) : null,
-        ...keys.map((k) => h(TableRow, {
-          label: "#" + k.id + "  " + mask(k.key),
-          subLabel: testState[k.id] ? testState[k.id].text : undefined,
-          trailing: button("Delete", RED, () => confirmRemoveKey(k), true),
-        })),
+        ...keys.map((k) => {
+          const busy = !!(testState[k.id] && testState[k.id].busy);
+          return h(TableRow, {
+            key: "key-" + k.id,
+            label: "#" + k.id + "  " + mask(k.key),
+            subLabel: testState[k.id] ? testState[k.id].text : undefined,
+            trailing: h(View, { style: { flexDirection: "row", alignItems: "center" } },
+              h(View, { style: { marginRight: 8, opacity: busy || testingAll ? 0.6 : 1 } },
+                button(busy ? "Testing…" : "Test", "#5865f2", () => testSingleKey(k), true)),
+              button("Delete", RED, () => confirmRemoveKey(k), true)
+            ),
+          });
+        }),
         h(View, { style: { paddingHorizontal: 16, paddingVertical: 12, backgroundColor: ROW_BG } },
           inputField("New API key", {
             value: newKey,
@@ -1954,7 +1981,8 @@
   }
 
   const ROW_KEY = "groq-ai-control-row";
-  const ANCHORS = ["Account Switcher", "Commands", "Plugins"];
+  const ANCHORS = ["Commands", "Account Switcher", "Plugins", "Developer", "Kettu"];
+  const KETTU_KEY = "GROQ_AI_CONTROL";
 
   function labelOf(node) {
     const p = node && node.props;
@@ -2001,7 +2029,80 @@
     }
   }
 
+  function ensureKettuRow() {
+    try {
+      const settingConstants = metro.findByProps("SETTING_RENDERER_CONFIG");
+      const config = settingConstants && settingConstants.SETTING_RENDERER_CONFIG;
+      if (config && !config[KETTU_KEY]) {
+        config[KETTU_KEY] = {
+          type: "pressable",
+          title: function () { return "Groq AI Control"; },
+          parent: null,
+          icon: null,
+          onPress: openGroqPage,
+          predicate: function () { return true; },
+        };
+        log("registered Kettu settings row");
+      }
+    } catch (e) {
+      log("kettu renderer register failed", e && e.message);
+    }
+  }
+
+  function injectKettuSection(sections) {
+    if (!Array.isArray(sections)) return false;
+    const known = ["COMMANDS", "ACCOUNT_SWITCHER", "PLUGINS", "DEVELOPER", "THEMES", "FONTS", "ADDON_BROWSER", "KETTU"];
+    for (let i = 0; i < sections.length; i++) {
+      const section = sections[i];
+      if (!section || !Array.isArray(section.settings)) continue;
+      const label = String(section.label || section.title || "");
+      const hasKnown = section.settings.some((k) => known.indexOf(String(k).toUpperCase()) !== -1);
+      if (label !== "Kettu" && !hasKnown) continue;
+      if (section.settings.indexOf(KETTU_KEY) !== -1) return true;
+      const after = ["COMMANDS", "ACCOUNT_SWITCHER", "PLUGINS", "DEVELOPER"];
+      let at = section.settings.length;
+      for (let j = 0; j < after.length; j++) {
+        const idx = section.settings.indexOf(after[j]);
+        if (idx !== -1) { at = idx + 1; break; }
+      }
+      section.settings.splice(at, 0, KETTU_KEY);
+      return true;
+    }
+    return false;
+  }
+
   function patchSettingsScreen() {
+    ensureKettuRow();
+
+    const createListMod = metro.findByProps("createList");
+    if (createListMod && typeof createListMod.createList === "function") {
+      unpatches.push(before("createList", createListMod, function (args) {
+        try {
+          ensureKettuRow();
+          const config = args && args[0];
+          if (config && injectKettuSection(config.sections)) {
+            log("injected into Kettu section");
+          }
+        } catch (e) {}
+      }));
+    }
+
+    const overview = metro.find((m) => m && (m.default && m.default.name === "SettingsOverviewScreen" || m.SettingsOverviewScreen));
+    if (overview) {
+      const cb = function (args, res) {
+        try {
+          ensureKettuRow();
+          const sections = res && res.props && res.props.sections;
+          if (sections) injectKettuSection(sections);
+          injectRow(res);
+        } catch (e) {}
+        return res;
+      };
+      const comp = overview.default && overview.default.name === "SettingsOverviewScreen" ? overview.default : overview.SettingsOverviewScreen;
+      if (comp && typeof comp.render === "function") unpatches.push(after("render", comp, cb));
+      else if (overview.default) unpatches.push(after("default", overview, cb));
+    }
+
     const mod = metro.find((m) => m && ((m.default && m.default.name === "SettingsScreen") || m.SettingsScreen));
     if (!mod) {
       log("SettingsScreen not found");
