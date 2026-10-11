@@ -2015,14 +2015,10 @@
     return h(ScrollView, { style: { flex: 1 }, contentContainerStyle: { padding: 12, paddingBottom: 48 } }, content);
   }
 
+  const GROQ_KEY = "GROQ_AI_CONTROL";
+
   function openGroqPage() {
     const payload = { title: "Groq AI Control", render: GroqSettingsPage };
-    try {
-      if (Navigation && typeof Navigation.push === "function") {
-        Navigation.push("VendettaCustomPage", payload);
-        return;
-      }
-    } catch (e) {}
     try {
       const navMod = metro.findByProps("getRootNavigationRef");
       const ref = navMod && navMod.getRootNavigationRef && navMod.getRootNavigationRef();
@@ -2031,229 +2027,107 @@
         return;
       }
     } catch (e) {}
+    try {
+      if (Navigation && typeof Navigation.push === "function") {
+        Navigation.push("VendettaCustomPage", payload);
+        return;
+      }
+    } catch (e) {}
     showToast("Groq: unable to open settings page");
   }
 
-  const ROW_KEY = "groq-ai-control-row";
-  const ANCHORS = ["Account Switcher", "Commands", "Developer", "Plugins", "Kettu"];
-  const KETTU_KEY = "GROQ_AI_CONTROL";
-
-  function labelOf(node) {
-    const p = node && node.props;
-    if (!p) return undefined;
-    return [p.label, p.title, p.text].find((v) => typeof v === "string");
-  }
-
-  function locate(node, anchor) {
-    if (!node || typeof node !== "object") return null;
-    if (Array.isArray(node)) {
-      for (let i = 0; i < node.length; i++) {
-        const el = node[i];
-        if (el && typeof el === "object" && !Array.isArray(el) && labelOf(el) === anchor) {
-          return { arr: node, idx: i };
-        }
-      }
-      for (let i = 0; i < node.length; i++) {
-        const r = locate(node[i], anchor);
-        if (r) return r;
-      }
-      return null;
-    }
-    if (node.props && node.props.children) return locate(node.props.children, anchor);
-    return null;
-  }
-
-  let tableRowMod = null;
-  function injectRow(res) {
-    if (!res || !res.props) return false;
-    if (!tableRowMod) { try { tableRowMod = metro.findByProps("TableRow"); } catch (e) {} }
-    const Row = (tableRowMod && tableRowMod.TableRow) || FormRow;
-    if (!Row) return false;
-    for (const anchor of ANCHORS) {
-      const hit = locate(res.props.children, anchor);
-      if (!hit) continue;
-      if (hit.arr.some((el) => el && el.key === ROW_KEY)) return true;
-      const Arrow = Row.Arrow || (FormRow && FormRow.Arrow);
-      hit.arr.splice(
-        hit.idx + 1,
-        0,
-        h(Row, {
-          key: ROW_KEY,
-          label: "Groq AI Control",
-          trailing: Arrow ? h(Arrow) : undefined,
-          onPress: openGroqPage,
-        })
-      );
-      return true;
-    }
-    return false;
-  }
-
-  // ---- Kettu builds its section when UserSettingsOverview renders, so hook that render too ----
-  let overviewHooked = false;
-  let treeDumped = false;
-
-  function findNode(node, pred, depth) {
-    if (!node || typeof node !== "object" || depth > 14) return null;
-    if (Array.isArray(node)) {
-      for (let i = 0; i < node.length; i++) {
-        const r = findNode(node[i], pred, depth + 1);
-        if (r) return r;
-      }
-      return null;
-    }
-    if (pred(node)) return node;
-    return node.props && node.props.children ? findNode(node.props.children, pred, depth + 1) : null;
-  }
-
-  function nodeType(node) {
-    const t = node && node.type;
-    return typeof t === "string" ? t : (t && (t.displayName || t.name)) || "?";
-  }
-
-  function collectLabels(node, out, depth) {
-    if (!node || typeof node !== "object" || out.length > 90 || depth > 14) return;
-    if (Array.isArray(node)) { node.forEach((n) => collectLabels(n, out, depth + 1)); return; }
-    const p = node.props;
-    if (!p) return;
-    const lab = labelOf(node);
-    if (lab) out.push(nodeType(node) + ":" + lab);
-    else if (Array.isArray(p.items)) {
-      out.push(nodeType(node) + ":items[" + p.items.slice(0, 12).map((i) => (i && (i.key || (typeof i.title === "string" ? i.title : "fn"))) || "?").join(",") + "]");
-    }
-    if (p.children) collectLabels(p.children, out, depth + 1);
-  }
-
-  function dumpTree(tag, res) {
-    try {
-      const out = [];
-      collectLabels(res, out, 0);
-      log("settings tree " + tag + ": " + out.join(" | ").slice(0, 1800));
-    } catch (e) {}
-  }
-
-  function hookOverviewClass(res) {
-    if (overviewHooked) return;
-    const el = findNode(res, (n) => n.type && (n.type.name === "UserSettingsOverview" || n.type.displayName === "UserSettingsOverview"), 0);
-    if (!el) {
-      if (!treeDumped) { treeDumped = true; dumpTree("(no UserSettingsOverview element)", res); }
-      return;
-    }
-    hookProto(el.type && el.type.prototype);
-  }
-
-  function hookProto(proto) {
-    if (overviewHooked) return;
-    if (!proto || typeof proto.render !== "function") {
-      log("UserSettingsOverview is not a class component, skipping render hook");
-      return;
-    }
-    overviewHooked = true;
-    unpatches.push(after("render", proto, function (a, ret) {
-      try {
-        const ok = injectRow(ret);
-        if (!treeDumped) { treeDumped = true; dumpTree("UserSettingsOverview.render inject=" + ok, ret); }
-      } catch (e) { log("overview render inject failed", e && e.message); }
-      return ret;
-    }));
-    log("hooked UserSettingsOverview.render");
-  }
-
-  function ensureKettuRow() {
-    try {
-      const settingConstants = metro.findByProps("SETTING_RENDERER_CONFIG");
-      const config = settingConstants && settingConstants.SETTING_RENDERER_CONFIG;
-      if (config && !config[KETTU_KEY]) {
-        config[KETTU_KEY] = {
-          type: "pressable",
-          title: function () { return "Groq AI Control"; },
-          parent: null,
-          icon: null,
-          onPress: openGroqPage,
-          predicate: function () { return true; },
-        };
-        log("registered Kettu settings row");
-      }
-    } catch (e) {
-      log("kettu renderer register failed", e && e.message);
-    }
-  }
-
-  function injectKettuSection(sections) {
-    if (!Array.isArray(sections)) return false;
-    const known = ["COMMANDS", "ACCOUNT_SWITCHER", "PLUGINS", "DEVELOPER", "THEMES", "FONTS", "ADDON_BROWSER", "KETTU"];
-    for (let i = 0; i < sections.length; i++) {
-      const section = sections[i];
-      if (!section || !Array.isArray(section.settings)) continue;
-      const label = String(section.label || section.title || "");
-      const hasKnown = section.settings.some((k) => known.indexOf(String(k).toUpperCase()) !== -1);
-      if (label !== "Kettu" && !hasKnown) continue;
-      if (section.settings.indexOf(KETTU_KEY) !== -1) return true;
-      const after = ["COMMANDS", "ACCOUNT_SWITCHER", "PLUGINS", "DEVELOPER"];
-      let at = section.settings.length;
-      for (let j = 0; j < after.length; j++) {
-        const idx = section.settings.indexOf(after[j]);
-        if (idx !== -1) { at = idx + 1; break; }
-      }
-      section.settings.splice(at, 0, KETTU_KEY);
-      return true;
-    }
-    return false;
-  }
-
   function patchSettingsScreen() {
-    ensureKettuRow();
+    const settingConstants = metro.findByProps("SETTING_RENDERER_CONFIG");
+    const createListModule = metro.findByProps("createList");
+    const SettingsOverviewScreen = metro.find((m) => m && m.default && m.default.name === "SettingsOverviewScreen");
+    const Table = metro.findByProps("TableRowIcon") || {};
+    const TableRowIcon = Table.TableRowIcon;
 
-    try {
-      const cls = metro.findByName ? metro.findByName("UserSettingsOverview", false) : null;
-      const proto = cls && (cls.prototype || (cls.default && cls.default.prototype));
-      if (proto) hookProto(proto);
-    } catch (e) { log("direct overview lookup failed", e && e.message); }
-
-    const createListMod = metro.findByProps("createList");
-    if (createListMod && typeof createListMod.createList === "function") {
-      unpatches.push(before("createList", createListMod, function (args) {
-        try {
-          ensureKettuRow();
-          const config = args && args[0];
-          if (config && injectKettuSection(config.sections)) {
-            log("injected into Kettu section");
-          }
-        } catch (e) {}
-      }));
-    }
-
-    const overview = metro.find((m) => m && (m.default && m.default.name === "SettingsOverviewScreen" || m.SettingsOverviewScreen));
-    if (overview) {
-      const cb = function (args, res) {
-        try {
-          ensureKettuRow();
-          const sections = res && res.props && res.props.sections;
-          if (sections) injectKettuSection(sections);
-          injectRow(res);
-          hookOverviewClass(res);
-        } catch (e) {}
-        return res;
-      };
-      const comp = overview.default && overview.default.name === "SettingsOverviewScreen" ? overview.default : overview.SettingsOverviewScreen;
-      if (comp && typeof comp.render === "function") unpatches.push(after("render", comp, cb));
-      else if (overview.default) unpatches.push(after("default", overview, cb));
-    }
-
-    const mod = metro.find((m) => m && ((m.default && m.default.name === "SettingsScreen") || m.SettingsScreen));
-    if (!mod) {
-      log("SettingsScreen not found");
+    if (!settingConstants) {
+      log("SETTING_RENDERER_CONFIG not found");
       return;
     }
-    const cb = (args, res) => { try { injectRow(res); hookOverviewClass(res); } catch (e) { log("inject failed", e && e.message); } return res; };
 
-    const comp = mod.default && mod.default.name === "SettingsScreen" ? mod.default : mod.SettingsScreen;
-    if (comp && typeof comp.render === "function") {
-      unpatches.push(after("render", comp, cb));
-    } else if (mod.default && mod.default.name === "SettingsScreen") {
-      unpatches.push(after("default", mod, cb));
-    } else if (typeof mod.SettingsScreen === "function") {
-      unpatches.push(after("SettingsScreen", mod, cb));
+    const row = {};
+    row[GROQ_KEY] = {
+      type: "pressable",
+      title: function () { return "Groq AI Control"; },
+      useTitle: function () { return "Groq AI Control"; },
+      icon: null,
+      IconComponent: TableRowIcon
+        ? function () { return h(TableRowIcon, { source: null }); }
+        : undefined,
+      usePredicate: function () { return true; },
+      onPress: openGroqPage,
+      withArrow: true,
+    };
+
+    let rendererConfigValue = settingConstants.SETTING_RENDERER_CONFIG;
+    try {
+      Object.defineProperty(settingConstants, "SETTING_RENDERER_CONFIG", {
+        enumerable: true,
+        configurable: true,
+        get: function () { return Object.assign({}, rendererConfigValue, row); },
+        set: function (v) { rendererConfigValue = v; },
+      });
+      log("overrode SETTING_RENDERER_CONFIG");
+    } catch (e) {
+      log("config override failed", e && e.message);
+      if (rendererConfigValue && !rendererConfigValue[GROQ_KEY]) {
+        rendererConfigValue[GROQ_KEY] = row[GROQ_KEY];
+      }
+    }
+
+    const firstRender = Symbol("GroqAI-pinToSettings");
+
+    function pinSection(sections) {
+      if (!Array.isArray(sections)) return;
+      const section = sections.find((x) => x && ["Bunny", "Kettu", "Revenge"].indexOf(x.label) !== -1);
+      if (!section) {
+        const isMain = sections.some((x) => x && Array.isArray(x.settings) && x.settings.indexOf("ACCOUNT") !== -1);
+        if (isMain) {
+          sections.unshift({ label: "Groq AI Control", title: "Groq AI Control", settings: [GROQ_KEY] });
+          log("added Groq section");
+        }
+        return;
+      }
+      if (!Array.isArray(section.settings)) return;
+      if (section.settings.indexOf(GROQ_KEY) !== -1) return;
+      section.settings.push(GROQ_KEY);
+      log("pinned to", section.label);
+    }
+
+    if (createListModule && typeof createListModule.createList === "function") {
+      unpatches.push(after("createList", createListModule, function (args) {
+        try {
+          if (!args || !args[0] || args[0][firstRender]) return;
+          args[0][firstRender] = true;
+          pinSection(args[0].sections);
+        } catch (e) { log("createList pin failed", e && e.message); }
+      }));
+    } else if (SettingsOverviewScreen) {
+      unpatches.push(after("default", SettingsOverviewScreen, function (args, ret) {
+        try {
+          if (!args || !args[0] || args[0][firstRender]) return;
+          args[0][firstRender] = true;
+          function find(node, depth) {
+            if (!node || typeof node !== "object" || depth > 8) return null;
+            if (node.props && Array.isArray(node.props.sections)) return node.props;
+            if (Array.isArray(node)) {
+              for (let i = 0; i < node.length; i++) {
+                const hit = find(node[i], depth + 1);
+                if (hit) return hit;
+              }
+              return null;
+            }
+            if (node.props && node.props.children) return find(node.props.children, depth + 1);
+            return null;
+          }
+          const hit = find(ret, 0);
+          if (hit) pinSection(hit.sections);
+        } catch (e) { log("overview pin failed", e && e.message); }
+        return ret;
+      }));
     }
   }
 
