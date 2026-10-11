@@ -785,7 +785,7 @@
     const text = logBuffer.slice(-300).join("\n") || "(log is empty)";
     try {
       if (RN.Share && typeof RN.Share.share === "function") {
-        await RN.Share.share({ message: text, title: "Persona Chat log" });
+        await RN.Share.share({ message: text, title: "AI Writer Magic log" });
         return;
       }
     } catch (e) {}
@@ -953,7 +953,7 @@
       ], { cancelable: true, onDismiss: cancel });
       return true;
     } catch (e) {
-      showToast("Persona Chat: couldn't open the confirmation dialog");
+      showToast("AI Writer Magic: couldn't open the confirmation dialog");
       cancel();
       return false;
     }
@@ -1070,12 +1070,12 @@
     for (let i = 0; i < keys.length; i++) {
       try {
         const out = await callGroq(keys[i], text, replyContext, forceAnswer);
-        debugToast("ok", "Persona Chat rewrite ok (key #" + (i + 1) + ")");
+        debugToast("ok", "AI Writer Magic rewrite ok (key #" + (i + 1) + ")");
         return out;
       } catch (e) {
         log("key #" + (i + 1) + " failed:", e && (e.status || e.message));
         if (e && e.refused) { // other keys would decline too; keep the user's own text
-          debugToast("warn", "Persona Chat declined, kept your text");
+          debugToast("warn", "AI Writer Magic declined, kept your text");
           return text;
         }
         debugToast("err", "Key #" + (i + 1) + " failed: " + ((e && (e.status || e.message)) || "unknown"));
@@ -1425,7 +1425,7 @@
           if (skipWhy) { log("skip auto-rewrite (" + skipWhy + ")"); return orig(...args); }
 
           if (ans.forced && getKeys().length === 0) {
-            showToast("Persona Chat: add an API key first. Sent without the AI.");
+            showToast("AI Writer Magic: add an API key first. Sent without the AI.");
             const plain = args.slice();
             plain[1] = Object.assign({}, msg, { content: content });
             return orig(...plain);
@@ -1494,7 +1494,7 @@
 
         if (!slot || !original.trim()) return orig(...args);
         if (getKeys().length === 0) {
-          if (ans.forced) { showToast("Persona Chat: add an API key first"); return; } // keep the text in the box
+          if (ans.forced) { showToast("AI Writer Magic: add an API key first"); return; } // keep the text in the box
           return orig(...args);
         }
 
@@ -1528,10 +1528,10 @@
 
   function registerGroqCommand() {
     unregisterCommand = registerCommand({
-      name: "persona-chat",
-      displayName: "persona-chat",
-      description: "Rewrite your message with Persona Chat and send it",
-      displayDescription: "Rewrite your message with Persona Chat and send it",
+      name: "ai-writer-magic",
+      displayName: "ai-writer-magic",
+      description: "Rewrite your message with AI Writer Magic and send it",
+      displayDescription: "Rewrite your message with AI Writer Magic and send it",
       applicationId: "-1",
       inputType: 1,
       type: 1,
@@ -1565,7 +1565,7 @@
           log("reply capture failed:", e && e.message);
           try { replyContext = formatContext(null, ans.forced); } catch (e2) {}
         }
-        log("payload context (/persona-chat):", replyContext.replace(/\n/g, " | ").slice(0, 180));
+        log("payload context (/ai-writer-magic):", replyContext.replace(/\n/g, " | ").slice(0, 180));
         log("slash target:", replyTarget && replyTarget.id);
 
         try {
@@ -1600,8 +1600,8 @@
           MessageModules.sendMessage(channelId, payload, undefined, extra);
           clearPending(channelId);
         } catch (e) {
-          log("/persona-chat failed:", e && e.message);
-          showToast("Persona Chat: " + ((e && e.message) || "failed to send message"));
+          log("/ai-writer-magic failed:", e && e.message);
+          showToast("AI Writer Magic: " + ((e && e.message) || "failed to send message"));
         }
       },
     });
@@ -1734,7 +1734,7 @@
       confirmDialog({
         title: "Enable auto-rewrite?",
         body:
-          "Every message you send, in any channel, will be rewritten by Persona Chat before it is posted, not only messages sent with /persona-chat. " +
+          "Every message you send, in any channel, will be rewritten by AI Writer Magic before it is posted, not only messages sent with /ai-writer-magic. " +
           "Your message text is sent to Groq's API, and sending will be slower." +
           "\n\nSlash commands are never rewritten." +
           (skipped.length ? "\nAlso left alone: messages with " + skipped.join(", ") + "." : "") +
@@ -1960,7 +1960,7 @@
       h(View, null,
         h(Text, { style: noteHead }, "Privacy"),
         h(Text, { style: noteText },
-          "Persona Chat sends your typed text, plus the reply context you enabled (the replied-to message, nearby messages and their usernames), " +
+          "AI Writer Magic sends your typed text, plus the reply context you enabled (the replied-to message, nearby messages and their usernames), " +
           "to Groq's API using your own key. It doesn't contact any other server, and your keys stay in this plugin's storage on your device.\n\n" +
           "How Groq handles that data is set by Groq, not by this plugin. Its docs describe a standard retention period (up to 30 days at the time of writing) " +
           "unless Zero Data Retention is turned on in Data Controls. Check the pages below for the current terms:\n"
@@ -1968,13 +1968,13 @@
         h(Text, { style: noteText }, "• ", link("Groq Privacy Policy", "https://groq.com/privacy-policy")),
         h(Text, { style: noteText }, "• ", link("Your Data in GroqCloud (retention)", "https://console.groq.com/docs/your-data")),
         h(Text, { style: noteText }, "• ", link("Data Controls (Zero Data Retention)", "https://console.groq.com/settings/data-controls")),
-        h(Text, { style: Object.assign({}, noteText, { marginTop: 8 }) }, "Avoid putting passwords or other private details in messages you send through Persona Chat.")
+        h(Text, { style: Object.assign({}, noteText, { marginTop: 8 }) }, "Avoid putting passwords or other private details in messages you send through AI Writer Magic.")
       )
     );
 
     const body = [
       group("General ⚙️", [
-        sw("Auto-rewrite all messages", storage.autoRewrite, onAutoRewriteToggle, "No /persona-chat needed"),
+        sw("Auto-rewrite all messages", storage.autoRewrite, onAutoRewriteToggle, "No /ai-writer-magic needed"),
         sw("Auto-answer questions", storage.answerQuestions !== false, (v) => { storage.answerQuestions = v; }, "Math, translations, and other answers. Start a message with !~{ans} or [Answer] to force it for that message"),
         sw("Preview before sending", storage.previewBeforeSend !== false, (v) => { storage.previewBeforeSend = v; }, "Send / Edit / Copy prompt / Cancel"),
       ]),
@@ -2059,7 +2059,7 @@
   const GROQ_KEY = "GROQ_AI_CONTROL";
 
   function openGroqPage() {
-    const payload = { title: "Persona Chat", render: GroqSettingsPage };
+    const payload = { title: "AI Writer Magic", render: GroqSettingsPage };
     try {
       const navMod = metro.findByProps("getRootNavigationRef");
       const ref = navMod && navMod.getRootNavigationRef && navMod.getRootNavigationRef();
@@ -2074,7 +2074,7 @@
         return;
       }
     } catch (e) {}
-    showToast("Persona Chat: unable to open settings page");
+    showToast("AI Writer Magic: unable to open settings page");
   }
 
   function patchSettingsScreen() {
@@ -2131,8 +2131,8 @@
     const row = {};
     row[GROQ_KEY] = {
       type: "pressable",
-      title: function () { return "Persona Chat"; },
-      useTitle: function () { return "Persona Chat"; },
+      title: function () { return "AI Writer Magic"; },
+      useTitle: function () { return "AI Writer Magic"; },
       icon: { uri: iconUri() },
       IconComponent: IconWithFallback,
       usePredicate: function () { return true; },
@@ -2164,8 +2164,8 @@
       if (!section) {
         const isMain = sections.some((x) => x && Array.isArray(x.settings) && x.settings.indexOf("ACCOUNT") !== -1);
         if (isMain) {
-          sections.unshift({ label: "Persona Chat", title: "Persona Chat", settings: [GROQ_KEY] });
-          log("added Persona Chat section");
+          sections.unshift({ label: "AI Writer Magic", title: "AI Writer Magic", settings: [GROQ_KEY] });
+          log("added AI Writer Magic section");
         }
         return;
       }
