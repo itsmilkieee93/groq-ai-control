@@ -1553,12 +1553,17 @@
     let systemPrompt = buildSystemPrompt(forceAnswer) + (replyContext ? "\n\n" + replyContext : "");
 
     // 🌸 Optional web search grounding for answers.
-    if (forceAnswer && storage.searchEnabled === true) {
+    if ((forceAnswer || storage.answerQuestions !== false) && storage.searchEnabled === true) {
       const searchQuery = String(text || "").replace(/^[!~\[]?(ans|answer)\]?\s*/i, "").trim().slice(0, 200);
       if (searchQuery.length >= 4) {
         const results = await searchWeb(searchQuery);
         if (results) {
-          systemPrompt += "\n\nWeb search results (use these to ground your answer, cite sources when relevant):\n" + results;
+          systemPrompt += "\n\n=== CURRENT WEB SEARCH RESULTS (PRIORITY OVER YOUR TRAINING DATA) ===\n" +
+            "These results are from a live web search. For any facts, dates, release dates, news, or current information, " +
+            "YOU MUST prefer these results over your own knowledge. If the search results contradict what you remember, " +
+            "use the search results. Cite the source briefly when useful.\n\n" +
+            results +
+            "\n=== END SEARCH RESULTS ===";
           log("web search injected for answer");
         }
       }
@@ -1621,6 +1626,34 @@
         if (useMath) {
           body.tools = [MATH_TOOL];
           body.tool_choice = round < MAX_TOOL_ROUNDS ? "auto" : "none";
+        }
+        // 🌸 Native Groq MCP web search (Exa preferred, Composio fallback).
+        // Groq handles tool discovery and execution server-side.
+        if (storage.searchEnabled === true && (forceAnswer || storage.answerQuestions !== false) && round === 0) {
+          const mcpTools = [];
+          const exaKey = (storage.exaApiKey || "").trim();
+          const composioKey = (storage.composioApiKey || "").trim();
+          if (exaKey) {
+            mcpTools.push({
+              type: "mcp",
+              server_label: "exa",
+              server_url: "https://mcp.exa.ai/mcp?exaApiKey=" + encodeURIComponent(exaKey),
+              require_approval: "never",
+            });
+          } else if (composioKey) {
+            mcpTools.push({
+              type: "mcp",
+              server_label: "composio",
+              server_url: "https://connect.composio.dev/mcp",
+              headers: { "x-api-key": composioKey },
+              require_approval: "never",
+            });
+          }
+          if (mcpTools.length) {
+            body.tools = (body.tools || []).concat(mcpTools);
+            if (!body.tool_choice) body.tool_choice = "auto";
+            log("MCP web search tools added to Groq payload");
+          }
         }
         const res = await fetch(GROQ_URL, {
           method: "POST",
