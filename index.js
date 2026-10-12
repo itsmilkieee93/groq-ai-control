@@ -1338,7 +1338,7 @@
 
   // Evaluates a math expression safely. Returns { value, text }. Throws Error with a readable message.
   function evalMath(input) {
-    const src = String(input == null ? "" : input).trim();
+    const src = String(input == null ? "" : input).trim().replace(/[\s=?]+$/, ""); // "2+2=" and "2+2=?" are fine
     if (!src) throw new Error("empty expression");
     if (src.length > 300) throw new Error("expression too long (max 300 characters)");
     const toks = mathTokens(src);
@@ -1474,8 +1474,29 @@
       if (sink) sink.push(r.text);
       return expr + " = " + r.text + (withSteps ? "\n(Use this exact value in your step-by-step.)" : "");
     } catch (e) {
-      return "Error: " + ((e && e.message) || "could not evaluate") + ". Use only numbers, + - * / % ^ ! parentheses and the listed functions.";
+      return "Error: " + ((e && e.message) || "could not evaluate") + ". Use only numbers, + - * / % ^ ! parentheses and the listed functions. Fix the expression and call calculate again.";
     }
+  }
+
+  // 🧮 Finds a math-looking part of the typed text and calculates it in JS up front, so the AI starts from the exact result.
+  function mathPrecheck(text) {
+    try {
+      const whole = String(text || "").trim();
+      const found = whole.match(/[\d(.][\d\s.+\-*\/\u00d7\u00f7^()%!\u2212\u2013]*[\d)!%]/g) || [];
+      const cands = found
+        .map((x) => x.trim())
+        .filter((x) => !/^\d{1,4}\s*[-\/]\s*\d{1,2}\s*[-\/]\s*\d{1,4}$/.test(x)) // dates are not math
+        .filter((x) => /\d\s*[+\-*\/\u00d7\u00f7^\u2212\u2013]\s*\(?\s*[.\d]/.test(x) || /\d!/.test(x))
+        .sort((a, b) => b.length - a.length)
+        .slice(0, 3);
+      for (let i = 0; i < cands.length; i++) {
+        try {
+          const r = evalMath(cands[i]);
+          return { expr: cands[i], text: r.text, mostly: cands[i].length >= whole.length * 0.4 };
+        } catch (e) {}
+      }
+    } catch (e) {}
+    return null;
   }
 
   // 🪜 True when the AI's final text really contains the last JS result (commas ignored, tiny rounding allowed).
@@ -1552,8 +1573,16 @@
     const timer = controller ? setTimeout(() => controller.abort(), gen.timeoutMs) : null;
     let systemPrompt = buildSystemPrompt(forceAnswer) + (replyContext ? "\n\n" + replyContext : "");
 
-    // 🌸 Optional web search grounding for answers.
-    if ((forceAnswer || storage.answerQuestions !== false) && storage.searchEnabled === true) {
+    // 🧮 JS pre-check: calculate any expression in the typed text first and hand the exact result to the AI.
+    const mathPre = (storage.mathTool !== false && (forceAnswer === true || storage.answerQuestions !== false)) ? mathPrecheck(text) : null;
+    if (mathPre) {
+      systemPrompt += "\n\nJS pre-check (exact): the typed text contains \"" + mathPre.expr + "\", which JavaScript calculated as " + mathPre.text +
+        ". If the question asks for that calculation, use this exact value and still show short steps. Ignore it if the text is about something else.";
+      log("math pre-check:", mathPre.expr, "=", mathPre.text);
+    }
+
+    // 🌸 Optional web search grounding for answers (skipped for plain math: JS already has the answer, and it saves tokens).
+    if (!(mathPre && mathPre.mostly) && (forceAnswer || storage.answerQuestions !== false) && storage.searchEnabled === true) {
       const searchQuery = String(text || "").replace(/^[!~\[]?(ans|answer)\]?\s*/i, "").trim().slice(0, 200);
       if (searchQuery.length >= 4) {
         const results = await searchWeb(searchQuery);
