@@ -489,20 +489,12 @@
 
     function userHistoryLines(channelId, userId) {
       if (!channelId || !userId) return [];
-      const guildId = guildIdOf(channelId, null);
       const mine = getChannelMessages(channelId)
         .filter((m) => authorOf(m).id === String(userId) && textOfMessage(m))
         .slice(-HISTORY_COUNT);
-      return mine.map((m) => {
-        const who = authorOf(m);
-        const row = { datetime: formatStamp(m.id), message_id: String(m.id), user_id: who.id };
-        if (who.username) row.username = who.username;
-        if (who.globalName) row.nickname = who.globalName;
-        const server = serverNickOf(guildId, who.id, m);
-        if (server) row.server_name = server;
-        row.message = textOfMessage(m).replace(/\s+/g, " ").trim().slice(0, WINDOW_LINE_MAX);
-        return JSON.stringify(row);
-      });
+      return mine.map((m) =>
+        formatStamp(m.id) + " | " + String(m.id) + " | " + textOfMessage(m).replace(/\s+/g, " ").trim().slice(0, WINDOW_LINE_MAX)
+      );
     }
 
     function resolveReplyInfo(channelId, args, explicitRef) {
@@ -559,13 +551,13 @@
       lastReplyImages = reply && Array.isArray(reply.imageUrls) ? reply.imageUrls : [];
       const self = getSelfIdentity();
       const lines = [
-        "This is Discord. You are writing the outgoing Discord chat message for this speaker. In the speaker's own text, 'me', 'my', 'mine', 'myself' and 'I' mean THIS person:",
+        "Discord. You write the outgoing chat message for this speaker ('me', 'my', 'mine', 'myself', 'I' in their text mean THIS person):",
         "- discord_user_id: " + (self.id || "unknown"),
         "- discord_username: " + (self.username || "unknown"),
         "- discord_global_name: " + (self.globalName || "unknown"),
       ];
       if (selfServerName) lines.push("- discord_server_name: " + selfServerName);
-      const replyWho = " (words like he, she, they, him, her in the speaker's text usually mean this person, never the speaker):";
+      const replyWho = " (he, she, they, him, her in the speaker's text usually mean this person, never the speaker):";
       if (reply && (reply.text || reply.id || reply.messageId || reply.username || reply.globalName || reply.isBot || reply.isForward)) {
         lines.push(reply.isForward
           ? "The speaker is replying to this forwarded Discord message" + replyWho
@@ -582,25 +574,25 @@
         if (reply.sentAt) lines.push("- reply_sent_at: " + reply.sentAt);
         if (reply.text) lines.push("- reply_message: \"" + reply.text.replace(/"/g, "'") + "\"");
         if (reply.windowLines && reply.windowLines.length) {
-          lines.push("Channel messages around the reply target (oldest first, UTC times). The line flagged >>> REPLY TARGET is the exact message being replied to; \"speaker\" marks the person you are writing for:");
+          lines.push("Channel messages around the reply target (oldest first, UTC). '>>> REPLY TARGET' is the exact message replied to; 'speaker' marks the person you write for:");
           for (let i = 0; i < reply.windowLines.length; i++) lines.push(reply.windowLines[i]);
         }
       }
       if (reply && reply.historyLines && reply.historyLines.length) {
-        lines.push("Last " + reply.historyLines.length + " messages from the person being replied to (oldest first, one JSON object per line; datetime is UTC, user_id is their snowflake, nickname is their global display name, server_name is their nickname in this server and only present when set):");
+        lines.push("Last " + reply.historyLines.length + " messages from the person being replied to (the reply_discord_* person above; oldest first; one per line as: UTC datetime | message id | text):");
         for (let i = 0; i < reply.historyLines.length; i++) lines.push(reply.historyLines[i]);
       }
-      const strict = "Do NOT insert names, IDs, or details from this context into the message, and do NOT replace pronouns (he, she, they, it, that, this) with names. "
-        + "A name or fact may only appear in the output if the speaker's own text already contains it. Keep the speaker's original wording and meaning as close as possible, but still fix typos and misspellings. ";
+      const strict = "Do NOT insert names, IDs or details from this context, and do NOT replace pronouns (he, she, they, it, that, this) with names. "
+        + "A name or fact may appear in the output only if the speaker's own text has it. Keep the speaker's wording and meaning as close as possible, but still fix typos. ";
       const footer = forceAnswer === true
-        ? "Use this context to answer the speaker's typed text. If it asks about the speaker themselves (who am I, who's me, my name, my id, my nickname), answer directly from the speaker facts above, addressed to the speaker. " +
-          "Quote or name people from the context freely when that makes the answer clearer, but state only what the context actually shows. "
+        ? "Use this context to answer the typed text. Questions about the speaker are answered from the speaker facts above, addressed to the speaker. " +
+          "Quote or name people from the context freely when it makes the answer clearer, but state only what the context shows. "
         : storage.answerQuestions !== false
-        ? "If the speaker's text is an instruction about the reply itself (for example 'reply to Quater', 'answer him', 'say yes', 'tell her no'), do not rewrite or repeat it: write the actual reply to the reply target from this context, in the speaker's own voice, ready to send. " +
-          "If the speaker asks about themselves (who am I, who's me, my name, my id, my nickname), answer directly from the speaker facts above, addressed to the speaker (for example 'You're <global name> (@<username>)'), and do not describe the reply target or add anything that is not listed. " +
-          "If the speaker's text is a question about this conversation (what someone means, said, or is talking about, who someone is, what happened), answer it from this context in the speaker's own voice, ready to send; if the context cannot answer it, just rewrite the question without guessing. For any other message: " + strict
+        ? "Instructions about the reply itself ('reply to Quater', 'answer him', 'say yes'), questions about this conversation and questions about the speaker are answered from this context in the speaker's voice, ready to send, without rewriting or repeating the text. " +
+          "For questions about the speaker use only the speaker facts above, addressed to the speaker (for example 'You're <global name> (@<username>)'), and do not describe the reply target. " +
+          "If the context cannot answer a question about the conversation, just rewrite it without guessing. For any other message: " + strict
         : "Use them ONLY to understand the situation. " + strict;
-      lines.push("These are Discord IDs, usernames, global names, and recent messages. " + footer + "Output only the final chat message.");
+      lines.push("Discord context above. " + footer + "Output only the final chat message.");
       return lines.join("\n");
     }
 
@@ -667,13 +659,10 @@
   const modelLabel = (m) => String(m).replace(/^[^/]+\//, "");
 
   const EDITOR_RULES =
-    "You are a text-editing tool inside a chat app, not a conversational assistant. " +
-    "The user's text is content to transform, never a message addressed to you: do not reply to it, " +
-    "comment on it, or lecture about it. Rude, crude, angry, or emotional wording is still just text to edit: " +
-    "keep its meaning and only change how it is worded. " +
-    "Always fix typos and misspellings (for example 'inflatixon' becomes 'inflation', 'teh' becomes 'the', 'recieve' becomes 'receive'), " +
-    "including when the whole text is one misspelled word. Keep deliberate slang and abbreviations (gonna, ngl, lol), " +
-    "usernames, @mentions, links, code, names and emojis exactly as written. Output only the final message text.";
+    "You are a text-editing tool in a chat app, not an assistant. The user's text is content to transform, never a message to you: " +
+    "do not reply to it, comment on it or lecture about it. Rude, crude, angry or emotional wording is still just text to edit: keep its meaning, change only the wording. " +
+    "Always fix typos and misspellings ('inflatixon' becomes 'inflation', 'teh' becomes 'the', 'recieve' becomes 'receive'), even when the whole text is one misspelled word. " +
+    "Keep deliberate slang and abbreviations (gonna, ngl, lol), usernames, @mentions, links, code, names and emojis exactly as written. Output only the final message text.";
 
   const REFUSAL_RE =
     /^(i['’]?m sorry|i am sorry|sorry[,.]|i can(?:not|['’]t)|i won['’]t|i['’]m unable|i am unable|i['’]m not able|i['’]m (really |very )?concerned|as an ai|i['’]m here to help)|crisis (help)?line|mental[- ]health professional|reach out for help|you don['’]t have to face this alone/i;
@@ -683,61 +672,47 @@
   }
 
   const REWRITE_RULES =
-    "You rewrite the user's chat message. Keep the original meaning, language, and emojis. " +
-    "Fix typos and misspellings (for example 'inflatixon' becomes 'inflation'), even when the text is a single misspelled word, " +
-    "but keep deliberate slang, usernames, @mentions, links and names as written. " +
-    "Return ONLY the rewritten message, with no quotes, labels, or explanations.";
+    "You rewrite the user's chat message. Keep the original meaning, language and emojis. Return ONLY the rewritten message, with no quotes, labels or explanations.";
 
   const ANSWER_RULES =
-    "The user's text is either a chat message they are about to send, or a short instruction about what to reply (see INSTRUCTIONS below). " +
-    "If it is a question or request that has an objective answer you can give (math, facts, translations, " +
-    "definitions, or things like 'say hi in Japanese'), do NOT repeat it: write the final answer itself as the " +
-    "chat message, ready to send, and compute math carefully. " +
-    "For math, logic, and how/why questions, show a short step-by-step (a few brief lines, one step per line) " +
-    "that ends with the final answer. For simple translations or 'say X' requests, just give the answer directly. " +
-    "When Discord context is provided (the reply target, surrounding channel messages, recent messages from the person " +
-    "being replied to) and the message asks about what was said or what someone means (for example 'what is he talking " +
-    "about', 'what does that mean', 'who is that', 'what happened'), answer it yourself from that context as the chat " +
-    "message, ready to send; if the context does not contain the answer, just rewrite the question instead of guessing. " +
-    "If it is ordinary conversation, or a question aimed at another person (their plans, feelings, opinions, " +
-    "availability), just rewrite it and keep its meaning. " +
-    "IDENTITY: in the speaker's text, 'me', 'my', 'mine', 'myself' and 'I' mean the SPEAKER (the discord_* fields in the context), " +
-    "and 'he', 'she', 'they', 'him', 'her' or 'that person' usually mean the REPLY TARGET (the reply_discord_* fields) unless the text names someone else. " +
-    "Other names in the channel messages are third parties. Never mix these people up. You are only the writer for the speaker: never talk about being an AI or a model, " +
-    "never answer as yourself, and never invent facts (real name, age, location, role, history, relationships) that are not written in the context. " +
-    "If the speaker asks about themselves ('who am I', 'who's me', 'what's my name', 'my id', 'my nickname'), answer plainly with only the speaker facts listed in the context. " +
-    "INSTRUCTIONS (this overrides the text-editing rule above): if the text is not something to say but an instruction about the reply itself, " +
-    "such as 'reply to Quater', 'answer him', 'respond to this', 'say yes', 'tell her no', 'agree', 'reply with a joke', or 'roast him', " +
-    "do NOT rewrite, translate, or repeat the instruction. Write the actual message the speaker would send as a reply to the reply target, " +
-    "using the reply target's message and the surrounding Discord context, and follow any stance or tone the instruction gives (agree, refuse, joke, and so on). " +
+    "The text is either a chat message the speaker is about to send, or a short instruction about what to reply. " +
+    "If it is a question or request with an objective answer (math, facts, translations, definitions, 'say hi in Japanese'), do NOT repeat it: " +
+    "write the final answer itself as the chat message, ready to send, and compute math carefully. " +
+    "For math, logic and how/why questions show a short step-by-step (a few brief lines, one step per line) ending with the final answer; " +
+    "for simple translations or 'say X' requests just give the answer. " +
+    "If it asks about what was said or meant in the Discord context ('what is he talking about', 'what does that mean', 'who is that', 'what happened'), " +
+    "answer it yourself from that context as the message, ready to send; if the context does not contain the answer, just rewrite the question instead of guessing. " +
+    "Ordinary conversation, or a question aimed at another person (plans, feelings, opinions, availability): just rewrite it and keep its meaning. " +
+    "IDENTITY: 'me', 'my', 'mine', 'myself' and 'I' mean the SPEAKER (the discord_* fields); 'he', 'she', 'they', 'him', 'her' or 'that person' usually mean the REPLY TARGET (the reply_discord_* fields) unless another name is given. " +
+    "Other names in the channel messages are third parties. Never mix these people up. " +
+    "You only write for the speaker: never mention being an AI or a model, never answer as yourself, and never invent facts (real name, age, location, role, history, relationships) that are not in the context. " +
+    "If the speaker asks about themselves ('who am I', 'my name', 'my id', 'my nickname'), answer plainly with only the speaker facts in the context. " +
+    "INSTRUCTIONS (overrides the text-editing rule above): if the text is an instruction about the reply itself, such as 'reply to Quater', 'answer him', 'respond to this', " +
+    "'say yes', 'tell her no', 'agree', 'reply with a joke' or 'roast him', do NOT rewrite, translate or repeat it. Write the actual message the speaker would send to the reply target, " +
+    "using the target's message and the surrounding context, and follow any stance or tone the instruction gives. " +
     "A name inside the instruction says who the reply is for; it is not part of the message. " +
-    "If there is no reply target or context to answer from, treat the text as an ordinary message and rewrite it. " +
-    "Return ONLY the message to send (including the steps, when asked for), with no quotes, labels, or commentary about the task itself.";
+    "With no reply target or context to answer from, treat the text as an ordinary message and rewrite it. " +
+    "Return ONLY the message to send (with the steps, when asked for), with no quotes, labels or commentary.";
 
   // Used instead of EDITOR_RULES + ANSWER_RULES when the speaker typed an answer tag ([Answer], [ans] or !~{ans}).
   // Those two rule sets lean towards rewriting, which is exactly what the tag is meant to switch off.
   const FORCED_ANSWER_RULES =
-    "You write the outgoing Discord chat message for the speaker. The speaker put an answer tag on their typed text, so it is NOT a message to polish or reword. " +
-    "It is a question, request or instruction, and your output is the ANSWER or REPLY itself, written as the message they will send, in their own voice. " +
-    "Words like 'reply,', 'answer,', 'respond,' or 'say' at the start are instructions, not part of the question. " +
-    "Never repeat, restate, or lightly rephrase the typed text, and never answer with the same question back. " +
-    "Lead with the answer. Use the Discord context (the reply target, nearby messages, who said what) together with ordinary general knowledge. " +
+    "You write the outgoing Discord chat message for the speaker. They put an answer tag on the typed text, so it is NOT a message to polish or reword: " +
+    "it is a question, request or instruction, and your output is the ANSWER or REPLY itself, written as the message they will send, in their own voice. " +
+    "A leading 'reply,', 'answer,', 'respond,' or 'say' is an instruction, not part of the question. " +
+    "Never repeat, restate or lightly rephrase the typed text, and never answer with the same question back. Lead with the answer. " +
+    "Use the Discord context (reply target, nearby messages, who said what) together with general knowledge. " +
     "For math or logic show a few short lines ending with the final answer; for translations or 'say X' requests just give the result. " +
-    "If the context only partly covers a question about a person or an event, say what the messages actually show, in a natural casual voice " +
-    "(for example 'from what i can see...'). Do not refuse and do not echo the question. " +
-    "If neither the context nor general knowledge can answer it, say so in one short natural line (for example 'no clue tbh'). " +
-    "Never invent facts about real people such as their job, age, location or history. " +
-    "IDENTITY: 'me', 'my', 'mine', 'myself' and 'I' in the typed text mean the SPEAKER (the discord_* fields in the context), " +
-    "and 'he', 'she', 'they', 'him', 'her' or 'that person' usually mean the REPLY TARGET (the reply_discord_* fields) unless a name is given. " +
-    "Never mix these people up, never talk about being an AI or a model, and never answer as yourself. " +
-    "If the speaker asks about themselves ('who am I', 'who's me', 'my name', 'my id', 'my nickname'), answer plainly with only the speaker facts in the context. " +
-    "Return ONLY the message to send, with no quotes, labels, or commentary about the task.";
+    "If the context only partly covers a question about a person or an event, say what the messages show, in a casual voice ('from what i can see...'); do not refuse or echo the question. " +
+    "If neither the context nor general knowledge can answer it, say so in one short natural line ('no clue tbh'). Never invent facts about real people (job, age, location, history). " +
+    "IDENTITY: 'me', 'my', 'mine', 'myself' and 'I' mean the SPEAKER (the discord_* fields); 'he', 'she', 'they', 'him', 'her' or 'that person' usually mean the REPLY TARGET (the reply_discord_* fields) unless a name is given. " +
+    "Never mix these people up, mention being an AI, or answer as yourself. " +
+    "If the speaker asks about themselves ('who am I', 'my name', 'my id', 'my nickname'), answer plainly with only the speaker facts in the context. " +
+    "Return ONLY the message to send, with no quotes, labels or commentary.";
 
   const PERSONALITIES = {
-    "Casual/Slang":
-      "Style: relaxed, friendly, natural slang, like a real person texting a friend. Keep it short and lively.",
-    Professional:
-      "Style: polite, clear, concise and professional. Correct grammar, no slang, no unnecessary emojis.",
+    "Casual/Slang": "Style: casual, friendly, natural slang, like texting a friend. Short and lively.",
+    Professional: "Style: polite, clear, concise, professional. Correct grammar, no slang, no needless emojis.",
   };
   const PERSONALITY_OPTIONS = ["Casual/Slang", "Professional", "Custom"];
 
@@ -955,16 +930,15 @@
   function userContent(text, replyContext, forceAnswer) {
     const answerOn = forceAnswer === true || storage.answerQuestions !== false;
     const tag = forceAnswer === true
-      ? "The speaker tagged the typed text below as an instruction or question to ANSWER, not a message to rewrite. " +
-        "Carry it out (answer the question, or write the reply it asks for) and output only the resulting chat message. " +
-        "If it is a question, answer it from the Discord context and general knowledge; if the context only partly answers it, say what it shows. " +
-        "Never repeat, rephrase or echo the typed text. In the typed text, \"me\", \"my\" and \"I\" mean the speaker described in the Discord context, never you.\n\n"
+      ? "The speaker tagged the typed text below as a question or instruction to ANSWER, not a message to rewrite. " +
+        "Carry it out and output only the resulting chat message; never repeat, rephrase or echo the typed text. " +
+        "In it, \"me\", \"my\" and \"I\" mean the speaker described in the Discord context, never you.\n\n"
       : "";
     if (!replyContext || replyContext.indexOf("reply_message:") === -1) return tag ? tag + "Typed text:\n" + text : text;
     return tag + "The speaker is replying on Discord. Use the referenced message below. Do not ignore it and do not invent a different topic.\n\n" +
       replyContext +
       (answerOn
-        ? "\n\nTyped text (the message to send, or an instruction about what to reply; if it is an instruction, write the actual reply to the message above instead of repeating it). Output only the chat message:\n"
+        ? "\n\nTyped text (the message to send, or an instruction about the reply; if an instruction, write the actual reply to the message above, do not repeat it). Output only the chat message:\n"
         : "\n\nTyped text to turn into the reply. Output only the chat message:\n") + text;
   }
 
@@ -1174,7 +1148,8 @@
   const MATH_CONSTS = { pi: Math.PI, e: Math.E, tau: 2 * Math.PI, phi: (1 + Math.sqrt(5)) / 2, ln2: Math.LN2, ln10: Math.LN10, sqrt2: Math.SQRT2 };
   const cleanTrig = (r) => (Math.abs(r) < 1e-14 ? 0 : r);
   const MAX_TOOL_ROUNDS = 3;
-  const MATH_HINT = /\d|\b(?:sqrt|square root|cube root|percent|plus|minus|times|multiplied|divided|squared|cubed|factorial|power|log|sin|cos|tan|calculate|compute|solve|average|mean)\b|[√π²³]/i;
+  // Common words like mean / power / log / times / plus no longer switch the calculator (and its ~250 tokens) on; digits, math symbols and clear math words still do.
+  const MATH_HINT = /\d|\b(?:sqrt|square root|cube root|percent|multiplied|divided|squared|cubed|factorial|calculate|compute)\b|\b(?:sin|cos|tan|log|ln)\s*\(|[\u221a\u03c0\u00b2\u00b3]/i;
 
   const mAdd = (a, b) => (isBig(a) && isBig(b) ? a + b : toNum(a) + toNum(b));
   const mSub = (a, b) => (isBig(a) && isBig(b) ? a - b : toNum(a) - toNum(b));
@@ -1437,14 +1412,14 @@
     function: {
       name: "calculate",
       description:
-        "Exactly evaluate a math expression with JavaScript. Use it for ANY arithmetic, percentages, powers, roots, trigonometry, logarithms or factorials instead of calculating in your head. " +
+        "Exact JavaScript calculator. Use it for ANY arithmetic, percentages, powers, roots, trig, logs or factorials instead of calculating in your head. " +
         "Supports + - * / % (modulo) ^ (power) ! (factorial), parentheses, constants pi e tau phi, and functions: " +
         "sqrt cbrt abs sign floor ceil trunc round(x,digits) sin cos tan asin acos atan atan2 sinh cosh tanh (radians), sind cosd tand (degrees), deg rad, " +
         "exp ln log (base 10) log2 log10 log(x,base) pow min max hypot gcd lcm mod fact. " +
-        "Whole numbers are exact (BigInt) for + - * ^ !. Write 15% as 15/100. No units or thousands separators. Call it once per separate calculation.",
+        "Whole numbers are exact for + - * ^ !. Write 15% as 15/100. No units or thousands separators. One call per calculation.",
       parameters: {
         type: "object",
-        properties: { expression: { type: "string", description: "For example: 15/100*2340 + sqrt(144)" } },
+        properties: { expression: { type: "string", description: "e.g. 15/100*2340 + sqrt(144)" } },
         required: ["expression"],
       },
     },
@@ -1452,13 +1427,9 @@
 
   // 🪜 Used while the JS calculator is live: the AI still writes its own short steps, JS supplies every number.
   const MATH_STEPS_RULES =
-    "MATH STEPS: you have a `calculate` tool that is exact. Still show your working as a short step-by-step in your own words, " +
-    "one step per line (2 to 6 brief lines), and end with the final answer on the last line. " +
-    "Run every numeric calculation through `calculate` and copy its result into the steps exactly, never recompute numbers in your head. " +
-    "Each step says what is being done and its result, for example: 'Take 15% of 2340: 351'. " +
-    "The final answer must be the exact result of the last `calculate` call. " +
-    "Do not paste the raw tool expression or mention the tool or JavaScript. " +
-    "A single trivial operation can be one line that already ends in the answer.";
+    "MATH: show a short step-by-step in your own words, one brief line per step (2 to 6 lines), the last line being the final answer. " +
+    "Run every numeric calculation through `calculate` and copy its result exactly; never work numbers out yourself. " +
+    "The final answer is the last `calculate` result. Do not show raw expressions or mention the tool or JavaScript. One trivial operation can be one line.";
 
   function runMathTool(args, withSteps, sink) {
     let expr = "";
@@ -1472,9 +1443,46 @@
       const r = evalMath(expr);
       log("math:", expr, "=", r.text);
       if (sink) sink.push(r.text);
-      return expr + " = " + r.text + (withSteps ? "\n(Use this exact value in your step-by-step.)" : "");
+      return expr + " = " + r.text + (withSteps ? "\n(use this exact value)" : "");
     } catch (e) {
       return "Error: " + ((e && e.message) || "could not evaluate") + ". Use only numbers, + - * / % ^ ! parentheses and the listed functions. Fix the expression and call calculate again.";
+    }
+  }
+
+  // 🧮 For a flat chain (numbers with + - * / only) JS can show its own working: each reduction, highest precedence first, left to right.
+  // Returns an array of "a × b = r" lines whose final value equals evalMath's, or null when the expression is not a flat chain.
+  function mathTrace(expr) {
+    try {
+      const toks = mathTokens(String(expr).replace(/[\s=?]+$/, ""));
+      if (toks.length < 3 || toks.length % 2 === 0) return null;
+      const vals = [], ops = [];
+      for (let i = 0; i < toks.length; i++) {
+        const t = toks[i];
+        if (i % 2 === 0) {
+          if (t.t !== "num") return null;
+          vals.push(HAS_BIGINT && /^\d+$/.test(t.v) ? BigInt(t.v) : parseFloat(t.v));
+        } else {
+          if (t.t !== "op" || "+-*/".indexOf(t.v) === -1) return null;
+          ops.push(t.v);
+        }
+      }
+      if (ops.length > 12) return null;
+      const sym = { "*": "\u00d7", "/": "\u00f7", "+": "+", "-": "-" };
+      const steps = [];
+      while (ops.length) {
+        let k = -1;
+        for (let i = 0; i < ops.length; i++) if (ops[i] === "*" || ops[i] === "/") { k = i; break; }
+        if (k === -1) k = 0;
+        const a = vals[k], b = vals[k + 1], o = ops[k];
+        const r = o === "*" ? mMul(a, b) : o === "/" ? mDiv(a, b) : o === "+" ? mAdd(a, b) : mSub(a, b);
+        steps.push(fmtMathResult(a) + " " + sym[o] + " " + fmtMathResult(b) + " = " + fmtMathResult(r));
+        vals.splice(k, 2, r);
+        ops.splice(k, 1);
+      }
+      if (fmtMathResult(vals[0]) !== evalMath(expr).text) return null; // safety net: never show a trace that disagrees with the engine
+      return steps;
+    } catch (e) {
+      return null;
     }
   }
 
@@ -1482,9 +1490,16 @@
   function mathPrecheck(text) {
     try {
       const whole = String(text || "").trim();
-      const found = whole.match(/[\d(.][\d\s.+\-*\/\u00d7\u00f7^()%!\u2212\u2013]*[\d)!%]/g) || [];
+      const re = /[\d(.\-\u2212][\d\s.+\-*\/\u00d7\u00f7^()%!\u2212\u2013]*[\d)!%]/g;
+      const found = [];
+      let m;
+      while ((m = re.exec(whole))) {
+        let x = m[0];
+        // a "-" glued to the previous word or number is a hyphen or a subtraction sign, not a minus sign
+        if (/^[-\u2212]/.test(x) && m.index > 0 && /[A-Za-z0-9)]/.test(whole[m.index - 1])) x = x.slice(1);
+        found.push(x.trim());
+      }
       const cands = found
-        .map((x) => x.trim())
         .filter((x) => !/^\d{1,4}\s*[-\/]\s*\d{1,2}\s*[-\/]\s*\d{1,4}$/.test(x)) // dates are not math
         .filter((x) => /\d\s*[+\-*\/\u00d7\u00f7^\u2212\u2013]\s*\(?\s*[.\d]/.test(x) || /\d!/.test(x))
         .sort((a, b) => b.length - a.length)
@@ -1492,7 +1507,14 @@
       for (let i = 0; i < cands.length; i++) {
         try {
           const r = evalMath(cands[i]);
-          return { expr: cands[i], text: r.text, mostly: cands[i].length >= whole.length * 0.4 };
+          // "mostly math": the expression is a big part of the text, or there is only a few words around it
+          const mostly = cands[i].length >= whole.length * 0.4 || whole.length - cands[i].length <= 30;
+          // "pure": the text is just the calculation, optionally with "what is" / "calculate" in front and "=" or "?" after
+          const at = whole.indexOf(cands[i]);
+          const pure = at !== -1 &&
+            /^(?:(?:what(?:'s|s)?(?:\s+is)?|calc(?:ulate)?|compute|solve|answer|how much is|result of)\s*)?$/i.test(whole.slice(0, at).trim()) &&
+            /^[=?!.\s]*$/.test(whole.slice(at + cands[i].length));
+          return { expr: cands[i], text: r.text, mostly: mostly, pure: pure, trace: mathTrace(cands[i]) };
         } catch (e) {}
       }
     } catch (e) {}
@@ -1538,23 +1560,26 @@
     while ((m = re.exec(String(str)))) { ms += parseFloat(m[1]) * unit[m[2]]; found = true; }
     return found ? ms : null;
   }
-  function fmtClock(ts) {
+  function fmtClock(ts, withSeconds) {
     try {
       const d = new Date(ts);
       const p = (n) => (n < 10 ? "0" : "") + n;
-      return p(d.getHours()) + ":" + p(d.getMinutes()) + (d.toDateString() !== new Date().toDateString() ? " tomorrow" : "");
+      let s = p(d.getHours()) + ":" + p(d.getMinutes());
+      if (withSeconds) s += ":" + p(d.getSeconds());
+      return s + (d.toDateString() !== new Date().toDateString() ? " tomorrow" : "");
     } catch (e) { return ""; }
   }
   function formatUsage(u) {
     if (!u) return null;
     const lines = [];
     if (u.total > 0) lines.push("Used " + fmtNum(u.total) + " tokens (" + fmtNum(u.prompt) + " in · " + fmtNum(u.completion) + " out)");
+    if (u.elapsedMs != null) lines.push("AI responded in " + u.elapsedMs + " ms");
     if (u.remTokens != null) {
       lines.push("Tokens left: " + fmtNum(u.remTokens) + (u.limTokens != null ? " / " + fmtNum(u.limTokens) : "") + " per min" + (u.resetTokens ? " (resets in " + u.resetTokens + ")" : ""));
     }
     if (u.remReq != null || u.resetReq) {
-      // 🕒 When the request quota (per day) resets: relative time from Groq plus the clock time it works out to.
-      const at = u.resetReqAt ? fmtClock(u.resetReqAt) : "";
+      // 🕒 When the request quota (per day) resets: relative time from Groq plus the clock time it works out to (with seconds).
+      const at = u.resetReqAt ? fmtClock(u.resetReqAt, true) : "";
       const reset = u.resetReq ? "resets in " + u.resetReq + (at ? " · at " + at : "") : "";
       if (u.remReq != null) {
         lines.push("Requests left: " + fmtNum(u.remReq) + (u.limReq != null ? " / " + fmtNum(u.limReq) : "") + " per day" + (reset ? " (" + reset + ")" : ""));
@@ -1566,33 +1591,41 @@
   }
 
   async function callGroq(apiKey, text, replyContext = "", forceAnswer = false) {
-    const usage = { prompt: 0, completion: 0, total: 0, remTokens: null, limTokens: null, remReq: null, limReq: null, resetTokens: null, resetReq: null, resetReqAt: null };
+    const usage = { prompt: 0, completion: 0, total: 0, remTokens: null, limTokens: null, remReq: null, limReq: null, resetTokens: null, resetReq: null, resetReqAt: null, elapsedMs: null };
     lastUsage = usage;
+    const started = Date.now();
     const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
     const gen = getGenParams(forceAnswer);
     const timer = controller ? setTimeout(() => controller.abort(), gen.timeoutMs) : null;
-    let systemPrompt = buildSystemPrompt(forceAnswer) + (replyContext ? "\n\n" + replyContext : "");
+    // The reply context is already inside the user message when there is a reply target (see userContent), so it is added to the system prompt only otherwise.
+    const ctxInUser = !!(replyContext && replyContext.indexOf("reply_message:") !== -1);
+    let systemPrompt = buildSystemPrompt(forceAnswer) + (replyContext && !ctxInUser ? "\n\n" + replyContext : "");
 
     // 🧮 JS pre-check: calculate any expression in the typed text first and hand the exact result to the AI.
     const mathPre = (storage.mathTool !== false && (forceAnswer === true || storage.answerQuestions !== false)) ? mathPrecheck(text) : null;
-    if (mathPre) {
+    // When the typed text is basically one plain calculation, JS has already done the working: the AI just presents it (single request, no tool round).
+    // Tagged [Answer] the speaker asked for the answer, so "mostly math" is enough; otherwise the text must be just the calculation (never hijack "see you 5-6").
+    const mathIsMain = !!(mathPre && (forceAnswer === true ? mathPre.mostly : mathPre.pure));
+    const traceMode = mathIsMain && !!mathPre.trace;
+    if (traceMode) {
+      systemPrompt += "\n\nJS solved \"" + mathPre.expr + "\" exactly, step by step: " + mathPre.trace.join("; ") + ". Result: " + mathPre.text +
+        ". Present these steps as short lines (merge trivial ones if there are many) ending with the final answer " + mathPre.text + ". Do not recalculate.";
+      log("math trace:", mathPre.expr, "=", mathPre.text);
+    } else if (mathIsMain) {
       systemPrompt += "\n\nJS pre-check (exact): the typed text contains \"" + mathPre.expr + "\", which JavaScript calculated as " + mathPre.text +
         ". If the question asks for that calculation, use this exact value and still show short steps. Ignore it if the text is about something else.";
       log("math pre-check:", mathPre.expr, "=", mathPre.text);
     }
 
     // 🌸 Optional web search grounding for answers (skipped for plain math: JS already has the answer, and it saves tokens).
-    if (!(mathPre && mathPre.mostly) && (forceAnswer || storage.answerQuestions !== false) && storage.searchEnabled === true) {
+    if (!mathIsMain && (forceAnswer || storage.answerQuestions !== false) && storage.searchEnabled === true) {
       const searchQuery = String(text || "").replace(/^[!~\[]?(ans|answer)\]?\s*/i, "").trim().slice(0, 200);
       if (searchQuery.length >= 4) {
         const results = await searchWeb(searchQuery);
         if (results) {
-          systemPrompt += "\n\n=== CURRENT WEB SEARCH RESULTS (PRIORITY OVER YOUR TRAINING DATA) ===\n" +
-            "These results are from a live web search. For any facts, dates, release dates, news, or current information, " +
-            "YOU MUST prefer these results over your own knowledge. If the search results contradict what you remember, " +
-            "use the search results. Cite the source briefly when useful.\n\n" +
+          systemPrompt += "\n\n=== LIVE WEB SEARCH RESULTS (prefer them over your memory for facts, dates, news and current info; cite the source briefly when useful) ===\n" +
             results +
-            "\n=== END SEARCH RESULTS ===";
+            "\n=== END RESULTS ===";
           log("web search injected for answer");
         }
       }
@@ -1613,7 +1646,7 @@
 
     // 🧮 JS calculator tool: the model calls it for exact math instead of guessing.
     const replyLine = (/- reply_message: "([^\n]*)/.exec(replyContext || "") || [])[1] || "";
-    const useMath = storage.mathTool !== false && answerMode && MATH_HINT.test(String(text || "") + " " + replyLine);
+    const useMath = !traceMode && storage.mathTool !== false && answerMode && MATH_HINT.test(String(text || "") + " " + replyLine);
     // 🪜 AI steps stay on even though the JS calculator does the arithmetic.
     const mathSteps = useMath; // steps always come with the JS calculator (single "JS math + AI steps" switch)
     const mathResults = []; // exact JS results of this answer, used to check the AI's steps
@@ -1637,6 +1670,7 @@
     const ask = async (extra) => {
       const msgs = buildBase().concat(extra || []);
       mathResults.length = 0;
+      if (traceMode) mathResults.push(mathPre.text); // the final answer is still checked against the JS result
       for (let round = 0; ; round++) {
         const model = imagesOn ? VISION_MODEL : (MODELS.includes(storage.model) ? storage.model : DEFAULT_MODEL);
         const qwen = model.indexOf("qwen/") === 0;
@@ -1717,7 +1751,7 @@
         if (out.length > 1 && out[0] === '"' && out[out.length - 1] === '"') out = out.slice(1, -1).trim();
         if (!out) throw new Error("Empty response");
         // 🪜 The steps must be built on the JS results: if the final text doesn't contain them, ask once to fix it.
-        if (mathSteps && mathResults.length && !mathChecked && !answerUsesMath(out, mathResults)) {
+        if ((mathSteps || traceMode) && mathResults.length && !mathChecked && !answerUsesMath(out, mathResults)) {
           mathChecked = true;
           log("steps don't match the JS result, asking for a fix:", mathResults.join("; "));
           msgs.push({ role: "assistant", content: out });
@@ -1750,6 +1784,7 @@
       return out;
     } finally {
       if (timer) clearTimeout(timer);
+      usage.elapsedMs = Date.now() - started;
     }
   }
 
