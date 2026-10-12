@@ -1079,7 +1079,35 @@
     return null;
   }
 
+  // 🌸 Token + rate-limit info from the last Groq call, shown in the preview sheet.
+  let lastUsage = null;
+  const fmtNum = (n) => String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+  const hdrNum = (res, name) => {
+    try {
+      const v = res && res.headers && res.headers.get ? res.headers.get(name) : null;
+      const n = v == null ? NaN : parseInt(v, 10);
+      return isNaN(n) ? null : n;
+    } catch (e) { return null; }
+  };
+  const hdrStr = (res, name) => {
+    try { return (res && res.headers && res.headers.get && res.headers.get(name)) || null; } catch (e) { return null; }
+  };
+  function formatUsage(u) {
+    if (!u) return null;
+    const lines = [];
+    if (u.total > 0) lines.push("Used " + fmtNum(u.total) + " tokens (" + fmtNum(u.prompt) + " in · " + fmtNum(u.completion) + " out)");
+    if (u.remTokens != null) {
+      lines.push("Tokens left: " + fmtNum(u.remTokens) + (u.limTokens != null ? " / " + fmtNum(u.limTokens) : "") + " per min" + (u.resetTokens ? " (resets in " + u.resetTokens + ")" : ""));
+    }
+    if (u.remReq != null) {
+      lines.push("Requests left: " + fmtNum(u.remReq) + (u.limReq != null ? " / " + fmtNum(u.limReq) : "") + " per day");
+    }
+    return lines.length ? lines : null;
+  }
+
   async function callGroq(apiKey, text, replyContext = "", forceAnswer = false) {
+    const usage = { prompt: 0, completion: 0, total: 0, remTokens: null, limTokens: null, remReq: null, limReq: null, resetTokens: null };
+    lastUsage = usage;
     const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
     const gen = getGenParams(forceAnswer);
     const timer = controller ? setTimeout(() => controller.abort(), gen.timeoutMs) : null;
@@ -1125,6 +1153,24 @@
         throw err;
       }
       const data = await res.json();
+      try {
+        const u = data && data.usage;
+        if (u) {
+          usage.prompt += u.prompt_tokens || 0;
+          usage.completion += u.completion_tokens || 0;
+          usage.total += u.total_tokens || ((u.prompt_tokens || 0) + (u.completion_tokens || 0));
+        }
+        const rt = hdrNum(res, "x-ratelimit-remaining-tokens");
+        if (rt != null) usage.remTokens = rt;
+        const lt = hdrNum(res, "x-ratelimit-limit-tokens");
+        if (lt != null) usage.limTokens = lt;
+        const rr = hdrNum(res, "x-ratelimit-remaining-requests");
+        if (rr != null) usage.remReq = rr;
+        const lr = hdrNum(res, "x-ratelimit-limit-requests");
+        if (lr != null) usage.limReq = lr;
+        const rs = hdrStr(res, "x-ratelimit-reset-tokens");
+        if (rs) usage.resetTokens = rs;
+      } catch (e) {}
       let out = data && data.choices && data.choices[0] && data.choices[0].message
         ? String(data.choices[0].message.content || "").trim()
         : "";
@@ -1216,6 +1262,7 @@
   }
 
   async function rewriteText(text, replyContext = "", forceAnswer = false) {
+    lastUsage = null;
     const keys = getKeys();
     for (let i = 0; i < keys.length; i++) {
       try {
@@ -1393,7 +1440,7 @@
 
   function PreviewSheet(props) {
     const { View, Text, TextInput, TouchableOpacity, ScrollView } = RN;
-    const { original, finalText, finish, startEditing, onShown } = props;
+    const { original, finalText, finish, startEditing, onShown, usage } = props;
     const P = getPalette();
     const C = { text: P.text, muted: P.muted, card: P.card, accent: "#5865f2", danger: "#da373c", neutral: "#4e5058" };
 
@@ -1440,6 +1487,12 @@
       );
     }
 
+    const usageLines = formatUsage(usage);
+    const usageView = usageLines
+      ? h(View, { style: { marginTop: 10 } },
+          usageLines.map((l, i) => h(Text, { key: "u" + i, style: { color: C.muted, fontSize: 12, marginTop: i ? 2 : 0 } }, l)))
+      : null;
+
     const body = h(
       View,
       { style: { padding: 16, paddingBottom: 28 + kb } },
@@ -1457,12 +1510,13 @@
             })
           : h(ScrollView, null, h(Text, { selectable: true, style: { color: C.text, fontSize: 15 } }, text))
       ),
+      usageView,
       ...buttonRows
     );
     return ActionSheetComp ? h(ActionSheetComp, null, body) : body;
   }
 
-  function showPreview(original, finalText, startEditing) {
+  function showPreview(original, finalText, startEditing, usage) {
     if (ActionSheetModule && typeof ActionSheetModule.openLazy === "function") {
       return new Promise((resolve) => {
         let done = false;
@@ -1472,7 +1526,7 @@
         const timer = setTimeout(() => {
           if (done) return;
           log("action sheet did not open, using alert");
-          showAlertPreview(original, finalText, startEditing).then(finish);
+          showAlertPreview(original, finalText, startEditing, usage).then(finish);
         }, 2500);
         try {
           ActionSheetModule.openLazy(
@@ -1482,6 +1536,7 @@
               original,
               finalText,
               startEditing,
+              usage,
               onShown: () => clearTimeout(timer),
               finish: (v) => { clearTimeout(timer); finish(v); },
             }
@@ -1489,14 +1544,14 @@
         } catch (e) {
           clearTimeout(timer);
           log("action sheet failed, using alert:", e && e.message);
-          showAlertPreview(original, finalText, startEditing).then(finish);
+          showAlertPreview(original, finalText, startEditing, usage).then(finish);
         }
       });
     }
-    return showAlertPreview(original, finalText, startEditing);
+    return showAlertPreview(original, finalText, startEditing, usage);
   }
 
-  function showAlertPreview(original, finalText, noEdit) {
+  function showAlertPreview(original, finalText, noEdit, usage) {
     return new Promise((resolve) => {
       const Alert = RN.Alert;
       if (!Alert || typeof Alert.alert !== "function") return resolve({ action: "send", text: finalText });
@@ -1508,7 +1563,7 @@
       try {
         Alert.alert(
           "Preview",
-          finalText,
+          finalText + (formatUsage(usage) ? "\n\n" + formatUsage(usage).join("\n") : ""),
           [
             { text: "Send", onPress: () => finish({ action: "send", text: finalText }) },
             middle,
@@ -1538,8 +1593,10 @@
     const preview = storage.previewBeforeSend !== false;
     const stopTyping = startTypingLoop(channelId);
     let finalText = original;
+    let usageInfo = null;
     try {
       finalText = await rewriteText(original, replyContext, forceAnswer);
+      usageInfo = lastUsage;
       if (!preview) {
         const delay = getTypingMs();
         if (delay > 0) await sleep(delay);
@@ -1551,9 +1608,9 @@
     }
 
     if (preview) {
-      let r = await showPreview(original, finalText);
+      let r = await showPreview(original, finalText, undefined, usageInfo);
       // Alert fallback "Edit": reopen the sheet straight in edit mode
-      if (r.action === "edit") r = await showPreview(original, r.text || finalText, true);
+      if (r.action === "edit") r = await showPreview(original, r.text || finalText, true, usageInfo);
       if (r.action === "cancel") return null; // Cancel just exits the preview
       finalText = r.text || finalText;
       const stop2 = startTypingLoop(channelId);
@@ -2272,33 +2329,42 @@
             )
           : null,
       ]),
-      group("Web Search 🔍", [
-        sw("Enable web search for answers", storage.searchEnabled === true, (v) => { storage.searchEnabled = v; },
-          "When answering questions, search the web first via Exa or Composio Exa to ground replies"),
-        h(View, { style: { paddingHorizontal: 16, paddingVertical: 12, backgroundColor: ROW_BG } },
-          inputField("Exa API key (direct, preferred)", {
-            value: exaKeyInput,
-            placeholder: "exa-...",
-            autoCapitalize: "none",
-            autoCorrect: false,
-            secureTextEntry: true,
-            onChangeText: (t) => { setExaKeyInput(t); storage.exaApiKey = t.trim(); },
-          })
-        ),
-        h(View, { style: { paddingHorizontal: 16, paddingBottom: 12, backgroundColor: ROW_BG } },
-          inputField("Composio API key (fallback connector)", {
-            value: composioKeyInput,
-            placeholder: "composio key...",
-            autoCapitalize: "none",
-            autoCorrect: false,
-            secureTextEntry: true,
-            onChangeText: (t) => { setComposioKeyInput(t); storage.composioApiKey = t.trim(); },
-          })
-        ),
-        h(Text, { style: { color: P.muted, fontSize: 12, paddingHorizontal: 16, paddingBottom: 12, backgroundColor: ROW_BG } },
-          "Direct Exa is used if its key is set. Otherwise the Composio Exa connector (COMPOSIO_SEARCH_WEB) is used. Get an Exa key at dashboard.exa.ai or a Composio key at app.composio.dev."
-        ),
-      ]),
+      group("Web Search 🔍", (() => {
+        const searchOn = storage.searchEnabled === true;
+        const rows = [
+          sw("Enable web search for answers", searchOn, (v) => { storage.searchEnabled = v; forceRender(); },
+            "When answering questions, search the web first via Exa or Composio Exa to ground replies"),
+        ];
+        // 🌸 Exa + Composio only appear while web search is enabled.
+        if (searchOn) {
+          rows.push(
+            h(View, { key: "exa", style: { paddingHorizontal: 16, paddingVertical: 12, backgroundColor: ROW_BG } },
+              inputField("Exa API key (direct, preferred)", {
+                value: exaKeyInput,
+                placeholder: "exa-...",
+                autoCapitalize: "none",
+                autoCorrect: false,
+                secureTextEntry: true,
+                onChangeText: (t) => { setExaKeyInput(t); storage.exaApiKey = t.trim(); },
+              })
+            ),
+            h(View, { key: "composio", style: { paddingHorizontal: 16, paddingVertical: 12, backgroundColor: ROW_BG } },
+              inputField("Composio API key (fallback connector)", {
+                value: composioKeyInput,
+                placeholder: "composio key...",
+                autoCapitalize: "none",
+                autoCorrect: false,
+                secureTextEntry: true,
+                onChangeText: (t) => { setComposioKeyInput(t); storage.composioApiKey = t.trim(); },
+              })
+            ),
+            h(Text, { key: "exa-note", style: { color: P.muted, fontSize: 12, paddingHorizontal: 16, paddingVertical: 12, backgroundColor: ROW_BG } },
+              "Direct Exa is used if its key is set. Otherwise the Composio Exa connector (COMPOSIO_SEARCH_WEB) is used. Get an Exa key at dashboard.exa.ai or a Composio key at app.composio.dev."
+            )
+          );
+        }
+        return rows;
+      })()),
       footer,
     ];
 
