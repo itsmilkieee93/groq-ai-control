@@ -194,6 +194,57 @@
       return clipReply(parts.join(" | "));
     }
 
+    // 🖼️ Image links in a message: attachments, embeds (image / thumbnail of image + gif embeds), plain image links, forwarded snapshots.
+    const IMG_EXT_RE = /\.(?:png|jpe?g|webp|gif)(?:$|[?#])/i;
+    function imageUrlsOf(msg, depth) {
+      const found = [];
+      const seen = {};
+      const add = (u) => {
+        if (typeof u !== "string") return;
+        const url = u.trim().replace(/[.,;:!?)\]>]+$/, "");
+        if (!/^https?:\/\//i.test(url) || url.length > 2000) return;
+        const key = url.split("?")[0];
+        if (seen[key]) return;
+        seen[key] = true;
+        found.push(url);
+      };
+      const pick = (o) => (o && typeof o === "object" ? (o.url || o.proxyURL || o.proxy_url || o.proxyUrl || "") : "");
+      const level = depth || 0;
+      if (!msg || typeof msg !== "object" || level > 1) return found;
+      const attachments = Array.isArray(msg.attachments) ? msg.attachments : [];
+      for (let i = 0; i < attachments.length; i++) {
+        const a = attachments[i];
+        if (!a || typeof a !== "object") continue;
+        const ct = String(a.content_type || a.contentType || "");
+        const name = String(a.filename || a.name || "");
+        const url = a.url || a.proxy_url || a.proxyURL || a.proxyUrl || "";
+        const isImg = /^image\//i.test(ct) ? !/svg/i.test(ct) : IMG_EXT_RE.test(name) || IMG_EXT_RE.test(String(url));
+        if (isImg) add(url);
+      }
+      const embeds = Array.isArray(msg.embeds) ? msg.embeds : msg.embed ? [msg.embed] : [];
+      for (let i = 0; i < embeds.length && i < 4; i++) {
+        const e = embeds[i];
+        if (!e || typeof e !== "object") continue;
+        add(pick(e.image));
+        if (e.type === "image" || e.type === "gifv") {
+          add(pick(e.thumbnail));
+          if (e.type === "image" && IMG_EXT_RE.test(String(e.url || ""))) add(e.url);
+        }
+      }
+      const content = typeof msg.content === "string" ? msg.content : typeof msg.text === "string" ? msg.text : "";
+      const links = content.match(/https?:\/\/[^\s<>"']+/g) || [];
+      for (let i = 0; i < links.length && i < 10; i++) {
+        const link = links[i].replace(/[.,;:!?)\]>*_~|]+$/, ""); // "pic.png." or "(pic.png)" at the end of a sentence
+        if (IMG_EXT_RE.test(link)) add(link);
+      }
+      const snaps = snapshotMessages(msg);
+      for (let i = 0; i < snaps.length; i++) {
+        const inner = imageUrlsOf(snaps[i], level + 1);
+        for (let j = 0; j < inner.length; j++) add(inner[j]);
+      }
+      return found.slice(0, MAX_VISION_IMAGES);
+    }
+
     function identityOf(user) {
       if (!user || typeof user !== "object") return { id: "", username: "", globalName: "" };
       const id = user.id || user.userId || user.user_id || "";
@@ -490,6 +541,7 @@
         historyLines: historyLines,
         serverName: serverName,
         text: textOfMessage(msg),
+        imageUrls: storage.readImages === false ? [] : imageUrlsOf(msg),
         id: who.id || forwardAuthor.id,
         username: who.username || forwardAuthor.username,
         globalName: who.globalName || forwardAuthor.globalName,
@@ -498,7 +550,13 @@
       };
     }
 
+    let lastReplyImages = [];
+    function getReplyImages() {
+      return lastReplyImages;
+    }
+
     function formatContext(reply, forceAnswer, selfServerName) {
+      lastReplyImages = reply && Array.isArray(reply.imageUrls) ? reply.imageUrls : [];
       const self = getSelfIdentity();
       const lines = [
         "This is Discord. You are writing the outgoing Discord chat message for this speaker. In the speaker's own text, 'me', 'my', 'mine', 'myself' and 'I' mean THIS person:",
@@ -588,7 +646,7 @@
       }
     }
 
-    return { buildPayloadContext, formatContext, findReplyRef, getReplyTarget, getReplyMention, clearPending, forgetPending, start, stop };
+    return { buildPayloadContext, formatContext, getReplyImages, findReplyRef, getReplyTarget, getReplyMention, clearPending, forgetPending, start, stop };
   }
 
   const { storage } = vendetta.plugin;
@@ -601,8 +659,12 @@
   const h = React.createElement;
 
   const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
-  const MODELS = ["openai/gpt-oss-120b", "openai/gpt-oss-20b"];
+  // 🌸 Qwen 3.8 27B on Groq is multimodal (text + images), so it also reads images from replied messages.
+  const VISION_MODEL = "qwen/qwen3.8-27b";
+  const MODELS = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", VISION_MODEL];
   const DEFAULT_MODEL = MODELS[0];
+  const MAX_VISION_IMAGES = 3; // Groq allows at most 3 images per request
+  const modelLabel = (m) => String(m).replace(/^[^/]+\//, "");
 
   const EDITOR_RULES =
     "You are a text-editing tool inside a chat app, not a conversational assistant. " +
@@ -940,13 +1002,14 @@
   function getGenParams(forceAnswer) {
     const defaultEffort = (forceAnswer === true || storage.answerQuestions !== false) ? "medium" : "low";
     if (storage.advancedEnabled !== true) {
-      return { temperature: 0.7, maxTokens: 2048, topP: null, effort: defaultEffort, timeoutMs: 20000 };
+      return { temperature: 0.7, maxTokens: 2048, topP: null, effort: defaultEffort, effortSet: false, timeoutMs: 20000 };
     }
     return {
       temperature: readAdv(ADV_SPEC.temperature),
       maxTokens: readAdv(ADV_SPEC.maxTokens),
       topP: readAdv(ADV_SPEC.topP),
       effort: REASONING_OPTIONS.includes(storage.advReasoning) ? storage.advReasoning : defaultEffort,
+      effortSet: REASONING_OPTIONS.includes(storage.advReasoning),
       timeoutMs: readAdv(ADV_SPEC.timeout) * 1000,
     };
   }
@@ -1079,6 +1142,307 @@
     return null;
   }
 
+  // ---- 🧮 Local math engine: pure JavaScript (Math + BigInt). No eval, no Function. ----
+  const HAS_BIGINT = typeof BigInt === "function";
+  const B = (n) => BigInt(n); // only called when HAS_BIGINT
+  const isBig = (v) => typeof v === "bigint";
+  const toNum = (v) => (isBig(v) ? Number(v) : v);
+  const MATH_CONSTS = { pi: Math.PI, e: Math.E, tau: 2 * Math.PI, phi: (1 + Math.sqrt(5)) / 2, ln2: Math.LN2, ln10: Math.LN10, sqrt2: Math.SQRT2 };
+  const cleanTrig = (r) => (Math.abs(r) < 1e-14 ? 0 : r);
+  const MAX_TOOL_ROUNDS = 3;
+  const MATH_HINT = /\d|\b(?:sqrt|square root|cube root|percent|plus|minus|times|multiplied|divided|squared|cubed|factorial|power|log|sin|cos|tan|calculate|compute|solve|average|mean)\b|[√π²³]/i;
+
+  const mAdd = (a, b) => (isBig(a) && isBig(b) ? a + b : toNum(a) + toNum(b));
+  const mSub = (a, b) => (isBig(a) && isBig(b) ? a - b : toNum(a) - toNum(b));
+  const mMul = (a, b) => (isBig(a) && isBig(b) ? a * b : toNum(a) * toNum(b));
+  const mNeg = (a) => -a;
+  function mDiv(a, b) {
+    if (isBig(a) && isBig(b)) {
+      if (b === B(0)) throw new Error("division by zero");
+      return a % b === B(0) ? a / b : Number(a) / Number(b);
+    }
+    const d = toNum(b);
+    if (d === 0) throw new Error("division by zero");
+    return toNum(a) / d;
+  }
+  function mMod(a, b) {
+    if (isBig(a) && isBig(b)) {
+      if (b === B(0)) throw new Error("modulo by zero");
+      return a % b;
+    }
+    const y = toNum(b);
+    if (y === 0) throw new Error("modulo by zero");
+    return toNum(a) % y;
+  }
+  function mPow(a, b) {
+    if (isBig(a) && isBig(b) && b >= B(0)) {
+      const e = Number(b);
+      const est = e * Math.log10(Math.max(1, Math.abs(Number(a))));
+      if (est <= 2000) {
+        let result = B(1);
+        let base = a;
+        let k = e;
+        while (k > 0) {
+          if (k % 2 === 1) result = result * base;
+          k = Math.floor(k / 2);
+          if (k > 0) base = base * base;
+        }
+        return result;
+      }
+      return Math.pow(Number(a), e);
+    }
+    return Math.pow(toNum(a), toNum(b));
+  }
+  function mFact(v) {
+    const n = toNum(v);
+    if (!Number.isInteger(n) || n < 0) throw new Error("factorial needs a whole number, 0 or higher");
+    if (n > 500) throw new Error("factorial is limited to 500");
+    if (HAS_BIGINT) {
+      let r = B(1);
+      for (let i = 2; i <= n; i++) r = r * B(i);
+      return r;
+    }
+    if (n > 170) throw new Error("factorial too large");
+    let r = 1;
+    for (let i = 2; i <= n; i++) r *= i;
+    return r;
+  }
+  function gcdNum(x, y) {
+    x = Math.abs(x);
+    y = Math.abs(y);
+    while (y) { const t = x % y; x = y; y = t; }
+    return x;
+  }
+  function needInts(a, name) {
+    for (let i = 0; i < a.length; i++) {
+      if (!Number.isInteger(toNum(a[i]))) throw new Error(name + " needs whole numbers");
+    }
+  }
+  // name: [minArgs, maxArgs, fn(argsArray)]
+  const MATH_FN = {
+    sqrt: [1, 1, (a) => Math.sqrt(toNum(a[0]))],
+    cbrt: [1, 1, (a) => Math.cbrt(toNum(a[0]))],
+    abs: [1, 1, (a) => (isBig(a[0]) ? (a[0] < B(0) ? -a[0] : a[0]) : Math.abs(a[0]))],
+    sign: [1, 1, (a) => Math.sign(toNum(a[0]))],
+    floor: [1, 1, (a) => (isBig(a[0]) ? a[0] : Math.floor(a[0]))],
+    ceil: [1, 1, (a) => (isBig(a[0]) ? a[0] : Math.ceil(a[0]))],
+    trunc: [1, 1, (a) => (isBig(a[0]) ? a[0] : Math.trunc(a[0]))],
+    round: [1, 2, (a) => {
+      if (isBig(a[0])) return a[0];
+      const d = a.length > 1 ? toNum(a[1]) : 0;
+      if (!Number.isInteger(d) || d < 0 || d > 12) throw new Error("round digits must be a whole number from 0 to 12");
+      return d === 0 ? Math.round(a[0]) : Number(a[0].toFixed(d));
+    }],
+    sin: [1, 1, (a) => cleanTrig(Math.sin(toNum(a[0])))],
+    cos: [1, 1, (a) => cleanTrig(Math.cos(toNum(a[0])))],
+    tan: [1, 1, (a) => cleanTrig(Math.tan(toNum(a[0])))],
+    asin: [1, 1, (a) => Math.asin(toNum(a[0]))],
+    acos: [1, 1, (a) => Math.acos(toNum(a[0]))],
+    atan: [1, 1, (a) => Math.atan(toNum(a[0]))],
+    atan2: [2, 2, (a) => Math.atan2(toNum(a[0]), toNum(a[1]))],
+    sinh: [1, 1, (a) => Math.sinh(toNum(a[0]))],
+    cosh: [1, 1, (a) => Math.cosh(toNum(a[0]))],
+    tanh: [1, 1, (a) => Math.tanh(toNum(a[0]))],
+    sind: [1, 1, (a) => cleanTrig(Math.sin(toNum(a[0]) * Math.PI / 180))],
+    cosd: [1, 1, (a) => cleanTrig(Math.cos(toNum(a[0]) * Math.PI / 180))],
+    tand: [1, 1, (a) => cleanTrig(Math.tan(toNum(a[0]) * Math.PI / 180))],
+    deg: [1, 1, (a) => toNum(a[0]) * 180 / Math.PI],
+    rad: [1, 1, (a) => toNum(a[0]) * Math.PI / 180],
+    exp: [1, 1, (a) => Math.exp(toNum(a[0]))],
+    ln: [1, 1, (a) => Math.log(toNum(a[0]))],
+    log: [1, 2, (a) => (a.length > 1 ? Math.log(toNum(a[0])) / Math.log(toNum(a[1])) : Math.log10(toNum(a[0])))],
+    log2: [1, 1, (a) => Math.log2(toNum(a[0]))],
+    log10: [1, 1, (a) => Math.log10(toNum(a[0]))],
+    pow: [2, 2, (a) => mPow(a[0], a[1])],
+    min: [1, 20, (a) => a.reduce((m, v) => (toNum(v) < toNum(m) ? v : m))],
+    max: [1, 20, (a) => a.reduce((m, v) => (toNum(v) > toNum(m) ? v : m))],
+    hypot: [1, 20, (a) => Math.hypot.apply(null, a.map(toNum))],
+    gcd: [2, 2, (a) => { needInts(a, "gcd"); return gcdNum(toNum(a[0]), toNum(a[1])); }],
+    lcm: [2, 2, (a) => {
+      needInts(a, "lcm");
+      const x = toNum(a[0]);
+      const y = toNum(a[1]);
+      return x === 0 || y === 0 ? 0 : Math.abs(x / gcdNum(x, y) * y);
+    }],
+    mod: [2, 2, (a) => mMod(a[0], a[1])],
+    fact: [1, 1, (a) => mFact(a[0])],
+    factorial: [1, 1, (a) => mFact(a[0])],
+  };
+
+  function mathTokens(raw) {
+    const s = String(raw)
+      .replace(/[×✕]/g, "*").replace(/÷/g, "/").replace(/[−–]/g, "-")
+      .replace(/\*\*/g, "^").replace(/√/g, " sqrt ").replace(/π/g, " pi ")
+      .replace(/\u00b2/g, "^2").replace(/\u00b3/g, "^3");
+    const toks = [];
+    let i = 0;
+    while (i < s.length) {
+      const c = s[i];
+      if (c === " " || c === "\t" || c === "\n" || c === "\r") { i++; continue; }
+      const rest = s.slice(i);
+      let m = /^(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?/.exec(rest);
+      if (m) { toks.push({ t: "num", v: m[0] }); i += m[0].length; continue; }
+      m = /^[A-Za-z_][A-Za-z0-9_]*/.exec(rest);
+      if (m) {
+        const w = m[0].toLowerCase();
+        if (w === "of" || w === "x" || w === "times") toks.push({ t: "op", v: "*" });
+        else if (w === "plus") toks.push({ t: "op", v: "+" });
+        else if (w === "minus") toks.push({ t: "op", v: "-" });
+        else toks.push({ t: "id", v: w });
+        i += m[0].length;
+        continue;
+      }
+      if ("+-*/%^!(),".indexOf(c) !== -1) { toks.push({ t: "op", v: c }); i++; continue; }
+      throw new Error("unexpected character '" + c + "'");
+    }
+    if (toks.length > 200) throw new Error("expression too long");
+    return toks;
+  }
+
+  function fmtMathResult(v) {
+    if (isBig(v)) {
+      const str = v.toString();
+      if (str.length <= 400) return str;
+      const neg = str[0] === "-" ? "-" : "";
+      const d = neg ? str.slice(1) : str;
+      return neg + d[0] + "." + d.slice(1, 15) + "e+" + (d.length - 1) + " (" + d.length + " digits)";
+    }
+    if (typeof v !== "number" || isNaN(v)) throw new Error("result is not a real number");
+    if (!isFinite(v)) throw new Error("result is infinite or too large");
+    return String(Number(v.toPrecision(15)));
+  }
+
+  // Evaluates a math expression safely. Returns { value, text }. Throws Error with a readable message.
+  function evalMath(input) {
+    const src = String(input == null ? "" : input).trim();
+    if (!src) throw new Error("empty expression");
+    if (src.length > 300) throw new Error("expression too long (max 300 characters)");
+    const toks = mathTokens(src);
+    let p = 0;
+    let depth = 0;
+    const isOp = (t, v) => !!t && t.t === "op" && t.v === v;
+    const startsOperand = (t) => !!t && (t.t === "num" || t.t === "id" || isOp(t, "("));
+    const need = (v) => { if (!isOp(toks[p], v)) throw new Error("expected '" + v + "'"); p++; };
+
+    function parseExpr() {
+      if (++depth > 60) throw new Error("expression nested too deeply");
+      let v = parseTerm();
+      for (;;) {
+        if (isOp(toks[p], "+")) { p++; v = mAdd(v, parseTerm()); }
+        else if (isOp(toks[p], "-")) { p++; v = mSub(v, parseTerm()); }
+        else break;
+      }
+      depth--;
+      return v;
+    }
+    function parseTerm() {
+      let v = parseUnary();
+      for (;;) {
+        const t = toks[p];
+        if (isOp(t, "*")) { p++; v = mMul(v, parseUnary()); }
+        else if (isOp(t, "/")) { p++; v = mDiv(v, parseUnary()); }
+        else if (isOp(t, "%") && startsOperand(toks[p + 1])) { p++; v = mMod(v, parseUnary()); }
+        else if (t && (t.t === "id" || isOp(t, "("))) { v = mMul(v, parseUnary()); } // 2pi, 3(4+1)
+        else break;
+      }
+      return v;
+    }
+    function parseUnary() {
+      if (isOp(toks[p], "-")) { p++; return mNeg(parseUnary()); }
+      if (isOp(toks[p], "+")) { p++; return parseUnary(); }
+      return parsePower();
+    }
+    function parsePower() {
+      const base = parsePostfix();
+      if (isOp(toks[p], "^")) { p++; return mPow(base, parseUnary()); }
+      return base;
+    }
+    function parsePostfix() {
+      let v = parsePrimary();
+      for (;;) {
+        if (isOp(toks[p], "!")) { p++; v = mFact(v); }
+        else if (isOp(toks[p], "%") && !startsOperand(toks[p + 1])) { p++; v = toNum(v) / 100; } // 15% = 0.15
+        else break;
+      }
+      return v;
+    }
+    function parsePrimary() {
+      const t = toks[p];
+      if (!t) throw new Error("unexpected end of expression");
+      if (t.t === "num") {
+        p++;
+        if (HAS_BIGINT && /^\d+$/.test(t.v)) return BigInt(t.v);
+        return parseFloat(t.v);
+      }
+      if (isOp(t, "(")) { p++; const v = parseExpr(); need(")"); return v; }
+      if (t.t === "id") {
+        p++;
+        const has = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
+        if (has(MATH_CONSTS, t.v) && !isOp(toks[p], "(")) return MATH_CONSTS[t.v];
+        const spec = has(MATH_FN, t.v) ? MATH_FN[t.v] : null;
+        if (!spec) throw new Error("unknown name '" + t.v + "'");
+        let args = [];
+        if (isOp(toks[p], "(")) {
+          p++;
+          if (!isOp(toks[p], ")")) {
+            for (;;) {
+              args.push(parseExpr());
+              if (isOp(toks[p], ",")) { p++; continue; }
+              break;
+            }
+          }
+          need(")");
+        } else {
+          args = [parseUnary()]; // sqrt 16
+        }
+        if (args.length < spec[0] || args.length > spec[1]) {
+          throw new Error(t.v + " takes " + (spec[0] === spec[1] ? spec[0] : spec[0] + " to " + spec[1]) + " argument(s)");
+        }
+        return spec[2](args);
+      }
+      throw new Error("unexpected '" + t.v + "'");
+    }
+
+    const value = parseExpr();
+    if (p < toks.length) throw new Error("unexpected '" + toks[p].v + "'");
+    return { value: value, text: fmtMathResult(value) };
+  }
+
+  const MATH_TOOL = {
+    type: "function",
+    function: {
+      name: "calculate",
+      description:
+        "Exactly evaluate a math expression with JavaScript. Use it for ANY arithmetic, percentages, powers, roots, trigonometry, logarithms or factorials instead of calculating in your head. " +
+        "Supports + - * / % (modulo) ^ (power) ! (factorial), parentheses, constants pi e tau phi, and functions: " +
+        "sqrt cbrt abs sign floor ceil trunc round(x,digits) sin cos tan asin acos atan atan2 sinh cosh tanh (radians), sind cosd tand (degrees), deg rad, " +
+        "exp ln log (base 10) log2 log10 log(x,base) pow min max hypot gcd lcm mod fact. " +
+        "Whole numbers are exact (BigInt) for + - * ^ !. Write 15% as 15/100. No units or thousands separators. Call it once per separate calculation.",
+      parameters: {
+        type: "object",
+        properties: { expression: { type: "string", description: "For example: 15/100*2340 + sqrt(144)" } },
+        required: ["expression"],
+      },
+    },
+  };
+
+  function runMathTool(args) {
+    let expr = "";
+    try {
+      const a = typeof args === "string" ? JSON.parse(args || "{}") : (args || {});
+      expr = String(a.expression != null ? a.expression : a.expr != null ? a.expr : "");
+    } catch (e) {
+      return 'Error: arguments must be JSON like {"expression":"2+2"}';
+    }
+    try {
+      const r = evalMath(expr);
+      log("math:", expr, "=", r.text);
+      return expr + " = " + r.text;
+    } catch (e) {
+      return "Error: " + ((e && e.message) || "could not evaluate") + ". Use only numbers, + - * / % ^ ! parentheses and the listed functions.";
+    }
+  }
+
   // 🌸 Token + rate-limit info from the last Groq call, shown in the preview sheet.
   let lastUsage = null;
   const fmtNum = (n) => String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
@@ -1125,69 +1489,126 @@
       }
     }
 
-    const baseMessages = [
-      { role: "system", content: systemPrompt },
-      { role: "user", content: userContent(text, replyContext, forceAnswer) },
-    ];
-    const ask = async (messages) => {
-      const res = await fetch(GROQ_URL, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: "Bearer " + apiKey,
-        },
-        body: JSON.stringify({
-          model: MODELS.includes(storage.model) ? storage.model : DEFAULT_MODEL,
+    const answerMode = forceAnswer === true || storage.answerQuestions !== false;
+
+    // 🖼️ Images from the replied message are read by Qwen 3.8 27B (the vision model).
+    let images = [];
+    if (storage.readImages !== false && replyContext && replyContext.indexOf("reply_message:") !== -1) {
+      try { images = (getReplyImages() || []).slice(0, MAX_VISION_IMAGES); } catch (e) { images = []; }
+    }
+    let imagesOn = images.length > 0;
+    if (imagesOn) {
+      log("reading " + images.length + " replied image(s) with " + VISION_MODEL);
+      debugToast("info", "Reading " + images.length + " image" + (images.length === 1 ? "" : "s") + " with " + modelLabel(VISION_MODEL));
+    }
+
+    // 🧮 JS calculator tool: the model calls it for exact math instead of guessing.
+    const replyLine = (/- reply_message: "([^\n]*)/.exec(replyContext || "") || [])[1] || "";
+    const useMath = storage.mathTool !== false && answerMode && MATH_HINT.test(String(text || "") + " " + replyLine);
+
+    const buildBase = () => {
+      const typed = userContent(text, replyContext, forceAnswer);
+      let userMsg = typed;
+      if (imagesOn) {
+        const note = "The replied Discord message contains " + images.length + " image" + (images.length === 1 ? "" : "s") +
+          ", attached below. Use the image" + (images.length === 1 ? "" : "s") + " only when the speaker's text asks about or depends on " +
+          (images.length === 1 ? "it" : "them") + " (what is in it, read the text in it, what it means, reply to it). Never invent details that are not visible.\n\n";
+        userMsg = [{ type: "text", text: note + typed }].concat(images.map((u) => ({ type: "image_url", image_url: { url: u } })));
+      }
+      return [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userMsg },
+      ];
+    };
+
+    const ask = async (extra) => {
+      const msgs = buildBase().concat(extra || []);
+      for (let round = 0; ; round++) {
+        const model = imagesOn ? VISION_MODEL : (MODELS.includes(storage.model) ? storage.model : DEFAULT_MODEL);
+        const qwen = model.indexOf("qwen/") === 0;
+        const body = {
+          model: model,
           temperature: gen.temperature,
           top_p: gen.topP == null ? undefined : gen.topP,
-          reasoning_effort: gen.effort,
-          include_reasoning: false,
+          // Qwen: "default" = no reasoning tokens (fast); an effort chosen in Advanced settings is respected.
+          reasoning_effort: qwen ? (gen.effortSet ? gen.effort : "default") : gen.effort,
           max_completion_tokens: gen.maxTokens,
-          messages: messages,
-        }),
-        signal: controller ? controller.signal : undefined,
-      });
-      if (!res.ok) {
-        const err = new Error("HTTP " + res.status);
-        err.status = res.status;
-        throw err;
-      }
-      const data = await res.json();
-      try {
-        const u = data && data.usage;
-        if (u) {
-          usage.prompt += u.prompt_tokens || 0;
-          usage.completion += u.completion_tokens || 0;
-          usage.total += u.total_tokens || ((u.prompt_tokens || 0) + (u.completion_tokens || 0));
+          messages: msgs,
+        };
+        // include_reasoning and reasoning_format can't be mixed: gpt-oss uses the first, Qwen the second.
+        if (qwen) body.reasoning_format = "hidden";
+        else body.include_reasoning = false;
+        if (useMath) {
+          body.tools = [MATH_TOOL];
+          body.tool_choice = round < MAX_TOOL_ROUNDS ? "auto" : "none";
         }
-        const rt = hdrNum(res, "x-ratelimit-remaining-tokens");
-        if (rt != null) usage.remTokens = rt;
-        const lt = hdrNum(res, "x-ratelimit-limit-tokens");
-        if (lt != null) usage.limTokens = lt;
-        const rr = hdrNum(res, "x-ratelimit-remaining-requests");
-        if (rr != null) usage.remReq = rr;
-        const lr = hdrNum(res, "x-ratelimit-limit-requests");
-        if (lr != null) usage.limReq = lr;
-        const rs = hdrStr(res, "x-ratelimit-reset-tokens");
-        if (rs) usage.resetTokens = rs;
-      } catch (e) {}
-      let out = data && data.choices && data.choices[0] && data.choices[0].message
-        ? String(data.choices[0].message.content || "").trim()
-        : "";
-      if (out.length > 1 && out[0] === '"' && out[out.length - 1] === '"') out = out.slice(1, -1).trim();
-      if (!out) throw new Error("Empty response");
-      return out;
+        const res = await fetch(GROQ_URL, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: "Bearer " + apiKey,
+          },
+          body: JSON.stringify(body),
+          signal: controller ? controller.signal : undefined,
+        });
+        if (!res.ok) {
+          if (res.status === 400 && imagesOn) {
+            // An image was rejected (format, size or unreachable link): retry once as text only.
+            log("image request rejected (400), retrying text-only");
+            imagesOn = false;
+            return ask(extra);
+          }
+          const err = new Error("HTTP " + res.status);
+          err.status = res.status;
+          throw err;
+        }
+        const data = await res.json();
+        try {
+          const u = data && data.usage;
+          if (u) {
+            usage.prompt += u.prompt_tokens || 0;
+            usage.completion += u.completion_tokens || 0;
+            usage.total += u.total_tokens || ((u.prompt_tokens || 0) + (u.completion_tokens || 0));
+          }
+          const rt = hdrNum(res, "x-ratelimit-remaining-tokens");
+          if (rt != null) usage.remTokens = rt;
+          const lt = hdrNum(res, "x-ratelimit-limit-tokens");
+          if (lt != null) usage.limTokens = lt;
+          const rr = hdrNum(res, "x-ratelimit-remaining-requests");
+          if (rr != null) usage.remReq = rr;
+          const lr = hdrNum(res, "x-ratelimit-limit-requests");
+          if (lr != null) usage.limReq = lr;
+          const rs = hdrStr(res, "x-ratelimit-reset-tokens");
+          if (rs) usage.resetTokens = rs;
+        } catch (e) {}
+        const msg = data && data.choices && data.choices[0] && data.choices[0].message;
+        const calls = msg && Array.isArray(msg.tool_calls) ? msg.tool_calls : [];
+        if (useMath && calls.length && round < MAX_TOOL_ROUNDS) {
+          msgs.push({ role: "assistant", content: msg.content || "", tool_calls: calls });
+          for (let i = 0; i < calls.length; i++) {
+            const c = calls[i] || {};
+            const fn = c.function || {};
+            const result = fn.name === "calculate" ? runMathTool(fn.arguments) : "Error: unknown tool";
+            msgs.push({ role: "tool", tool_call_id: c.id, content: result });
+          }
+          continue;
+        }
+        let out = msg ? String(msg.content || "").trim() : "";
+        if (out.length > 1 && out[0] === '"' && out[out.length - 1] === '"') out = out.slice(1, -1).trim();
+        if (!out) throw new Error("Empty response");
+        return out;
+      }
     };
     try {
-      let out = await ask(baseMessages);
+      let out = await ask();
       // Answer tag used but the model only repeated the text: ask once more, explicitly.
       if (forceAnswer === true && looksLikeEcho(out, text)) {
         log("forced answer came back as an echo, retrying once");
         try {
-          out = await ask(baseMessages.concat([
+          out = await ask([
             { role: "assistant", content: out },
             { role: "user", content: "That only repeated the typed text. Do not rewrite it. Write the actual answer or reply now, using the Discord context and general knowledge, and say what the context shows if it only partly answers. Output only the message." },
-          ]));
+          ]);
         } catch (e2) {
           log("echo retry failed", e2 && e2.message);
         }
@@ -1248,7 +1669,7 @@
         names = list.map((m) => m && m.id).filter(Boolean);
       } catch (e) {}
       const hasModel = names.indexOf(model) !== -1;
-      const short = model.replace("openai/", "");
+      const short = modelLabel(model);
       const summary = hasModel
         ? "OK · Groq key valid (" + names.length + " models, " + short + " available, " + ms + " ms)"
         : "OK · Groq key valid (" + names.length + " models) but " + short + " not listed (" + ms + " ms)";
@@ -1416,7 +1837,7 @@
     try { return SelectedChannelStore ? SelectedChannelStore.getChannelId() : undefined; } catch (e) { return undefined; }
   }
 
-  const { buildPayloadContext, formatContext, findReplyRef, getReplyTarget, getReplyMention, clearPending, start: startReplyWatch, stop: stopReplyWatch } = createReplyContext({ metro, log, notify: debugToast });
+  const { buildPayloadContext, formatContext, getReplyImages, findReplyRef, getReplyTarget, getReplyMention, clearPending, start: startReplyWatch, stop: stopReplyWatch } = createReplyContext({ metro, log, notify: debugToast });
 
   // Light/dark detection: Discord's own theme first, system scheme as fallback.
   function isLightTheme() {
@@ -2259,6 +2680,8 @@
       group("General ⚙️", [
         sw("Auto-rewrite all messages", storage.autoRewrite, onAutoRewriteToggle, "No /ai-writer-magic needed"),
         sw("Auto-answer questions", storage.answerQuestions !== false, (v) => { storage.answerQuestions = v; }, "Math, translations, and other answers. Start a message with !~{ans} or [Answer] to force it for that message"),
+        sw("JS calculator for math", storage.mathTool !== false, (v) => { storage.mathTool = v; },
+          "Answers are calculated exactly with JavaScript (percentages, roots, powers, trig, big numbers) instead of guessed by the AI"),
         sw("Preview before sending", storage.previewBeforeSend !== false, (v) => { storage.previewBeforeSend = v; }, "Send / Edit / Copy prompt / Cancel"),
       ]),
       group("Skip auto-rewrite for 🚫", [
@@ -2267,7 +2690,7 @@
         sw("Bot commands", storage.skipBotCommands !== false, (v) => { storage.skipBotCommands = v; }, "Prefix commands like !help, .play, $work"),
       ]),
       group("Timing ⏱️", [durationRow]),
-      group("AI Model 🧠", MODELS.map((m) => pick(m.replace("openai/", ""), m === model, () => { storage.model = m; }))),
+      group("AI Model 🧠", MODELS.map((m) => pick(modelLabel(m), m === model, () => { storage.model = m; }))),
       group("AI Personality 🎨", [
         ...PERSONALITY_OPTIONS.map((opt) => pick(opt, opt === personality, () => { storage.personality = opt; })),
         customField,
@@ -2280,6 +2703,8 @@
               storage.ctxIncludeOthers !== false ? "Messages from everyone nearby, not just the reply target" : "Only the reply target's messages")
           : null,
         ctxPanel,
+        sw("Read images in replied messages", storage.readImages !== false, (v) => { storage.readImages = v; },
+          "Replies to a message with images (attachments, embeds, image links) are read by Qwen 3.8 27B vision. Up to 3 images, about 2,048 tokens each"),
       ]),
       group("Advanced 🛠️", [
         sw("Advanced settings", advancedOn, onAdvancedToggle,
