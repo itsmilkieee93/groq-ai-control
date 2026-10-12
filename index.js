@@ -452,9 +452,7 @@
     }
 
     // Last N messages from one user (merged into "Messages around reply target").
-    const HISTORY_OPTIONS = [0, 3, 5, 10, 15, 20];
-    const HISTORY_DEF = 5;
-    const HISTORY_COUNT = HISTORY_DEF; // fallback if ctxSize not yet available
+    // HISTORY_OPTIONS and HISTORY_DEF are defined in outer scope.
 
     function guildIdOf(channelId, msg) {
       try {
@@ -492,7 +490,7 @@
     function userHistoryLines(channelId, userId) {
       if (!channelId || !userId) return [];
       if (storage.ctxWindow === false) return [];
-      const n = typeof ctxSize === "function" ? ctxSize("ctxHistory", 5) : 5;
+      const n = typeof ctxSize === "function" ? ctxSize("ctxHistory", HISTORY_DEF) : HISTORY_DEF;
       if (n <= 0) return [];
       const mine = getChannelMessages(channelId)
         .filter((m) => authorOf(m).id === String(userId) && textOfMessage(m))
@@ -965,6 +963,8 @@
   const CTX_AFTER_DEF = 6;
   const CTX_BEFORE_OPTIONS = [0, 2, 4, 6, 10];
   const CTX_AFTER_OPTIONS = [0, 3, 6, 10, 15];
+  const HISTORY_OPTIONS = [0, 3, 5, 10, 15, 20];
+  const HISTORY_DEF = 5;
 
   function ctxSize(key, def) {
     const n = parseInt(storage[key], 10);
