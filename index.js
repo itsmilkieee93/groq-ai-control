@@ -1000,11 +1000,103 @@
     return false;
   }
 
+  // 🌸 Web search via Exa (direct) or Composio Exa connector.
+  // Used to ground answers when search is enabled and a key is present.
+  async function searchWeb(query) {
+    const q = String(query || "").trim();
+    if (!q || q.length < 3) return null;
+    const exaKey = (storage.exaApiKey || "").trim();
+    const composioKey = (storage.composioApiKey || "").trim();
+
+    // Prefer direct Exa if key is set.
+    if (exaKey) {
+      try {
+        const res = await fetch("https://api.exa.ai/search", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": "Bearer " + exaKey,
+          },
+          body: JSON.stringify({
+            query: q,
+            type: "auto",
+            numResults: 5,
+            contents: { highlights: true, text: { maxCharacters: 400 } },
+          }),
+        });
+        if (!res.ok) {
+          log("Exa search failed", res.status);
+          return null;
+        }
+        const data = await res.json();
+        const results = (data && data.results) || [];
+        if (!results.length) return null;
+        return results.slice(0, 5).map((r, i) => {
+          const title = r.title || "Untitled";
+          const url = r.url || "";
+          const snippet = (r.highlights && r.highlights[0]) || (r.text || "").slice(0, 300);
+          return (i + 1) + ". " + title + "\n   " + url + "\n   " + snippet;
+        }).join("\n\n");
+      } catch (e) {
+        log("Exa search error", e && e.message);
+        return null;
+      }
+    }
+
+    // Fallback to Composio Exa connector (COMPOSIO_SEARCH_WEB).
+    if (composioKey) {
+      try {
+        const res = await fetch("https://backend.composio.dev/api/v3.1/tools/execute/COMPOSIO_SEARCH_WEB", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-api-key": composioKey,
+          },
+          body: JSON.stringify({
+            arguments: { query: q },
+            user_id: "discord-ai-writer",
+          }),
+        });
+        if (!res.ok) {
+          log("Composio Exa search failed", res.status);
+          return null;
+        }
+        const data = await res.json();
+        // Response shape varies; try to extract useful text.
+        const answer = data && data.data && (data.data.answer || data.data.results && data.data.results.answer);
+        const citations = data && data.data && data.data.results && data.data.results.citations;
+        let out = "";
+        if (answer) out += answer + "\n\n";
+        if (Array.isArray(citations)) {
+          out += citations.slice(0, 5).map((c, i) => (i + 1) + ". " + (c.title || c.url || "source") + (c.url ? "\n   " + c.url : "")).join("\n");
+        }
+        return out.trim() || null;
+      } catch (e) {
+        log("Composio Exa search error", e && e.message);
+        return null;
+      }
+    }
+    return null;
+  }
+
   async function callGroq(apiKey, text, replyContext = "", forceAnswer = false) {
     const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
     const gen = getGenParams(forceAnswer);
     const timer = controller ? setTimeout(() => controller.abort(), gen.timeoutMs) : null;
-    const systemPrompt = buildSystemPrompt(forceAnswer) + (replyContext ? "\n\n" + replyContext : "");
+    let systemPrompt = buildSystemPrompt(forceAnswer) + (replyContext ? "\n\n" + replyContext : "");
+
+    // 🌸 Optional web search grounding for answers.
+    if (forceAnswer && storage.searchEnabled === true) {
+      const searchQuery = String(text || "").replace(/^[!~\[]?(ans|answer)\]?\s*/i, "").trim().slice(0, 200);
+      if (searchQuery.length >= 4) {
+        const results = await searchWeb(searchQuery);
+        if (results) {
+          systemPrompt += "\n\nWeb search results (use these to ground your answer, cite sources when relevant):\n" + results;
+          log("web search injected for answer");
+        }
+      }
+    }
+
     const baseMessages = [
       { role: "system", content: systemPrompt },
       { role: "user", content: userContent(text, replyContext, forceAnswer) },
@@ -1819,6 +1911,8 @@
     const native = !!(TableRowGroup && TableSwitchRow && TableRow);
 
     const [newKey, setNewKey] = React.useState("");
+    const [composioKeyInput, setComposioKeyInput] = React.useState(storage.composioApiKey || "");
+    const [exaKeyInput, setExaKeyInput] = React.useState(storage.exaApiKey || "");
     const [testState, setTestState] = React.useState({}); // key id -> { busy, ok, text }
     const [testingAll, setTestingAll] = React.useState(false);
     const [customPrompt, setCustomPrompt] = React.useState(
@@ -2178,6 +2272,33 @@
             )
           : null,
       ]),
+      group("Web Search 🔍", [
+        sw("Enable web search for answers", storage.searchEnabled === true, (v) => { storage.searchEnabled = v; },
+          "When answering questions, search the web first via Exa or Composio Exa to ground replies"),
+        h(View, { style: { paddingHorizontal: 16, paddingVertical: 12, backgroundColor: ROW_BG } },
+          inputField("Exa API key (direct, preferred)", {
+            value: exaKeyInput,
+            placeholder: "exa-...",
+            autoCapitalize: "none",
+            autoCorrect: false,
+            secureTextEntry: true,
+            onChangeText: (t) => { setExaKeyInput(t); storage.exaApiKey = t.trim(); },
+          })
+        ),
+        h(View, { style: { paddingHorizontal: 16, paddingBottom: 12, backgroundColor: ROW_BG } },
+          inputField("Composio API key (fallback connector)", {
+            value: composioKeyInput,
+            placeholder: "composio key...",
+            autoCapitalize: "none",
+            autoCorrect: false,
+            secureTextEntry: true,
+            onChangeText: (t) => { setComposioKeyInput(t); storage.composioApiKey = t.trim(); },
+          })
+        ),
+        h(Text, { style: { color: P.muted, fontSize: 12, paddingHorizontal: 16, paddingBottom: 12, backgroundColor: ROW_BG } },
+          "Direct Exa is used if its key is set. Otherwise the Composio Exa connector (COMPOSIO_SEARCH_WEB) is used. Get an Exa key at dashboard.exa.ai or a Composio key at app.composio.dev."
+        ),
+      ]),
       footer,
     ];
 
@@ -2363,7 +2484,9 @@
     Object.keys(ADV_SPEC).forEach((k) => {
       if (!Number.isFinite(parseFloat(storage[ADV_SPEC[k].key]))) storage[ADV_SPEC[k].key] = ADV_SPEC[k].def;
     });
-    if (!MODELS.includes(storage.model)) storage.model = DEFAULT_MODEL;
+    if (typeof storage.searchEnabled !== "boolean") storage.searchEnabled = false;
+    if (typeof storage.composioApiKey !== "string") storage.composioApiKey = "";
+    if (typeof storage.exaApiKey !== "string") storage.exaApiKey = "";
 
     try { patchSettingsScreen(); } catch (e) { log("settings patch error", e && e.message); }
     try { startReplyWatch(); } catch (e) { log("reply watch error", e && e.message); }
