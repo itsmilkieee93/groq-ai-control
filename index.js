@@ -1106,10 +1106,13 @@
       }
     }
 
-    // Fallback to Composio Exa connector (COMPOSIO_SEARCH_WEB).
+    // Fallback to Composio Exa connector.
+    // Uses COMPOSIO_SEARCH_WEB (which calls Exa under the hood) or EXA_SEARCH.
     if (composioKey) {
       try {
-        const res = await fetch("https://backend.composio.dev/api/v3.1/tools/execute/COMPOSIO_SEARCH_WEB", {
+        // Try COMPOSIO_SEARCH_WEB first (simple query param).
+        const toolSlug = "COMPOSIO_SEARCH_WEB";
+        const res = await fetch("https://backend.composio.dev/api/v3.1/tools/execute/" + toolSlug, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -1118,24 +1121,45 @@
           body: JSON.stringify({
             arguments: { query: q },
             user_id: "discord-ai-writer",
+            version: "latest",
           }),
         });
         if (!res.ok) {
-          log("Composio Exa search failed", res.status);
+          log("Composio search failed", res.status, await res.text().catch(() => ""));
           return null;
         }
         const data = await res.json();
-        // Response shape varies; try to extract useful text.
-        const answer = data && data.data && (data.data.answer || data.data.results && data.data.results.answer);
-        const citations = data && data.data && data.data.results && data.data.results.citations;
+        if (!data || data.successful === false) {
+          log("Composio search unsuccessful", data && data.error);
+          return null;
+        }
+        // Parse various response shapes for search results.
+        const d = data.data || data;
         let out = "";
-        if (answer) out += answer + "\n\n";
-        if (Array.isArray(citations)) {
-          out += citations.slice(0, 5).map((c, i) => (i + 1) + ". " + (c.title || c.url || "source") + (c.url ? "\n   " + c.url : "")).join("\n");
+        // COMPOSIO_SEARCH_WEB style
+        if (d.answer) out += d.answer + "\n\n";
+        if (d.results && d.results.answer) out += d.results.answer + "\n\n";
+        const citations = (d.results && d.results.citations) || d.citations || d.results || [];
+        if (Array.isArray(citations) && citations.length) {
+          out += citations.slice(0, 5).map((c, i) => {
+            const title = c.title || c.name || "Result";
+            const url = c.url || c.link || "";
+            const snippet = c.snippet || c.text || c.highlight || "";
+            return (i + 1) + ". " + title + (url ? "\n   " + url : "") + (snippet ? "\n   " + String(snippet).slice(0, 250) : "");
+          }).join("\n\n");
+        }
+        // EXA_SEARCH style (results array)
+        if (!out && Array.isArray(d.results)) {
+          out = d.results.slice(0, 5).map((r, i) => {
+            const title = r.title || "Untitled";
+            const url = r.url || "";
+            const snippet = (r.highlights && r.highlights[0]) || r.text || "";
+            return (i + 1) + ". " + title + "\n   " + url + "\n   " + String(snippet).slice(0, 250);
+          }).join("\n\n");
         }
         return out.trim() || null;
       } catch (e) {
-        log("Composio Exa search error", e && e.message);
+        log("Composio search error", e && e.message);
         return null;
       }
     }
@@ -1426,7 +1450,17 @@
     },
   };
 
-  function runMathTool(args) {
+  // 🪜 Used while the JS calculator is live: the AI still writes its own short steps, JS supplies every number.
+  const MATH_STEPS_RULES =
+    "MATH STEPS: you have a `calculate` tool that is exact. Still show your working as a short step-by-step in your own words, " +
+    "one step per line (2 to 6 brief lines), and end with the final answer on the last line. " +
+    "Run every numeric calculation through `calculate` and copy its result into the steps exactly, never recompute numbers in your head. " +
+    "Each step says what is being done and its result, for example: 'Take 15% of 2340: 351'. " +
+    "The final answer must be the exact result of the last `calculate` call. " +
+    "Do not paste the raw tool expression or mention the tool or JavaScript. " +
+    "A single trivial operation can be one line that already ends in the answer.";
+
+  function runMathTool(args, withSteps, sink) {
     let expr = "";
     try {
       const a = typeof args === "string" ? JSON.parse(args || "{}") : (args || {});
@@ -1437,10 +1471,28 @@
     try {
       const r = evalMath(expr);
       log("math:", expr, "=", r.text);
-      return expr + " = " + r.text;
+      if (sink) sink.push(r.text);
+      return expr + " = " + r.text + (withSteps ? "\n(Use this exact value in your step-by-step.)" : "");
     } catch (e) {
       return "Error: " + ((e && e.message) || "could not evaluate") + ". Use only numbers, + - * / % ^ ! parentheses and the listed functions.";
     }
+  }
+
+  // 🪜 True when the AI's final text really contains the last JS result (commas ignored, tiny rounding allowed).
+  function answerUsesMath(out, results) {
+    if (!results || !results.length) return true;
+    const last = String(results[results.length - 1]);
+    const hay = String(out).replace(/(\d),(?=\d{3}(?!\d))/g, "$1");
+    const v = Number(last);
+    if (!/^-?\d+$/.test(last) && hay.indexOf(last) !== -1) return true;
+    if (!isFinite(v)) return true; // huge BigInt text: can't compare reliably, don't force a retry
+    const nums = hay.match(/-?\d+(?:\.\d+)?(?:e[+-]?\d+)?/gi) || [];
+    return nums.some((n) => {
+      const x = Number(n);
+      if (!isFinite(x)) return false;
+      if (/^-?\d+$/.test(last)) return x === v; // whole-number results must match exactly
+      return Math.abs(x - v) <= Math.max(Math.abs(v) * 0.005, 0.01); // decimals: allow rounding
+    });
   }
 
   // 🌸 Token + rate-limit info from the last Groq call, shown in the preview sheet.
@@ -1456,6 +1508,22 @@
   const hdrStr = (res, name) => {
     try { return (res && res.headers && res.headers.get && res.headers.get(name)) || null; } catch (e) { return null; }
   };
+  // Groq sends reset times like "59.56s", "2m59.56s" or "1h2m3s". Returns milliseconds, or null.
+  function parseResetMs(str) {
+    if (!str) return null;
+    const re = /(\d+(?:\.\d+)?)(ms|d|h|m|s)/g;
+    const unit = { ms: 1, s: 1000, m: 60000, h: 3600000, d: 86400000 };
+    let ms = 0, found = false, m;
+    while ((m = re.exec(String(str)))) { ms += parseFloat(m[1]) * unit[m[2]]; found = true; }
+    return found ? ms : null;
+  }
+  function fmtClock(ts) {
+    try {
+      const d = new Date(ts);
+      const p = (n) => (n < 10 ? "0" : "") + n;
+      return p(d.getHours()) + ":" + p(d.getMinutes()) + (d.toDateString() !== new Date().toDateString() ? " tomorrow" : "");
+    } catch (e) { return ""; }
+  }
   function formatUsage(u) {
     if (!u) return null;
     const lines = [];
@@ -1463,14 +1531,21 @@
     if (u.remTokens != null) {
       lines.push("Tokens left: " + fmtNum(u.remTokens) + (u.limTokens != null ? " / " + fmtNum(u.limTokens) : "") + " per min" + (u.resetTokens ? " (resets in " + u.resetTokens + ")" : ""));
     }
-    if (u.remReq != null) {
-      lines.push("Requests left: " + fmtNum(u.remReq) + (u.limReq != null ? " / " + fmtNum(u.limReq) : "") + " per day");
+    if (u.remReq != null || u.resetReq) {
+      // 🕒 When the request quota (per day) resets: relative time from Groq plus the clock time it works out to.
+      const at = u.resetReqAt ? fmtClock(u.resetReqAt) : "";
+      const reset = u.resetReq ? "resets in " + u.resetReq + (at ? " · at " + at : "") : "";
+      if (u.remReq != null) {
+        lines.push("Requests left: " + fmtNum(u.remReq) + (u.limReq != null ? " / " + fmtNum(u.limReq) : "") + " per day" + (reset ? " (" + reset + ")" : ""));
+      } else {
+        lines.push("Requests " + reset.replace(/^resets/, "reset"));
+      }
     }
     return lines.length ? lines : null;
   }
 
   async function callGroq(apiKey, text, replyContext = "", forceAnswer = false) {
-    const usage = { prompt: 0, completion: 0, total: 0, remTokens: null, limTokens: null, remReq: null, limReq: null, resetTokens: null };
+    const usage = { prompt: 0, completion: 0, total: 0, remTokens: null, limTokens: null, remReq: null, limReq: null, resetTokens: null, resetReq: null, resetReqAt: null };
     lastUsage = usage;
     const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
     const gen = getGenParams(forceAnswer);
@@ -1505,6 +1580,10 @@
     // 🧮 JS calculator tool: the model calls it for exact math instead of guessing.
     const replyLine = (/- reply_message: "([^\n]*)/.exec(replyContext || "") || [])[1] || "";
     const useMath = storage.mathTool !== false && answerMode && MATH_HINT.test(String(text || "") + " " + replyLine);
+    // 🪜 AI steps stay on even though the JS calculator does the arithmetic.
+    const mathSteps = useMath; // steps always come with the JS calculator (single "JS math + AI steps" switch)
+    const mathResults = []; // exact JS results of this answer, used to check the AI's steps
+    let mathChecked = false;
 
     const buildBase = () => {
       const typed = userContent(text, replyContext, forceAnswer);
@@ -1516,13 +1595,14 @@
         userMsg = [{ type: "text", text: note + typed }].concat(images.map((u) => ({ type: "image_url", image_url: { url: u } })));
       }
       return [
-        { role: "system", content: systemPrompt },
+        { role: "system", content: mathSteps ? systemPrompt + "\n\n" + MATH_STEPS_RULES : systemPrompt },
         { role: "user", content: userMsg },
       ];
     };
 
     const ask = async (extra) => {
       const msgs = buildBase().concat(extra || []);
+      mathResults.length = 0;
       for (let round = 0; ; round++) {
         const model = imagesOn ? VISION_MODEL : (MODELS.includes(storage.model) ? storage.model : DEFAULT_MODEL);
         const qwen = model.indexOf("qwen/") === 0;
@@ -1580,6 +1660,12 @@
           if (lr != null) usage.limReq = lr;
           const rs = hdrStr(res, "x-ratelimit-reset-tokens");
           if (rs) usage.resetTokens = rs;
+          const rrs = hdrStr(res, "x-ratelimit-reset-requests");
+          if (rrs) {
+            usage.resetReq = rrs;
+            const rms = parseResetMs(rrs);
+            usage.resetReqAt = rms != null ? Date.now() + rms : null;
+          }
         } catch (e) {}
         const msg = data && data.choices && data.choices[0] && data.choices[0].message;
         const calls = msg && Array.isArray(msg.tool_calls) ? msg.tool_calls : [];
@@ -1588,7 +1674,7 @@
           for (let i = 0; i < calls.length; i++) {
             const c = calls[i] || {};
             const fn = c.function || {};
-            const result = fn.name === "calculate" ? runMathTool(fn.arguments) : "Error: unknown tool";
+            const result = fn.name === "calculate" ? runMathTool(fn.arguments, mathSteps, mathResults) : "Error: unknown tool";
             msgs.push({ role: "tool", tool_call_id: c.id, content: result });
           }
           continue;
@@ -1596,6 +1682,15 @@
         let out = msg ? String(msg.content || "").trim() : "";
         if (out.length > 1 && out[0] === '"' && out[out.length - 1] === '"') out = out.slice(1, -1).trim();
         if (!out) throw new Error("Empty response");
+        // 🪜 The steps must be built on the JS results: if the final text doesn't contain them, ask once to fix it.
+        if (mathSteps && mathResults.length && !mathChecked && !answerUsesMath(out, mathResults)) {
+          mathChecked = true;
+          log("steps don't match the JS result, asking for a fix:", mathResults.join("; "));
+          msgs.push({ role: "assistant", content: out });
+          msgs.push({ role: "user", content: "Your steps must use the exact JavaScript results: " + mathResults.join("; ") +
+            ". Rewrite the short step-by-step so every number comes from these results and the last line is the correct final answer. Output only the message." });
+          continue;
+        }
         return out;
       }
     };
@@ -2360,6 +2455,27 @@
         )
       ),
       h(View, null,
+        h(Text, { style: noteHead }, "How to get an Exa API key (recommended for web search)"),
+        h(Text, { style: noteText },
+          "1. Go to ", link("dashboard.exa.ai", "https://dashboard.exa.ai"), " and sign up or log in.\n" +
+          "2. Open ", link("API Keys", "https://dashboard.exa.ai/api-keys"), " and create a new key.\n" +
+          "3. Copy the key (it starts with exa-).\n" +
+          "4. In the Web Search section above, paste it into the Exa API key field.\n\n" +
+          "Direct Exa is faster and simpler. New accounts get free credits. See the ",
+          link("Exa docs", "https://exa.ai/docs"), " for more."
+        )
+      ),
+      h(View, null,
+        h(Text, { style: noteHead }, "How to get a Composio API key (optional fallback)"),
+        h(Text, { style: noteText },
+          "1. Go to ", link("app.composio.dev", "https://app.composio.dev"), " and sign up or log in.\n" +
+          "2. Create or select a project, then go to Settings → API Keys and create a key.\n" +
+          "3. Copy the key.\n" +
+          "4. Paste it into the Composio API key field in the Web Search section above.\n\n" +
+          "This uses Composio's Exa connector (COMPOSIO_SEARCH_WEB). You may need to enable the Exa or Composio Search toolkit in your project. Prefer the direct Exa key when possible."
+        )
+      ),
+      h(View, null,
         h(Text, { style: noteHead }, "Privacy"),
         h(Text, { style: noteText },
           "AI Writer Magic sends your typed text, plus the reply context you enabled (the replied-to message, nearby messages and their usernames), " +
@@ -2680,10 +2796,10 @@
       group("General ⚙️", [
         sw("Auto-rewrite all messages", storage.autoRewrite, onAutoRewriteToggle, "No /ai-writer-magic needed"),
         sw("Auto-answer questions", storage.answerQuestions !== false, (v) => { storage.answerQuestions = v; }, "Math, translations, and other answers. Start a message with !~{ans} or [Answer] to force it for that message"),
-        sw("JS calculator for math", storage.mathTool !== false, (v) => { storage.mathTool = v; },
-          "Answers are calculated exactly with JavaScript (percentages, roots, powers, trig, big numbers) instead of guessed by the AI"),
+        sw("Auto Math Explainer", storage.mathTool !== false, (v) => { storage.mathTool = v; },
+          "Numbers are calculated exactly with JavaScript (percentages, roots, powers, trig, big numbers) and the AI writes short steps built from those results, re-checked against them"),
         sw("Preview before sending", storage.previewBeforeSend !== false, (v) => { storage.previewBeforeSend = v; }, "Send / Edit / Copy prompt / Cancel"),
-      ]),
+      ]), 
       group("Skip auto-rewrite for 🚫", [
         sw("Pings", storage.skipMentions !== false, (v) => { storage.skipMentions = v; }, "@user, @role, @everyone, @here"),
         sw("Links", storage.skipLinks !== false, (v) => { storage.skipLinks = v; }, "http(s) links, www., Discord invites"),
