@@ -678,7 +678,7 @@
     "The text is either a chat message the speaker is about to send, or a short instruction about what to reply. " +
     "If it is a question or request with an objective answer (math, facts, translations, definitions, 'say hi in Japanese'), do NOT repeat it: " +
     "write the final answer itself as the chat message, ready to send, and compute math carefully. " +
-    "For math, logic and how/why questions show a short step-by-step (a few brief lines, one step per line) ending with the final answer; " +
+    "For math, logic and how/why questions show a short step-by-step in natural words (a few brief lines, one step per line) ending with the final answer; " +
     "for simple translations or 'say X' requests just give the answer. " +
     "If it asks about what was said or meant in the Discord context ('what is he talking about', 'what does that mean', 'who is that', 'what happened'), " +
     "answer it yourself from that context as the message, ready to send; if the context does not contain the answer, just rewrite the question instead of guessing. " +
@@ -702,7 +702,7 @@
     "A leading 'reply,', 'answer,', 'respond,' or 'say' is an instruction, not part of the question. " +
     "Never repeat, restate or lightly rephrase the typed text, and never answer with the same question back. Lead with the answer. " +
     "Use the Discord context (reply target, nearby messages, who said what) together with general knowledge. " +
-    "For math or logic show a few short lines ending with the final answer; for translations or 'say X' requests just give the result. " +
+    "For math or logic show a few short natural-language lines ending with the final answer; for translations or 'say X' requests just give the result. " +
     "If the context only partly covers a question about a person or an event, say what the messages show, in a casual voice ('from what i can see...'); do not refuse or echo the question. " +
     "If neither the context nor general knowledge can answer it, say so in one short natural line ('no clue tbh'). Never invent facts about real people (job, age, location, history). " +
     "IDENTITY: 'me', 'my', 'mine', 'myself' and 'I' mean the SPEAKER (the discord_* fields); 'he', 'she', 'they', 'him', 'her' or 'that person' usually mean the REPLY TARGET (the reply_discord_* fields) unless a name is given. " +
@@ -1427,8 +1427,9 @@
 
   // 🪜 Used while the JS calculator is live: the AI still writes its own short steps, JS supplies every number.
   const MATH_STEPS_RULES =
-    "MATH: show a short step-by-step in your own words, one brief line per step (2 to 6 lines), the last line being the final answer. " +
-    "Run every numeric calculation through `calculate` and copy its result exactly; never work numbers out yourself. " +
+    "MATH: explain the working in natural language, like a friend talking it through: one short line per step saying what you do and what it gives " +
+    "(2 to 6 lines), in the language of the typed text and in the Style above (your personality), and the last line is the final answer. " +
+    "Run every numeric calculation through `calculate` and copy its result exactly (grouping thousands with commas is fine); never work numbers out yourself. " +
     "The final answer is the last `calculate` result. Do not show raw expressions or mention the tool or JavaScript. One trivial operation can be one line.";
 
   function runMathTool(args, withSteps, sink) {
@@ -1609,11 +1610,14 @@
     const traceMode = mathIsMain && !!mathPre.trace;
     if (traceMode) {
       systemPrompt += "\n\nJS solved \"" + mathPre.expr + "\" exactly, step by step: " + mathPre.trace.join("; ") + ". Result: " + mathPre.text +
-        ". Present these steps as short lines (merge trivial ones if there are many) ending with the final answer " + mathPre.text + ". Do not recalculate.";
+        ". Explain it in natural language, like a friend talking it through: one short line per step saying what is done and what it gives " +
+        "(for example 'first 181 times 81 gives 14661'), in the language of the typed text and in the Style above (your personality), not as a raw list of equations. " +
+        "You may group thousands with commas and merge trivial steps, but every number you mention must be one JS gave. Do not recalculate. " +
+        "The last line is the final answer " + mathPre.text + ".";
       log("math trace:", mathPre.expr, "=", mathPre.text);
     } else if (mathIsMain) {
       systemPrompt += "\n\nJS pre-check (exact): the typed text contains \"" + mathPre.expr + "\", which JavaScript calculated as " + mathPre.text +
-        ". If the question asks for that calculation, use this exact value and still show short steps. Ignore it if the text is about something else.";
+        ". If the question asks for that calculation, use this exact value and explain the working in short natural-language steps. Ignore it if the text is about something else.";
       log("math pre-check:", mathPre.expr, "=", mathPre.text);
     }
 
