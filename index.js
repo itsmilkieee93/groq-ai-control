@@ -380,6 +380,7 @@
     const DISCORD_EPOCH = 1420070400000;
     // Window size, on/off and "include other people" are all user settings (Reply Context group).
     const WINDOW_LINE_MAX = 200;
+    const LEAN_LINE_MAX = 140; // [Answer] mode: shorter lines to keep the input small
 
     function snowflakeToMs(id) {
       const n = Number(String(id || ""));
@@ -427,32 +428,32 @@
       return { items: all.slice(start, end), anchorId: String(anchorId), hiddenBefore: start, hiddenAfter: all.length - end };
     }
 
-    function windowLines(win) {
+    function windowLines(win, lean) {
       if (!win || !win.items.length) return [];
+      const lineMax = lean ? LEAN_LINE_MAX : WINDOW_LINE_MAX;
       const selfId = getSelfIdentity().id;
       const out = [];
-      if (win.hiddenBefore > 0) out.push("... (" + win.hiddenBefore + " earlier messages not shown)");
+      if (!lean && win.hiddenBefore > 0) out.push("... (" + win.hiddenBefore + " earlier messages not shown)");
       for (let i = 0; i < win.items.length; i++) {
         const m = win.items[i];
         const isAnchor = String(m.id) === win.anchorId;
-        const text = textOfMessage(m).replace(/\s+/g, " ").trim().slice(0, WINDOW_LINE_MAX);
+        const text = textOfMessage(m).replace(/\s+/g, " ").trim().slice(0, lineMax);
         if (!text && !isAnchor) continue;
         const who = authorOf(m);
         const name = who.globalName || who.username || who.id || "unknown";
         const ms = snowflakeToMs(m.id);
-        const when = ms ? new Date(ms).toISOString().slice(11, 16) + "Z" : "";
+        const when = !lean && ms ? new Date(ms).toISOString().slice(11, 16) + "Z" : "";
         const flags = [];
         if (isAnchor) flags.push(">>> REPLY TARGET");
         if (selfId && who.id === selfId) flags.push("speaker");
-        if (isBotMessage(m)) flags.push("bot");
+        if (!lean && isBotMessage(m)) flags.push("bot");
         out.push("- " + (flags.length ? "[" + flags.join(", ") + "] " : "") + (when ? when + " " : "") + name + ": " + (text || "(no text)"));
       }
-      if (win.hiddenAfter > 0) out.push("... (" + win.hiddenAfter + " newer messages not shown)");
+      if (!lean && win.hiddenAfter > 0) out.push("... (" + win.hiddenAfter + " newer messages not shown)");
       return out;
     }
 
-    // Last N messages from one user, parsed into datetime / snowflake / username / nickname / server name.
-    const HISTORY_COUNT = 10;
+    // Recent messages from the replied-to person. On/off and the count are user settings (Reply Context group).
 
     function guildIdOf(channelId, msg) {
       try {
@@ -487,17 +488,23 @@
       return ms ? new Date(ms).toISOString().slice(0, 19).replace("T", " ") + "Z" : "";
     }
 
-    function userHistoryLines(channelId, userId) {
+    // Recent messages from the person being replied to (any person, not just one user), taken from the loaded chat.
+    // Messages already shown in the window are skipped so nothing is sent twice. Off = Reply Context setting.
+    function userHistoryLines(channelId, userId, skipIds, lean) {
       if (!channelId || !userId) return [];
+      if (storage.ctxUserHistory === false) return [];
+      const lineMax = lean ? LEAN_LINE_MAX : WINDOW_LINE_MAX;
       const mine = getChannelMessages(channelId)
-        .filter((m) => authorOf(m).id === String(userId) && textOfMessage(m))
-        .slice(-HISTORY_COUNT);
-      return mine.map((m) =>
-        formatStamp(m.id) + " | " + String(m.id) + " | " + textOfMessage(m).replace(/\s+/g, " ").trim().slice(0, WINDOW_LINE_MAX)
-      );
+        .filter((m) => authorOf(m).id === String(userId) && !(skipIds && skipIds.has(String(m.id))) && textOfMessage(m))
+        .slice(-histSize());
+      return mine.map((m) => {
+        const t = textOfMessage(m).replace(/\s+/g, " ").trim().slice(0, lineMax);
+        // Lean ([Answer]) mode drops the datetime and message id: about 25 tokens saved per line.
+        return lean ? "- " + t : formatStamp(m.id) + " | " + String(m.id) + " | " + t;
+      });
     }
 
-    function resolveReplyInfo(channelId, args, explicitRef) {
+    function resolveReplyInfo(channelId, args, explicitRef, lean) {
       const fromArgs = extractReplyMessage(args);
       const fromStore = messageFromStore(channelId, explicitRef || findReplyRef(args));
       const fromPending = getPendingReplyMessage(channelId);
@@ -519,7 +526,9 @@
       const chId = channelId || msg.channel_id || msg.channelId;
       const replyUserId = who.id || forwardAuthor.id;
       const win = sliceAnchorWindow(chId, anchorId, replyUserId);
-      const historyLines = userHistoryLines(chId, replyUserId);
+      const skipIds = new Set(win ? win.items.map((m) => String(m.id)) : []);
+      if (anchorId) skipIds.add(anchorId);
+      const historyLines = userHistoryLines(chId, replyUserId, skipIds, lean === true);
       const serverName = serverNickOf(guildIdOf(chId, msg), replyUserId, msg);
       log("snowflake anchor", anchorId || "none", win ? "window " + win.items.length : "no window", "history " + historyLines.length, "server_name " + (serverName ? "yes" : "no"));
       const shortId = anchorId ? "…" + anchorId.slice(-6) : "none";
@@ -529,7 +538,7 @@
       return {
         messageId: anchorId,
         sentAt: anchorMs ? new Date(anchorMs).toISOString() : "",
-        windowLines: windowLines(win),
+        windowLines: windowLines(win, lean === true),
         historyLines: historyLines,
         serverName: serverName,
         text: textOfMessage(msg),
@@ -549,15 +558,21 @@
 
     function formatContext(reply, forceAnswer, selfServerName) {
       lastReplyImages = reply && Array.isArray(reply.imageUrls) ? reply.imageUrls : [];
+      // [Answer] mode: the strict rules already live in the system prompt, so the context stays short here.
+      const lean = forceAnswer === true;
       const self = getSelfIdentity();
       const lines = [
-        "Discord. You write the outgoing chat message for this speaker ('me', 'my', 'mine', 'myself', 'I' in their text mean THIS person):",
+        lean
+          ? "Discord. You write the outgoing message for this speaker ('me', 'my', 'I' mean THIS person):"
+          : "Discord. You write the outgoing chat message for this speaker ('me', 'my', 'mine', 'myself', 'I' in their text mean THIS person):",
         "- discord_user_id: " + (self.id || "unknown"),
         "- discord_username: " + (self.username || "unknown"),
         "- discord_global_name: " + (self.globalName || "unknown"),
       ];
       if (selfServerName) lines.push("- discord_server_name: " + selfServerName);
-      const replyWho = " (he, she, they, him, her in the speaker's text usually mean this person, never the speaker):";
+      const replyWho = lean
+        ? " (he, she, they, him, her = this person):"
+        : " (he, she, they, him, her in the speaker's text usually mean this person, never the speaker):";
       if (reply && (reply.text || reply.id || reply.messageId || reply.username || reply.globalName || reply.isBot || reply.isForward)) {
         lines.push(reply.isForward
           ? "The speaker is replying to this forwarded Discord message" + replyWho
@@ -570,29 +585,32 @@
         if (reply.serverName) lines.push("- reply_discord_server_name: " + reply.serverName);
         if (reply.isBot) lines.push("- reply_is_bot: true");
         if (reply.isForward) lines.push("- reply_is_forward: true");
-        if (reply.messageId) lines.push("- reply_message_id: " + reply.messageId);
+        if (reply.messageId && !lean) lines.push("- reply_message_id: " + reply.messageId);
         if (reply.sentAt) lines.push("- reply_sent_at: " + reply.sentAt);
         if (reply.text) lines.push("- reply_message: \"" + reply.text.replace(/"/g, "'") + "\"");
         if (reply.windowLines && reply.windowLines.length) {
-          lines.push("Channel messages around the reply target (oldest first, UTC). '>>> REPLY TARGET' is the exact message replied to; 'speaker' marks the person you write for:");
+          lines.push(lean
+            ? "Nearby messages (oldest first; '>>> REPLY TARGET' = the replied message, 'speaker' = you):"
+            : "Channel messages around the reply target (oldest first, UTC). '>>> REPLY TARGET' is the exact message replied to; 'speaker' marks the person you write for:");
           for (let i = 0; i < reply.windowLines.length; i++) lines.push(reply.windowLines[i]);
         }
       }
       if (reply && reply.historyLines && reply.historyLines.length) {
-        lines.push("Last " + reply.historyLines.length + " messages from the person being replied to (the reply_discord_* person above; oldest first; one per line as: UTC datetime | message id | text):");
+        lines.push(lean
+          ? "Other recent messages from the replied person (" + reply.historyLines.length + ", oldest first):"
+          : "Other recent messages (" + reply.historyLines.length + ") from the person being replied to (the reply_discord_* person above, not already listed above; oldest first; one per line as: UTC datetime | message id | text):");
         for (let i = 0; i < reply.historyLines.length; i++) lines.push(reply.historyLines[i]);
       }
       const strict = "Do NOT insert names, IDs or details from this context, and do NOT replace pronouns (he, she, they, it, that, this) with names. "
         + "A name or fact may appear in the output only if the speaker's own text has it. Keep the speaker's wording and meaning as close as possible, but still fix typos. ";
-      const footer = forceAnswer === true
-        ? "Use this context to answer the typed text. Questions about the speaker are answered from the speaker facts above, addressed to the speaker. " +
-          "Quote or name people from the context freely when it makes the answer clearer, but state only what the context shows. "
+      const footer = lean
+        ? "Answer the typed text from this context and general knowledge; state only what the context shows. "
         : storage.answerQuestions !== false
         ? "Instructions about the reply itself ('reply to Quater', 'answer him', 'say yes'), questions about this conversation and questions about the speaker are answered from this context in the speaker's voice, ready to send, without rewriting or repeating the text. " +
           "For questions about the speaker use only the speaker facts above, addressed to the speaker (for example 'You're <global name> (@<username>)'), and do not describe the reply target. " +
           "If the context cannot answer a question about the conversation, just rewrite it without guessing. For any other message: " + strict
         : "Use them ONLY to understand the situation. " + strict;
-      lines.push("Discord context above. " + footer + "Output only the final chat message.");
+      lines.push((lean ? "" : "Discord context above. ") + footer + "Output only the final chat message.");
       return lines.join("\n");
     }
 
@@ -602,7 +620,7 @@
         const me = getSelfIdentity();
         selfServerName = serverNickOf(guildIdOf(channelId, null), me.id, null);
       } catch (e) {}
-      return formatContext(resolveReplyInfo(channelId, args, explicitRef), forceAnswer, selfServerName);
+      return formatContext(resolveReplyInfo(channelId, args, explicitRef, forceAnswer === true), forceAnswer, selfServerName);
     }
 
     function getReplyTarget(channelId) {
@@ -697,17 +715,13 @@
   // Used instead of EDITOR_RULES + ANSWER_RULES when the speaker typed an answer tag ([Answer], [ans] or !~{ans}).
   // Those two rule sets lean towards rewriting, which is exactly what the tag is meant to switch off.
   const FORCED_ANSWER_RULES =
-    "You write the outgoing Discord chat message for the speaker. They put an answer tag on the typed text, so it is NOT a message to polish or reword: " +
-    "it is a question, request or instruction, and your output is the ANSWER or REPLY itself, written as the message they will send, in their own voice. " +
+    "You write the outgoing Discord message for the speaker. The typed text carries an answer tag, so it is a question, request or instruction, never a message to polish. " +
+    "STRICT: your output is the ANSWER itself, in the speaker's voice, ready to send. Never repeat, rephrase or reword the typed text, never answer with the question back, never ask the speaker for more details. Lead with the answer. " +
     "A leading 'reply,', 'answer,', 'respond,' or 'say' is an instruction, not part of the question. " +
-    "Never repeat, restate or lightly rephrase the typed text, and never answer with the same question back. Lead with the answer. " +
-    "Use the Discord context (reply target, nearby messages, who said what) together with general knowledge. " +
-    "For math or logic show a few short natural-language lines ending with the final answer; for translations or 'say X' requests just give the result. " +
-    "If the context only partly covers a question about a person or an event, say what the messages show, in a casual voice ('from what i can see...'); do not refuse or echo the question. " +
-    "If neither the context nor general knowledge can answer it, say so in one short natural line ('no clue tbh'). Never invent facts about real people (job, age, location, history). " +
-    "IDENTITY: 'me', 'my', 'mine', 'myself' and 'I' mean the SPEAKER (the discord_* fields); 'he', 'she', 'they', 'him', 'her' or 'that person' usually mean the REPLY TARGET (the reply_discord_* fields) unless a name is given. " +
-    "Never mix these people up, mention being an AI, or answer as yourself. " +
-    "If the speaker asks about themselves ('who am I', 'my name', 'my id', 'my nickname'), answer plainly with only the speaker facts in the context. " +
+    "Use the Discord context together with general knowledge. Math or logic: a few short natural lines ending with the final answer; translations or 'say X': just the result. " +
+    "If the context only partly covers it, say what the messages show ('from what i can see...'); if nothing can answer it, one short line ('no clue tbh'). Never invent facts about real people. " +
+    "IDENTITY: 'me', 'my', 'I' = the SPEAKER (discord_* fields); 'he', 'she', 'they', 'that person' = the REPLY TARGET (reply_discord_* fields) unless a name is given; other names are third parties. Never mix them up, mention being an AI, or answer as yourself. " +
+    "Questions about the speaker ('who am I', 'my name', 'my id') are answered plainly from the speaker fields only. " +
     "Return ONLY the message to send, with no quotes, labels or commentary.";
 
   const PERSONALITIES = {
@@ -927,15 +941,22 @@
     return rest.trim() ? { forced: true, text: rest } : { forced: false, text: text };
   }
 
+  // The model sometimes starts its answer with the tag or an "Answer:" label; neither belongs in the sent message.
+  function stripAnswerLabel(out) {
+    const raw = String(out || "").trim();
+    const cleaned = raw.replace(ANS_PREFIX_RE, "").replace(/^answer\s*:\s+/i, "").trim();
+    return cleaned || raw;
+  }
+
   function userContent(text, replyContext, forceAnswer) {
     const answerOn = forceAnswer === true || storage.answerQuestions !== false;
+    // [Answer] mode: the system prompt already holds the strict rules, so this stays to one line.
     const tag = forceAnswer === true
-      ? "The speaker tagged the typed text below as a question or instruction to ANSWER, not a message to rewrite. " +
-        "Carry it out and output only the resulting chat message; never repeat, rephrase or echo the typed text. " +
-        "In it, \"me\", \"my\" and \"I\" mean the speaker described in the Discord context, never you.\n\n"
+      ? "Answer tag: ANSWER the typed text, do not rewrite or repeat it. Output only the message.\n\n"
       : "";
     if (!replyContext || replyContext.indexOf("reply_message:") === -1) return tag ? tag + "Typed text:\n" + text : text;
-    return tag + "The speaker is replying on Discord. Use the referenced message below. Do not ignore it and do not invent a different topic.\n\n" +
+    if (forceAnswer === true) return tag + replyContext + "\n\nTyped text:\n" + text;
+    return "The speaker is replying on Discord. Use the referenced message below. Do not ignore it and do not invent a different topic.\n\n" +
       replyContext +
       (answerOn
         ? "\n\nTyped text (the message to send, or an instruction about the reply; if an instruction, write the actual reply to the message above, do not repeat it). Output only the chat message:\n"
@@ -960,10 +981,18 @@
   const CTX_AFTER_DEF = 6;
   const CTX_BEFORE_OPTIONS = [0, 2, 4, 6, 10];
   const CTX_AFTER_OPTIONS = [0, 3, 6, 10, 15];
+  // Recent messages from the person you reply to (e.g. ScubbyGame), for anyone you reply to.
+  const HIST_COUNT_DEF = 10;
+  const HIST_COUNT_OPTIONS = [3, 5, 10, 15, 20];
 
   function ctxSize(key, def) {
     const n = parseInt(storage[key], 10);
     return Number.isFinite(n) ? Math.min(30, Math.max(0, n)) : def;
+  }
+
+  function histSize() {
+    const n = parseInt(storage.ctxHistoryCount, 10);
+    return Number.isFinite(n) ? Math.min(30, Math.max(1, n)) : HIST_COUNT_DEF;
   }
 
   function readAdv(spec) {
@@ -1571,7 +1600,7 @@
     } catch (e) { return ""; }
   }
   function formatUsage(u) {
-    if (!u) return null;
+    if (!u || storage.showUsage === false) return null; // "Show token usage in preview" setting
     const lines = [];
     if (u.total > 0) lines.push("Used " + fmtNum(u.total) + " tokens (" + fmtNum(u.prompt) + " in · " + fmtNum(u.completion) + " out)");
     if (u.elapsedMs != null) lines.push("AI responded in " + u.elapsedMs + " ms");
@@ -1768,16 +1797,23 @@
     };
     try {
       let out = await ask();
+      if (forceAnswer === true) out = stripAnswerLabel(out);
       // Answer tag used but the model only repeated the text: ask once more, explicitly.
       if (forceAnswer === true && looksLikeEcho(out, text)) {
         log("forced answer came back as an echo, retrying once");
         try {
-          out = await ask([
+          out = stripAnswerLabel(await ask([
             { role: "assistant", content: out },
             { role: "user", content: "That only repeated the typed text. Do not rewrite it. Write the actual answer or reply now, using the Discord context and general knowledge, and say what the context shows if it only partly answers. Output only the message." },
-          ]);
+          ]));
         } catch (e2) {
           log("echo retry failed", e2 && e2.message);
+        }
+        // Strict: an [Answer] message must never go out as a rewrite of the question.
+        if (looksLikeEcho(out, text)) {
+          const err = new Error("Answer tag: model only repeated the text");
+          err.refused = true;
+          throw err;
         }
       }
       if (looksLikeRefusal(out, text)) {
@@ -1860,13 +1896,16 @@
         return out;
       } catch (e) {
         log("key #" + (i + 1) + " failed:", e && (e.status || e.message));
-        if (e && e.refused) { // other keys would decline too; keep the user's own text
+        if (e && e.refused) { // other keys would decline too
+          // [Answer] must be an answer: never fall back to sending the typed question itself.
+          if (forceAnswer === true) { debugToast("warn", "AI Writer Magic could not answer"); return null; }
           debugToast("warn", "AI Writer Magic declined, kept your text");
           return text;
         }
         debugToast("err", "Key #" + (i + 1) + " failed: " + ((e && (e.status || e.message)) || "unknown"));
       }
     }
+    if (forceAnswer === true) { debugToast("err", "All keys failed, no answer"); return null; }
     debugToast("err", "All keys failed, using your original text");
     return text;
   }
@@ -2183,17 +2222,28 @@
     const stopTyping = startTypingLoop(channelId);
     let finalText = original;
     let usageInfo = null;
+    let noAnswer = false;
     try {
-      finalText = await rewriteText(original, replyContext, forceAnswer);
-      usageInfo = lastUsage;
-      if (!preview) {
-        const delay = getTypingMs();
-        if (delay > 0) await sleep(delay);
+      const out = await rewriteText(original, replyContext, forceAnswer);
+      if (out === null) {
+        noAnswer = true; // [Answer] only: no valid answer, so nothing is sent
+      } else {
+        finalText = out;
+        usageInfo = lastUsage;
+        if (!preview) {
+          const delay = getTypingMs();
+          if (delay > 0) await sleep(delay);
+        }
       }
     } catch (e) {
-      finalText = original;
+      if (forceAnswer === true) noAnswer = true;
+      else finalText = original;
     } finally {
       stopTyping();
+    }
+    if (noAnswer) {
+      showToast("AI Writer Magic: no answer for the [Answer] message, nothing was sent. Try again.");
+      return null;
     }
 
     if (preview) {
@@ -2845,6 +2895,15 @@
           )
         )
       : null;
+    const histOn = storage.ctxUserHistory !== false;
+    const histPanel = histOn
+      ? h(View, { style: { paddingHorizontal: 16, paddingTop: 12, paddingBottom: 6, backgroundColor: ROW_BG } },
+          h(View, { style: { marginBottom: 6 } },
+            h(Text, { style: { color: P.muted, fontSize: 12, fontWeight: "700", textTransform: "uppercase", marginBottom: 8 } }, "Their recent messages to send"),
+            Chips(HIST_COUNT_OPTIONS, histSize(), (n) => { storage.ctxHistoryCount = n; }, chipColors0(), null)
+          )
+        )
+      : null;
     const effort = getGenParams().effort;
     const chipColors = { accent: "#5865f2", input: isLightTheme() ? "#e3e5e8" : "#2b2d31", muted: P.muted };
     const advancedOn = storage.advancedEnabled === true;
@@ -2868,10 +2927,11 @@
     const body = [
       group("General ⚙️", [
         sw("Auto-rewrite all messages", storage.autoRewrite, onAutoRewriteToggle, "No /ai-writer-magic needed"),
-        sw("Auto-answer questions", storage.answerQuestions !== false, (v) => { storage.answerQuestions = v; }, "Math, translations, and other answers. Start a message with !~{ans} or [Answer] to force it for that message"),
+        sw("Auto-answer questions", storage.answerQuestions !== false, (v) => { storage.answerQuestions = v; }, "Math, translations, and other answers. Start a message with !~{ans} or [Answer] to force it for that message: it is always answered, never rewritten, and uses a lean prompt"),
         sw("Auto Math Explainer", storage.mathTool !== false, (v) => { storage.mathTool = v; },
           "Numbers are calculated exactly with JavaScript (percentages, roots, powers, trig, big numbers) and the AI writes short steps built from those results, re-checked against them"),
         sw("Preview before sending", storage.previewBeforeSend !== false, (v) => { storage.previewBeforeSend = v; }, "Send / Edit / Copy prompt / Cancel"),
+        sw("Show token usage in preview", storage.showUsage !== false, (v) => { storage.showUsage = v; }, "Tokens used, response time and remaining quota under the preview text"),
       ]), 
       group("Skip auto-rewrite for 🚫", [
         sw("Pings", storage.skipMentions !== false, (v) => { storage.skipMentions = v; }, "@user, @role, @everyone, @here"),
@@ -2892,6 +2952,9 @@
               storage.ctxIncludeOthers !== false ? "Messages from everyone nearby, not just the reply target" : "Only the reply target's messages")
           : null,
         ctxPanel,
+        sw("Replied person's other messages", histOn, (v) => { storage.ctxUserHistory = v; },
+          "Also sends the recent messages of whoever you reply to (e.g. ScubbyGame), for every person you reply to. Only messages already loaded in the chat; ones shown in the window are not repeated"),
+        histPanel,
         sw("Read images in replied messages", storage.readImages !== false, (v) => { storage.readImages = v; },
           "Replies to a message with images (attachments, embeds, image links) are read by Qwen 3.8 27B vision. Up to 3 images, about 2,048 tokens each"),
       ]),
@@ -3161,6 +3224,9 @@
     if (typeof storage.ctxIncludeOthers !== "boolean") storage.ctxIncludeOthers = true;
     if (!Number.isFinite(parseInt(storage.ctxBefore, 10))) storage.ctxBefore = CTX_BEFORE_DEF;
     if (!Number.isFinite(parseInt(storage.ctxAfter, 10))) storage.ctxAfter = CTX_AFTER_DEF;
+    if (typeof storage.ctxUserHistory !== "boolean") storage.ctxUserHistory = true;
+    if (!Number.isFinite(parseInt(storage.ctxHistoryCount, 10))) storage.ctxHistoryCount = HIST_COUNT_DEF;
+    if (typeof storage.showUsage !== "boolean") storage.showUsage = true;
     Object.keys(ADV_SPEC).forEach((k) => {
       if (!Number.isFinite(parseFloat(storage[ADV_SPEC[k].key]))) storage[ADV_SPEC[k].key] = ADV_SPEC[k].def;
     });
