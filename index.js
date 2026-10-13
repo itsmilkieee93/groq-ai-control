@@ -964,83 +964,116 @@
     return { paths: ordered, packageName: pkg, externalPkg: externalPkg };
   }
 
+  // Reads the file back from an absolute path to prove it really exists with the right content.
+  // Returns "ok" | "mismatch" | "missing" | "unverified" (module can't tell us).
+  async function verifyFile(fm, absPath, expected) {
+    let exists;
+    try {
+      if (typeof fm.fileExists === "function") exists = await fm.fileExists(absPath);
+    } catch (e) { exists = undefined; }
+    if (exists === false) return "missing";
+    try {
+      if (typeof fm.readFile === "function") {
+        const back = await fm.readFile(absPath, "utf8");
+        if (typeof back === "string") return back === expected ? "ok" : "mismatch";
+      }
+    } catch (e) {
+      if (exists === true) return "ok";
+      return "missing";
+    }
+    return exists === true ? "ok" : "unverified";
+  }
+
+  // Writes <AIWriterMagicExports>/<name> and only reports a path that was actually checked.
+  // Returns { path, external, verified }.
+  //  - The file manager resolves "documents" + a RELATIVE path itself; an absolute path passed
+  //    there gets appended to the base dir (that was the old bug: the file landed in a nested,
+  //    wrong folder while the toast still claimed Android/data).
+  //  - Step 1 writes to the real documents dir (from getConstants) and verifies it.
+  //  - Step 2 (only if that dir is private/internal) tries the external package folder via a
+  //    relative "../" climb computed from the real documents path, and verifies it too.
   async function writeAppFile(text, name) {
     const fm = getFileManager();
     if (!fm) throw new Error("file manager not available");
     const rel = APP_EXPORT_SUBDIR + "/" + name;
-    const info = getPathCandidates();
-    const fallbacks = [];
+    const docsDir = cleanPath(getFileManagerConstants().DocumentsDirPath);
+    const pkg = packageFromPath(docsDir);
+    const isExtPath = (p) => String(p).indexOf("/Android/data/") !== -1;
+    const problems = [];
 
-    // 1) External-style directory keys first
-    const dirTypes = ["external", "externalFiles", "external_files", "files", "documents"];
-    for (let i = 0; i < dirTypes.length; i++) {
-      try {
-        await fm.writeFile(dirTypes[i], rel, text, "utf8");
-        const isExt = dirTypes[i].indexOf("external") !== -1 || dirTypes[i] === "files";
-        const path = isExt
-          ? info.externalPkg + "/" + rel
-          : (info.paths.find((p) => p.indexOf("/Android/data/") !== -1) || info.paths[0] || "documents") + "/" + rel;
-        lastExported = { path: path, name: name, text: text };
-        if (isExt) return path;
-        fallbacks.push(path);
-      } catch (e) {}
+    // 1) documents + relative path
+    let docsPath = "";
+    let docsState = "unverified";
+    try {
+      await fm.writeFile("documents", rel, text, "utf8");
+      docsPath = docsDir ? docsDir + "/" + rel : "";
+      if (docsPath) docsState = await verifyFile(fm, docsPath, text);
+      log("export: documents write done", docsPath || "(documents path unknown)", docsState);
+      if (docsState === "ok" && isExtPath(docsPath)) {
+        lastExported = { path: docsPath, name: name, text: text };
+        return { path: docsPath, external: true, verified: true };
+      }
+      if (docsState === "missing" || docsState === "mismatch") problems.push("documents: " + docsState);
+    } catch (e) {
+      problems.push("documents write failed: " + ((e && e.message) || e));
+      log("export: documents write failed", e);
     }
 
-    // 2) Absolute external package path
-    const absTargets = [
-      info.externalPkg + "/" + rel,
-      "/sdcard/Android/data/" + info.packageName + "/files/" + rel,
-    ];
-    for (let i = 0; i < absTargets.length; i++) {
-      const abs = absTargets[i];
+    // 2) documents dir is internal → try the external package folder (no permission needed for own package)
+    if (docsDir && pkg && !isExtPath(docsDir)) {
+      const extDir = "/storage/emulated/0/Android/data/" + pkg + "/files";
+      const depth = docsDir.split("/").filter(Boolean).length;
+      let up = "";
+      for (let i = 0; i < depth; i++) up += "../";
+      const climbRel = up + extDir.replace(/^\//, "") + "/" + rel;
+      const extPath = extDir + "/" + rel;
       try {
-        await fm.writeFile("documents", abs, text, "utf8");
-        lastExported = { path: abs, name: name, text: text };
-        return abs;
+        await fm.writeFile("documents", climbRel, text, "utf8");
+        const st = await verifyFile(fm, extPath, text);
+        log("export: external climb write", extPath, st);
+        if (st === "ok") {
+          lastExported = { path: extPath, name: name, text: text };
+          return { path: extPath, external: true, verified: true };
+        }
+        problems.push("external: " + st);
       } catch (e) {
-        try {
-          await fm.writeFile("", abs, text, "utf8");
-          lastExported = { path: abs, name: name, text: text };
-          return abs;
-        } catch (e2) {}
+        problems.push("external write failed: " + ((e && e.message) || e));
+        log("export: external write failed", e);
       }
     }
 
-    // 3) Relative climb from documents → external package
-    const climbs = [
-      "../../../../../../storage/emulated/0/Android/data/" + info.packageName + "/files/" + rel,
-      "../../../../../storage/emulated/0/Android/data/" + info.packageName + "/files/" + rel,
-      "../../../../storage/emulated/0/Android/data/" + info.packageName + "/files/" + rel,
-    ];
-    for (let i = 0; i < climbs.length; i++) {
-      try {
-        await fm.writeFile("documents", climbs[i], text, "utf8");
-        const path = info.externalPkg + "/" + rel;
-        lastExported = { path: path, name: name, text: text };
-        return path;
-      } catch (e) {}
+    // 3) fall back to what step 1 produced, but never pretend it is verified/external
+    if (docsPath && docsState === "ok") {
+      lastExported = { path: docsPath, name: name, text: text };
+      return { path: docsPath, external: false, verified: true };
     }
+    if (docsPath && docsState === "unverified") {
+      lastExported = { path: docsPath, name: name, text: text };
+      return { path: docsPath, external: false, verified: false };
+    }
+    // Nothing verified: keep the text so "Share file" still works, then fail honestly.
+    lastExported = { path: "", name: name, text: text };
+    throw new Error("file was not found after writing (" + (problems.join("; ") || "unknown") + ")");
+  }
 
-    // 4) Use first successful documents/files write
-    if (fallbacks.length) {
-      lastExported = { path: fallbacks[0], name: name, text: text };
-      return fallbacks[0];
-    }
-    throw new Error("could not write file (external + documents both failed)");
+  function exportToastText(label, r) {
+    if (r.external && r.verified) return label + " exported & verified: " + r.path;
+    if (r.verified) return label + " saved in app-private storage (not visible in file managers): " + r.path + " - use Share file";
+    return label + " written but could not be verified: " + r.path + " - use Share file";
   }
 
   // Shares the last exported file (file URI when possible).
   async function shareLastFile() {
     const info = lastExported;
-    if (!info || !info.path) {
+    if (!info || (!info.path && !info.text)) {
       showToast("Export a file first");
       return;
     }
-    const fileUrl = info.path.indexOf("://") === -1 ? "file://" + info.path : info.path;
+    const fileUrl = !info.path ? "" : (info.path.indexOf("://") === -1 ? "file://" + info.path : info.path);
     try {
       if (RN.Share && typeof RN.Share.share === "function") {
         await RN.Share.share({
-          url: fileUrl,
+          url: fileUrl || undefined,
           message: info.text,
           title: info.name,
           type: info.name.endsWith(".json") ? "application/json" : "text/plain",
@@ -1062,9 +1095,8 @@
     const name = "ai_writer_magic_" + exportStamp() + ".txt";
     const text = buildExportText();
     try {
-      const path = await writeAppFile(text, name);
-      const isExt = String(path).indexOf("/Android/data/") !== -1;
-      showToast((isExt ? "Exported to Android/data: " : "Exported (internal only): ") + path);
+      const r = await writeAppFile(text, name);
+      showToast(exportToastText("Log", r));
     } catch (e) {
       showToast("Export failed: " + ((e && e.message) || "unknown"));
     }
@@ -1129,9 +1161,8 @@
     const text = JSON.stringify(obj, null, 2);
     const name = "ai_writer_magic_settings_" + exportStamp() + ".json";
     try {
-      const path = await writeAppFile(text, name);
-      const isExt = String(path).indexOf("/Android/data/") !== -1;
-      showToast((isExt ? "Settings exported to Android/data: " : "Settings exported (internal only): ") + path);
+      const r = await writeAppFile(text, name);
+      showToast(exportToastText("Settings", r));
     } catch (e) {
       showToast("Settings export failed: " + ((e && e.message) || "unknown"));
     }
