@@ -1075,75 +1075,133 @@
   const LOG_WARNING = "The log contains message text, usernames, user/channel IDs and the full AI requests and replies. API keys are masked, but don't post it publicly.";
   const SETTINGS_WARNING = "The settings file contains your API keys (Groq, Exa, Composio) in plain text. Never post it publicly or send it to anyone you don't trust.";
 
-  // Looks for native modules that can hand a real file to the Android share sheet.
-  // Only react-native-share's open() has a known shape; anything else is just logged for diagnosis.
-  function findNativeFileSharer() {
-    const mods = [];
-    try { if (RN.NativeModules) mods.push(RN.NativeModules); } catch (e) {}
-    try { if (typeof nativeModuleProxy !== "undefined" && nativeModuleProxy) mods.push(nativeModuleProxy); } catch (e) {}
-    let rnShare = null;
-    const seen = [];
-    for (let i = 0; i < mods.length; i++) {
-      let keys = [];
-      try { keys = Object.keys(mods[i]); } catch (e) {}
-      for (let j = 0; j < keys.length; j++) {
-        try {
-          const m = mods[i][keys[j]];
-          if (!m || (typeof m !== "object" && typeof m !== "function")) continue;
-          const fns = Object.keys(m).filter((k) => /share/i.test(k) && typeof m[k] === "function");
-          if (fns.length) seen.push(keys[j] + "." + fns.join("/"));
-          if (!rnShare && /^RN?Share/i.test(keys[j]) && typeof m.open === "function") rnShare = m;
-        } catch (e) {}
+  // Names-only report of native modules/methods that could be used to share a file (no secrets in it).
+  function nativeModuleReport() {
+    const re = /share|send|intent|open|provider|uri|export|attach|view|save|download|file|launch/i;
+    const lines = [];
+    const seen = {};
+    const methodsOf = (m) => {
+      let names = [];
+      try { names = names.concat(Object.keys(m)); } catch (e) {}
+      try { names = names.concat(Object.getOwnPropertyNames(m)); } catch (e) {}
+      try { const p = Object.getPrototypeOf(m); if (p && p !== Object.prototype) names = names.concat(Object.getOwnPropertyNames(p)); } catch (e) {}
+      const out = [];
+      for (let i = 0; i < names.length; i++) {
+        const k = names[i];
+        if (out.indexOf(k) !== -1 || k === "constructor") continue;
+        try { if (typeof m[k] === "function") out.push(k); } catch (e) {}
       }
-    }
+      return out;
+    };
+    const add = (name, m, all) => {
+      if (!m || seen[name] || (typeof m !== "object" && typeof m !== "function")) return;
+      seen[name] = true;
+      const fns = methodsOf(m);
+      const shown = all ? fns : fns.filter((k) => re.test(k));
+      if (shown.length || re.test(name)) lines.push(name + ": " + (shown.join(", ") || "(no matching methods)"));
+    };
     try {
-      const fm = getFileManager();
-      if (fm) {
-        const fns = Object.keys(fm).filter((k) => /share|open/i.test(k) && typeof fm[k] === "function");
-        if (fns.length) seen.push("fileManager." + fns.join("/"));
+      if (RN.NativeModules) {
+        const keys = Object.keys(RN.NativeModules);
+        for (let i = 0; i < keys.length; i++) { try { add(keys[i], RN.NativeModules[keys[i]], false); } catch (e) {} }
       }
     } catch (e) {}
-    log("share: native share-capable methods found:", seen.length ? seen.join(", ") : "(none)");
-    return rnShare;
+    const known = ["DCDFileManager", "RTNFileManager", "NativeFileModule", "DCDShare", "DCDShareManager", "RNShare",
+      "KettuNative", "BunnyNative", "VendettaNative", "RevengeNative", "BundleUpdaterManager", "DCDDeviceManager", "DCDChat", "NativeClientInfoModule"];
+    for (let i = 0; i < known.length; i++) {
+      let m = null;
+      try { if (typeof nativeModuleProxy !== "undefined" && nativeModuleProxy) m = nativeModuleProxy[known[i]]; } catch (e) {}
+      if (!m) { try { m = globalThis.nativeModuleProxy && globalThis.nativeModuleProxy[known[i]]; } catch (e) {} }
+      if (m) add(known[i], m, true);
+    }
+    return lines.length ? lines.join("\n") : "(no native modules found)";
   }
 
-  // Sends the exported FILE (attachment) through the system share sheet.
-  // Returns true if a file share was started, false if no way to share a real file exists here.
+  function uiCopyNativeReport() {
+    const text = nativeModuleReport();
+    log("native module report:\n" + text);
+    showToast(copyText(text) ? "Native module report copied to clipboard" : "Couldn't copy report");
+  }
+
+  // react-native-share style sharer (open({url,type,...})), if this Discord build ships one.
+  function findNativeFileSharer() {
+    const names = ["RNShare", "RNShareModule", "RNShareOpen"];
+    const sources = [];
+    try { if (RN.NativeModules) sources.push(RN.NativeModules); } catch (e) {}
+    try { if (typeof nativeModuleProxy !== "undefined" && nativeModuleProxy) sources.push(nativeModuleProxy); } catch (e) {}
+    for (let i = 0; i < sources.length; i++) {
+      for (let j = 0; j < names.length; j++) {
+        try { const m = sources[i][names[j]]; if (m && typeof m.open === "function") return m; } catch (e) {}
+      }
+    }
+    log("share: no file-capable share module. Report:\n" + nativeModuleReport());
+    return null;
+  }
+
+  // UTF-8 bytes of a string (TextEncoder when present, manual encoder otherwise).
+  function utf8Bytes(str) {
+    try { if (typeof TextEncoder !== "undefined") return new TextEncoder().encode(str); } catch (e) {}
+    const out = [];
+    for (let i = 0; i < str.length; i++) {
+      let c = str.charCodeAt(i);
+      if (c >= 0xd800 && c <= 0xdbff && i + 1 < str.length) {
+        const d = str.charCodeAt(i + 1);
+        if (d >= 0xdc00 && d <= 0xdfff) { c = 0x10000 + ((c - 0xd800) << 10) + (d - 0xdc00); i++; }
+      }
+      if (c < 0x80) out.push(c);
+      else if (c < 0x800) out.push(0xc0 | (c >> 6), 0x80 | (c & 63));
+      else if (c < 0x10000) out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
+      else out.push(0xf0 | (c >> 18), 0x80 | ((c >> 12) & 63), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
+    }
+    return Uint8Array.from(out);
+  }
+
+  // Chunked Base64 (no btoa, no String.fromCharCode.apply) - safe for large logs.
+  const B64_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  function bytesToBase64(bytes) {
+    const CHUNK = 3 * 4096; // multiple of 3, so padding only ever appears in the last chunk
+    const parts = [];
+    for (let i = 0; i < bytes.length; i += CHUNK) {
+      const end = Math.min(i + CHUNK, bytes.length);
+      let s = "";
+      let j = i;
+      for (; j + 2 < end; j += 3) {
+        const n = (bytes[j] << 16) | (bytes[j + 1] << 8) | bytes[j + 2];
+        s += B64_CHARS[(n >> 18) & 63] + B64_CHARS[(n >> 12) & 63] + B64_CHARS[(n >> 6) & 63] + B64_CHARS[n & 63];
+      }
+      if (j < end) {
+        const two = end - j > 1;
+        const n = (bytes[j] << 16) | ((two ? bytes[j + 1] : 0) << 8);
+        s += B64_CHARS[(n >> 18) & 63] + B64_CHARS[(n >> 12) & 63] + (two ? B64_CHARS[(n >> 6) & 63] : "=") + "=";
+      }
+      parts.push(s);
+    }
+    return parts.join("");
+  }
+
+  // Sends the export as a real attachment: the text is turned into a Base64 data URI in memory,
+  // so no file:// path (blocked by scoped storage) is involved. No `message`, so Android has no
+  // plain-text payload to fall back to. Returns true only if the share sheet was opened.
   async function shareFileAttachment(info) {
+    if (!info || typeof info.text !== "string" || !info.name) return false;
     const sharer = findNativeFileSharer();
-    if (!sharer || !info.path) return false;
-    const url = info.path.indexOf("://") === -1 ? "file://" + info.path : info.path;
+    if (!sharer) return false;
     try {
+      const mime = info.name.endsWith(".json") ? "application/json" : "text/plain";
+      const b64 = bytesToBase64(utf8Bytes(info.text));
       await sharer.open({
-        url: url,
-        type: info.name.endsWith(".json") ? "application/json" : "text/plain",
-        filename: info.name,
+        url: "data:" + mime + ";base64," + b64,
+        type: mime,
+        filename: info.name.replace(/\.[^.]+$/, ""), // extension comes from `type`
         title: info.name,
         failOnCancel: false,
       });
-      log("share: file share sheet opened", info.path);
+      log("share: attachment share sheet opened", info.name, b64.length + " base64 chars");
       return true;
     } catch (e) {
-      log("share: file share failed", e);
+      log("share: attachment share failed", e);
       return false;
     }
-  }
-
-  // Shares an exported file. Real file first; plain text only as a clearly announced fallback.
-  async function shareExportedInfo(info) {
-    if (!info || (!info.path && !info.text)) {
-      showToast("Export a file first");
-      return;
-    }
-    if (await shareFileAttachment(info)) return;
-    try {
-      if (RN.Share && typeof RN.Share.share === "function") {
-        showToast("This Discord build can't attach files - sharing as text instead");
-        await RN.Share.share({ message: info.text, title: info.name });
-        return;
-      }
-    } catch (e) {}
-    showToast(copyText(info.text) ? "Can't attach files here - copied to clipboard instead" : "Couldn't share");
   }
 
   // kind = "log" | "settings": each Share file button only sends its own export.
@@ -1160,7 +1218,17 @@
       body: (kind === "settings" ? SETTINGS_WARNING : LOG_WARNING) + "\n\nShare " + info.name + "?",
       confirmText: "Share",
       confirmColor: kind === "settings" ? "red" : "brand",
-      onConfirm: () => { shareExportedInfo(info); },
+      onConfirm: async () => {
+        let ok = false;
+        try { ok = await shareFileAttachment(info); } catch (e) { log("share: unexpected error", e); }
+        if (ok) return;
+        // Safety net: native sharing unavailable or failed -> put the contents on the clipboard.
+        let copied = false;
+        try { copied = !!copyText(info.text); } catch (e) {}
+        showToast(copied
+          ? "Couldn't attach the file - contents copied to clipboard instead"
+          : "Couldn't share or copy the file");
+      },
     });
   }
 
@@ -3443,6 +3511,9 @@
         ),
         h(View, { style: { paddingHorizontal: 16, paddingTop: 4, paddingBottom: 14, backgroundColor: ROW_BG } },
           h(Text, { style: { color: RED, fontSize: 12, lineHeight: 18 } }, "⚠️ " + LOG_WARNING)
+        ),
+        h(View, { style: { paddingHorizontal: 16, paddingBottom: 12, backgroundColor: ROW_BG } },
+          button("Copy native module report", "#4e5058", uiCopyNativeReport, true)
         ),
       ]),
       group("Settings backup 💾", [
