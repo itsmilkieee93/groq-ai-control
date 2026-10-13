@@ -1179,32 +1179,41 @@
     return parts.join("");
   }
 
-  // Sends the export as a real attachment: the text is turned into a Base64 data URI in memory,
-  // so no file:// path (blocked by scoped storage) is involved. No `message`, so Android has no
-  // plain-text payload to fall back to. Returns true only if the share sheet was opened.
-  async function shareFileAttachment(info) {
-    if (!info || typeof info.text !== "string" || !info.name) return false;
-    const sharer = findNativeFileSharer();
-    if (!sharer) return false;
-    try {
-      const mime = info.name.endsWith(".json") ? "application/json" : "text/plain";
-      const b64 = bytesToBase64(utf8Bytes(info.text));
-      await sharer.open({
-        url: "data:" + mime + ";base64," + b64,
-        type: mime,
-        filename: info.name.replace(/\.[^.]+$/, ""), // extension comes from `type`
-        title: info.name,
-        failOnCancel: false,
-      });
-      log("share: attachment share sheet opened", info.name, b64.length + " base64 chars");
-      return true;
-    } catch (e) {
-      log("share: attachment share failed", e);
-      return false;
+async function shareFileAttachment(info) {
+    if (!info || typeof info.text !== "string" || !info.name) return { ok: false, reason: "nothing to export" };
+    const PUBLIC_DIR = "/storage/emulated/0/Discord/AIWriterMagic";
+    const fm = getFileManager();
+    if (!fm) {
+      log("export: no file manager module");
+      return { ok: false, reason: "file manager not available" };
     }
+    const safeName = String(info.name).replace(/[\\/:*?"<>|]/g, "_");
+    const target = PUBLIC_DIR + "/" + safeName;
+    const c = getFileManagerConstants(); // base directories come from getConstants()
+    const bases = [["documents", cleanPath(c.DocumentsDirPath)]];
+    if (c.CacheDirPath) bases.push(["cache", cleanPath(c.CacheDirPath)]);
+    const problems = [];
+    for (let i = 0; i < bases.length; i++) {
+      const dirType = bases[i][0];
+      const base = bases[i][1];
+      // Climb from the module's base dir to the filesystem root (extra "../" is harmless at root).
+      const depth = (base ? base.split("/").filter(Boolean).length : 10) + 2;
+      const rel = "../".repeat(depth) + PUBLIC_DIR.replace(/^\//, "") + "/" + safeName;
+      try {
+        await fm.writeFile(dirType, rel, info.text, "utf8");
+        const st = await verifyFile(fm, target, info.text);
+        log("export: public write", dirType, target, st);
+        if (st === "ok") return { ok: true, path: target };
+        problems.push(dirType + ": " + st);
+      } catch (e) {
+        problems.push(dirType + " write failed: " + ((e && e.message) || e));
+        log("export: public write failed", dirType, e);
+      }
+    }
+    return { ok: false, reason: problems.join("; ") || "unknown" };
   }
 
-  // kind = "log" | "settings": each Share file button only sends its own export.
+  // kind = "log" | "settings": each Share file button only exports its own file.
   const lastExportedByKind = { log: null, settings: null };
 
   function uiShareExported(kind) {
@@ -1213,25 +1222,31 @@
       showToast(kind === "settings" ? "Export settings first" : "Export log first");
       return;
     }
+    // Kept on purpose: the file is about to land in a folder every app with storage access can read.
     confirmDialog({
       title: "⚠️ Sensitive information",
-      body: (kind === "settings" ? SETTINGS_WARNING : LOG_WARNING) + "\n\nShare " + info.name + "?",
-      confirmText: "Share",
+      body: (kind === "settings" ? SETTINGS_WARNING : LOG_WARNING) +
+        "\n\nSave " + info.name + " to Downloads/AIWriterMagic? Other apps with storage access can read it.",
+      confirmText: "Save",
       confirmColor: kind === "settings" ? "red" : "brand",
       onConfirm: async () => {
-        let ok = false;
-        try { ok = await shareFileAttachment(info); } catch (e) { log("share: unexpected error", e); }
-        if (ok) return;
-        // Safety net: native sharing unavailable or failed -> put the contents on the clipboard.
+        let r = { ok: false };
+        try { r = await shareFileAttachment(info); } catch (e) { log("export: unexpected error", e); }
+        if (r && r.ok) {
+          showToast("The file " + info.name + " was saved successfully! Please open your phone's File Manager app in the Downloads/AIWriterMagic folder to retrieve the original document.");
+          return;
+        }
+        log("export: public folder unavailable, using clipboard backup:", r && r.reason);
+        // Final safety net: storage denied -> put the contents on the clipboard.
         let copied = false;
         try { copied = !!copyText(info.text); } catch (e) {}
         showToast(copied
-          ? "Couldn't attach the file - contents copied to clipboard instead"
-          : "Couldn't share or copy the file");
+          ? "Storage access denied! Backup text automatically copied to clipboard."
+          : "Storage access denied and the clipboard copy failed. Please export again.");
       },
     });
   }
-
+  
   async function uiExportLog() {
     if (!logBuffer.length) { showToast("Log is empty, nothing to export"); return; }
     const name = "ai_writer_magic_" + exportStamp() + ".txt";
