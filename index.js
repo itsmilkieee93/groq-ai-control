@@ -60,7 +60,10 @@
         message.id = action.messageId || action.message_id;
       }
       rememberPending(channelId, message);
-      if (message) log("cached swipe reply", channelId, message.id, textOfMessage(message).slice(0, 80));
+      if (message) {
+        const w = authorOf(message);
+        log("cached swipe reply: channel " + channelId + ", message id " + message.id + ", author id " + (w.id || "?") + ", @" + (w.username || "?") + " (" + (w.globalName || "?") + "): " + JSON.stringify(textOfMessage(message).slice(0, 300)));
+      }
     }
 
     function start() {
@@ -525,6 +528,18 @@
       const historyLines = userHistoryLines(chId, replyUserId);
       const serverName = serverNickOf(guildIdOf(chId, msg), replyUserId, msg);
       log("snowflake anchor", anchorId || "none", win ? "window " + win.items.length : "no window", "history " + historyLines.length, "server_name " + (serverName ? "yes" : "no"));
+      log("reply target detail:\n" +
+        "  source: " + source + "\n" +
+        "  channel id: " + (chId || "?") + "\n" +
+        "  message id (snowflake): " + (anchorId || "?") + "\n" +
+        "  sent at (from snowflake): " + (anchorMs ? new Date(anchorMs).toISOString() : "?") + "\n" +
+        "  author user id (snowflake): " + (replyUserId || "?") + "\n" +
+        "  author username: " + (who.username || forwardAuthor.username || "?") + "\n" +
+        "  author global name: " + (who.globalName || forwardAuthor.globalName || "?") + "\n" +
+        "  author server nickname: " + (serverName || "?") + "\n" +
+        "  bot: " + (isBotMessage(msg) || isBotMessage(snaps[0])) + "  forwarded: " + isForwardedMessage(msg) + "\n" +
+        "  images: " + (storage.readImages === false ? "off" : imageUrlsOf(msg).length) + "\n" +
+        "  content: " + JSON.stringify(textOfMessage(msg)));
       const shortId = anchorId ? "…" + anchorId.slice(-6) : "none";
       if (win) toast("ok", "Anchor " + shortId + " · window " + win.items.length + (storage.ctxIncludeOthers === false ? " (target only)" : "") + " · history " + historyLines.length);
       else if (storage.ctxWindow === false) toast("info", "Anchor " + shortId + ": window is off in settings · history " + historyLines.length);
@@ -604,6 +619,7 @@
       try {
         const me = getSelfIdentity();
         selfServerName = serverNickOf(guildIdOf(channelId, null), me.id, null);
+        log("speaker (you): user id " + (me.id || "?") + ", @" + (me.username || "?") + ", global name " + (me.globalName || "?") + ", server nickname " + (selfServerName || "?") + ", channel " + (channelId || "?"));
       } catch (e) {}
       return formatContext(resolveReplyInfo(channelId, args, explicitRef), forceAnswer, selfServerName);
     }
@@ -784,7 +800,8 @@
   };
 
   // In-memory log buffer (last LOG_MAX lines). Can be written to a file or shared from settings.
-  const LOG_MAX = 500;
+  const LOG_MAX = 1000;
+  const LOG_ENTRY_MAX = 8000; // one entry (e.g. a full AI request) is cut after this many characters
   const LOG_FILE = "groq-ai-control.log";
   const logBuffer = [];
   let logFlushTimer = null;
@@ -795,8 +812,30 @@
     try { return JSON.stringify(v); } catch (e) { return String(v); }
   }
 
+  // API keys are never written to the log in full: only the first 4 and last 4 characters.
+  function maskKey(k) {
+    const t = String(k == null ? "" : k);
+    return t.length > 10 ? t.slice(0, 4) + "…" + t.slice(-4) : "****";
+  }
+  const SECRET_KEY_RE = /^(authorization|api[-_]?key|key|token|composioApiKey|exaApiKey)$/i;
+  // JSON for the log: secrets masked, base64 images shortened.
+  function safeJson(obj, indent) {
+    try {
+      return JSON.stringify(obj, function (k, v) {
+        if (typeof v === "string" && SECRET_KEY_RE.test(k)) return maskKey(v);
+        if (typeof v === "string" && v.indexOf("data:") === 0 && v.length > 80) return v.slice(0, 30) + "…[" + v.length + " chars]";
+        if (typeof v === "bigint") return String(v);
+        return v;
+      }, indent);
+    } catch (e) {
+      return "[unserializable: " + ((e && e.message) || e) + "]";
+    }
+  }
+
   function pushLog(parts) {
-    logBuffer.push(new Date().toISOString() + " " + parts.map(logPart).join(" "));
+    let line = parts.map(logPart).join(" ");
+    if (line.length > LOG_ENTRY_MAX) line = line.slice(0, LOG_ENTRY_MAX) + "… [" + (line.length - LOG_ENTRY_MAX) + " more characters cut]";
+    logBuffer.push(new Date().toISOString() + " " + line);
     if (logBuffer.length > LOG_MAX) logBuffer.splice(0, logBuffer.length - LOG_MAX);
     if (storage.logToFile === true) scheduleLogFlush();
   }
@@ -863,6 +902,58 @@
   function uiClearLog() {
     logBuffer.length = 0;
     showToast("Log cleared");
+  }
+
+  // 📤 Export: whole in-memory log -> /sdcard/Discord/ai_writer_magic_YYYYMMDD_HHMMSS.txt
+  const EXPORT_DIR = "/sdcard/Discord";
+  function exportStamp() {
+    const d = new Date();
+    const p2 = (n) => (n < 10 ? "0" : "") + n;
+    return d.getFullYear() + p2(d.getMonth() + 1) + p2(d.getDate()) + "_" + p2(d.getHours()) + p2(d.getMinutes()) + p2(d.getSeconds());
+  }
+
+  function buildExportText() {
+    return "AI Writer Magic log\n" +
+      "Exported: " + new Date().toISOString() + "\n" +
+      "Entries: " + logBuffer.length + "\n" +
+      "Note: contains message text, usernames, IDs and the full AI request/response. API keys are masked.\n\n" +
+      logBuffer.join("\n") + "\n";
+  }
+
+  // The native file module only writes inside the app folders, so the path is built relative to the
+  // documents folder with "../" segments that climb up to the storage root. Throws when Android blocks it.
+  async function exportLogToSdcard(text, name) {
+    const fm = getFileManager();
+    if (!fm) throw new Error("file manager not available");
+    let base = "";
+    try {
+      const c = typeof fm.getConstants === "function" ? fm.getConstants() : null;
+      base = (c && c.DocumentsDirPath) || "";
+    } catch (e) {}
+    const depth = String(base).replace(/^file:\/\//, "").split("/").filter(Boolean).length || 5;
+    const rel = new Array(depth + 1).join("../") + EXPORT_DIR.replace(/^\//, "") + "/" + name;
+    await fm.writeFile("documents", rel, text, "utf8");
+    return EXPORT_DIR + "/" + name;
+  }
+
+  async function uiExportLog() {
+    if (!logBuffer.length) { showToast("Log is empty, nothing to export"); return; }
+    const name = "ai_writer_magic_" + exportStamp() + ".txt";
+    const text = buildExportText();
+    try {
+      const where = await exportLogToSdcard(text, name);
+      showToast("Log exported: " + where);
+    } catch (e) {
+      const why = (e && e.message) || "unknown";
+      showToast("Couldn't write to " + EXPORT_DIR + " (" + why + "). Opening share sheet instead");
+      try {
+        if (RN.Share && typeof RN.Share.share === "function") {
+          await RN.Share.share({ message: text, title: name });
+          return;
+        }
+      } catch (e2) {}
+      showToast(copyText(text) ? "Log copied to clipboard" : "Couldn't export, share or copy log");
+    }
   }
 
   // Debug toasts: shown only when the "Debug toasts" setting is on.
@@ -1575,7 +1666,41 @@
       return s + (d.toDateString() !== new Date().toDateString() ? " tomorrow" : "");
     } catch (e) { return ""; }
   }
+  // 📊 Running totals across all AI calls (stored, survives restarts) until "Reset statistics" is pressed.
+  const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  function fmtDate(ts) {
+    try {
+      const d = new Date(ts);
+      return d.getDate() + " " + MONTHS[d.getMonth()] + " " + d.getFullYear();
+    } catch (e) { return ""; }
+  }
+  function emptyStats() { return { requests: 0, prompt: 0, completion: 0, total: 0, since: Date.now() }; }
+  function getStats() {
+    const s = storage.usageStats;
+    return s && typeof s === "object" ? s : null;
+  }
+  function recordUsage(u) {
+    try {
+      if (!u || !(u.total > 0)) return;
+      const s = getStats() || emptyStats();
+      storage.usageStats = {
+        requests: (s.requests || 0) + 1,
+        prompt: (s.prompt || 0) + (u.prompt || 0),
+        completion: (s.completion || 0) + (u.completion || 0),
+        total: (s.total || 0) + u.total,
+        since: s.since || Date.now(),
+      };
+    } catch (e) {}
+  }
+  function resetUsageStats() { storage.usageStats = emptyStats(); }
+  function statsSummary() {
+    const s = getStats();
+    if (!s || !(s.requests > 0)) return null;
+    return fmtNum(s.total) + " tokens (" + fmtNum(s.prompt) + " in · " + fmtNum(s.completion) + " out) in " + fmtNum(s.requests) + " request" + (s.requests === 1 ? "" : "s") + " since " + fmtDate(s.since);
+  }
+
   function formatUsage(u) {
+    if (storage.showUsage === false) return null; // "Show token usage in preview" is off
     if (!u) return null;
     const lines = [];
     if (u.total > 0) lines.push("Used " + fmtNum(u.total) + " tokens (" + fmtNum(u.prompt) + " in · " + fmtNum(u.completion) + " out)");
@@ -1593,6 +1718,8 @@
         lines.push("Requests " + reset.replace(/^resets/, "reset"));
       }
     }
+    const totals = statsSummary();
+    if (totals) lines.push("Total: " + totals);
     return lines.length ? lines : null;
   }
 
@@ -1602,6 +1729,7 @@
     const started = Date.now();
     const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
     const gen = getGenParams(forceAnswer);
+    log("AI call start: key " + maskKey(apiKey) + ", forced answer " + (forceAnswer === true) + ", typed text: " + JSON.stringify(text) + ", params " + safeJson(gen));
     const timer = controller ? setTimeout(() => controller.abort(), gen.timeoutMs) : null;
     // The reply context is already inside the user message when there is a reply target (see userContent), so it is added to the system prompt only otherwise.
     const ctxInUser = !!(replyContext && replyContext.indexOf("reply_message:") !== -1);
@@ -1635,7 +1763,7 @@
           systemPrompt += "\n\n=== LIVE WEB SEARCH RESULTS (prefer them over your memory for facts, dates, news and current info; cite the source briefly when useful) ===\n" +
             results +
             "\n=== END RESULTS ===";
-          log("web search injected for answer");
+          log("web search injected for answer, query " + JSON.stringify(searchQuery) + ":\n" + results);
         }
       }
     }
@@ -1699,6 +1827,8 @@
           body.tools = [MATH_TOOL];
           body.tool_choice = round < MAX_TOOL_ROUNDS ? "auto" : "none";
         }
+        const reqStarted = Date.now();
+        log("→ Groq request (key " + maskKey(apiKey) + ", round " + round + "):\n" + safeJson({ url: GROQ_URL, body: body }, 2));
         const res = await fetch(GROQ_URL, {
           method: "POST",
           headers: {
@@ -1709,6 +1839,9 @@
           signal: controller ? controller.signal : undefined,
         });
         if (!res.ok) {
+          let errBody = "";
+          try { errBody = await res.text(); } catch (e) {}
+          log("← Groq HTTP " + res.status + " after " + (Date.now() - reqStarted) + " ms (key " + maskKey(apiKey) + "): " + String(errBody).slice(0, 1500));
           if (res.status === 400 && imagesOn) {
             // An image was rejected (format, size or unreachable link): retry once as text only.
             log("image request rejected (400), retrying text-only");
@@ -1720,6 +1853,15 @@
           throw err;
         }
         const data = await res.json();
+        log("← Groq response HTTP " + res.status + " in " + (Date.now() - reqStarted) + " ms:\n" + safeJson({
+          rateLimit: {
+            remainingTokens: hdrNum(res, "x-ratelimit-remaining-tokens"),
+            remainingRequests: hdrNum(res, "x-ratelimit-remaining-requests"),
+            resetTokens: hdrStr(res, "x-ratelimit-reset-tokens"),
+            resetRequests: hdrStr(res, "x-ratelimit-reset-requests"),
+          },
+          data: data,
+        }, 2));
         try {
           const u = data && data.usage;
           if (u) {
@@ -1752,6 +1894,7 @@
             const c = calls[i] || {};
             const fn = c.function || {};
             const result = fn.name === "calculate" ? runMathTool(fn.arguments, mathSteps, mathResults) : "Error: unknown tool";
+            log("math tool call: " + (fn.name || "?") + "(" + (fn.arguments || "") + ") -> " + result);
             msgs.push({ role: "tool", tool_call_id: c.id, content: result });
           }
           continue;
@@ -1785,6 +1928,7 @@
           log("echo retry failed", e2 && e2.message);
         }
       }
+      log("AI output (" + out.length + " chars):\n" + out);
       if (looksLikeRefusal(out, text)) {
         const err = new Error("Model declined");
         err.refused = true;
@@ -1794,6 +1938,8 @@
     } finally {
       if (timer) clearTimeout(timer);
       usage.elapsedMs = Date.now() - started;
+      log("AI call finished in " + usage.elapsedMs + " ms, tokens " + usage.total + " (" + usage.prompt + " in / " + usage.completion + " out)");
+      recordUsage(usage);
     }
   }
 
@@ -1861,10 +2007,11 @@
     for (let i = 0; i < keys.length; i++) {
       try {
         const out = await callGroq(keys[i], text, replyContext, forceAnswer);
+        log("rewrite ok with key #" + (i + 1) + " (" + maskKey(keys[i]) + ")");
         debugToast("ok", "AI Writer Magic rewrite ok (key #" + (i + 1) + ")");
         return out;
       } catch (e) {
-        log("key #" + (i + 1) + " failed:", e && (e.status || e.message));
+        log("key #" + (i + 1) + " (" + maskKey(keys[i]) + ") failed:", e && (e.status || e.message));
         if (e && e.refused) { // other keys would decline too; keep the user's own text
           debugToast("warn", "AI Writer Magic declined, kept your text");
           return text;
@@ -1872,6 +2019,7 @@
         debugToast("err", "Key #" + (i + 1) + " failed: " + ((e && (e.status || e.message)) || "unknown"));
       }
     }
+    log("all keys failed (" + keys.length + " tried), using the original text");
     debugToast("err", "All keys failed, using your original text");
     return text;
   }
@@ -2070,7 +2218,7 @@
     const buttons = [
       btn("Send", C.accent, () => { if (!text.trim()) return; act("send", text)(); }, "send"),
       editing ? null : btn("Edit", C.neutral, () => setEditing(true), "edit"),
-      btn("Copy prompt", C.neutral, () => { showToast(copyText(original) ? "Prompt copied to clipboard" : "Couldn't copy to clipboard"); }, "copy"),
+      btn("Copy prompt", C.neutral, () => { log("preview: Copy prompt pressed"); showToast(copyText(original) ? "Prompt copied to clipboard" : "Couldn't copy to clipboard"); }, "copy"),
       btn("Cancel", C.danger, act("cancel", original), "cancel"),
     ].filter(Boolean);
     const buttonRows = [];
@@ -2185,12 +2333,14 @@
   // then waits the typing delay. Resolves with the text to send, or null if the user cancelled.
   async function produceFinalText(original, channelId, textStaysInBox, replyContext = "", forceAnswer = false) {
     const preview = storage.previewBeforeSend !== false;
+    log("AI job start: channel " + channelId + ", preview " + preview + ", forced answer " + forceAnswer + ", input: " + JSON.stringify(original));
     const stopTyping = startTypingLoop(channelId);
     let finalText = original;
     let usageInfo = null;
     try {
       finalText = await rewriteText(original, replyContext, forceAnswer);
       usageInfo = lastUsage;
+      log("AI job result (" + (finalText === original ? "same as input / fallback" : "changed") + "): " + JSON.stringify(finalText));
       if (!preview) {
         const delay = getTypingMs();
         if (delay > 0) await sleep(delay);
@@ -2205,6 +2355,7 @@
       let r = await showPreview(original, finalText, undefined, usageInfo);
       // Alert fallback "Edit": reopen the sheet straight in edit mode
       if (r.action === "edit") r = await showPreview(original, r.text || finalText, true, usageInfo);
+      log("preview action: " + r.action + (r.action === "send" && r.text !== finalText ? " (edited by you): " + JSON.stringify(r.text) : ""));
       if (r.action === "cancel") return null; // Cancel just exits the preview
       finalText = r.text || finalText;
       const stop2 = startTypingLoop(channelId);
@@ -2252,11 +2403,14 @@
           }
 
           const channelId = args[0];
+          log("▶ sendMessage intercepted: channel " + channelId + ", forced answer " + ans.forced + ", typed text: " + JSON.stringify(rawContent) + ", messageReference: " + safeJson(msg && msg.messageReference));
           const replyContext = buildPayloadContext(channelId, args, msg && msg.messageReference, ans.forced);
-          log("payload context:", replyContext.replace(/\n/g, " | ").slice(0, 180));
+          log("payload context (sendMessage):\n" + replyContext);
           const job = async () => {
             const finalText = await produceFinalText(content, channelId, false, replyContext, ans.forced);
             if (finalText === null) return;
+            const refId = msg && msg.messageReference ? (msg.messageReference.message_id || msg.messageReference.messageId) : null;
+            log("◀ sendMessage: sending to channel " + channelId + ": " + JSON.stringify(finalText) + (refId ? " (reply to message id " + refId + ")" : ""));
             const next = args.slice();
             next[1] = Object.assign({}, msg, { content: finalText });
             return orig(...next);
@@ -2316,13 +2470,15 @@
         }
 
         const channelId = findChannelId(args);
+        log("▶ handleSendMessage intercepted: channel " + channelId + ", forced answer " + ans.forced + ", typed text: " + JSON.stringify(raw) + ", reply ref: " + safeJson(findReplyRef(args)));
         const replyContext = buildPayloadContext(channelId, args, findReplyRef(args), ans.forced);
-        log("payload context:", replyContext.replace(/\n/g, " | ").slice(0, 180));
+        log("payload context (handleSendMessage):\n" + replyContext);
         inFlight = true;
 
         (async () => {
           const finalText = await produceFinalText(original, channelId, true, replyContext, ans.forced);
           if (finalText === null) { inFlight = false; return; }
+          log("◀ handleSendMessage: sending " + JSON.stringify(finalText));
 
           try {
             if (typeof ChatInputModule.changeText === "function") ChatInputModule.changeText(finalText);
@@ -2370,6 +2526,7 @@
         const channelId = ctx && ctx.channel ? ctx.channel.id : undefined;
         if (!original.trim()) return;
 
+        log("▶ /ai-writer-magic: channel " + channelId + ", forced answer " + ans.forced + ", typed text: " + JSON.stringify(rawText));
         // Capture the reply target NOW, before the API call. Slash UI clears the pending reply.
         let replyTarget = null;
         let replyMention = null;
@@ -2382,8 +2539,8 @@
           log("reply capture failed:", e && e.message);
           try { replyContext = formatContext(null, ans.forced); } catch (e2) {}
         }
-        log("payload context (/ai-writer-magic):", replyContext.replace(/\n/g, " | ").slice(0, 180));
-        log("slash target:", replyTarget && replyTarget.id);
+        log("payload context (/ai-writer-magic):\n" + replyContext);
+        log("slash target: message id " + (replyTarget && replyTarget.id) + ", ping the replied user: " + replyMention);
 
         try {
           // Let the slash UI close before the preview opens.
@@ -2414,6 +2571,7 @@
           } else {
             log("slash: no reply target for", channelId);
           }
+          log("◀ /ai-writer-magic: sending to channel " + channelId + ": " + safeJson({ payload: payload, extra: extra }));
           MessageModules.sendMessage(channelId, payload, undefined, extra);
           clearPending(channelId);
         } catch (e) {
@@ -2629,6 +2787,7 @@
       if (list.some((x) => x && x.key === k)) return showToast("Key already added");
       const nextId = list.reduce((m, x) => Math.max(m, (x && x.id) || 0), 0) + 1;
       storage.apiKeys = list.concat([{ id: nextId, key: k }]);
+      log("settings: API key #" + nextId + " added (" + maskKey(k) + ")");
       setNewKey("");
     };
     // Tests one key and writes the result into the row. Returns the result (or null for an empty key).
@@ -2665,6 +2824,7 @@
       setTestingAll(false);
     };
     const removeKey = (id) => {
+      log("settings: API key #" + id + " removed");
       storage.apiKeys = (storage.apiKeys || []).filter((x) => x && x.id !== id);
     };
     const confirmRemoveKey = (k) => {
@@ -2674,6 +2834,15 @@
         confirmText: "Delete",
         confirmColor: "red",
         onConfirm: () => removeKey(k.id),
+      });
+    };
+    const confirmResetStats = () => {
+      confirmDialog({
+        title: "Reset statistics?",
+        body: "The running token and request totals shown in the preview box will go back to zero. This can't be undone.",
+        confirmText: "Reset",
+        confirmColor: "red",
+        onConfirm: () => { resetUsageStats(); showToast("Statistics reset"); },
       });
     };
     const onAdvancedToggle = (v) => {
@@ -2882,6 +3051,17 @@
           "Numbers are calculated exactly with JavaScript (percentages, roots, powers, trig, big numbers) and the AI writes short steps built from those results, re-checked against them"),
         sw("Preview before sending", storage.previewBeforeSend !== false, (v) => { storage.previewBeforeSend = v; }, "Send / Edit / Copy prompt / Cancel"),
       ]), 
+      group("Preview Stats 📊", [
+        sw("Show token usage in preview", storage.showUsage !== false, (v) => { storage.showUsage = v; },
+          "Tokens used, rate limits and running totals inside the preview box"),
+        h(TableRow, {
+          label: "Usage statistics",
+          subLabel: statsSummary() || "Nothing recorded yet",
+        }),
+        h(View, { style: { paddingHorizontal: 16, paddingBottom: 14, paddingTop: 4, backgroundColor: ROW_BG } },
+          button("Reset statistics", RED, confirmResetStats, false)
+        ),
+      ]),
       group("Skip auto-rewrite for 🚫", [
         sw("Pings", storage.skipMentions !== false, (v) => { storage.skipMentions = v; }, "@user, @role, @everyone, @here"),
         sw("Links", storage.skipLinks !== false, (v) => { storage.skipLinks = v; }, "http(s) links, www., Discord invites"),
@@ -2916,6 +3096,9 @@
           h(View, { style: { flex: 1, marginRight: 8 } }, button("Write log", GREEN, uiWriteLog, true)),
           h(View, { style: { flex: 1, marginRight: 8 } }, button("Share log", "#4e5058", uiShareLog, true)),
           h(View, { style: { flex: 1 } }, button("Clear log", RED, uiClearLog, true))
+        ),
+        h(View, { style: { paddingHorizontal: 16, paddingBottom: 12, backgroundColor: ROW_BG } },
+          button("Export log to " + EXPORT_DIR, "#5865f2", uiExportLog, false)
         ),
       ]),
       group("Groq API Keys 🔑", [
@@ -3166,6 +3349,8 @@
     if (typeof storage.skipBotCommands !== "boolean") storage.skipBotCommands = true;
     if (typeof storage.debugToasts !== "boolean") storage.debugToasts = false;
     if (typeof storage.logToFile !== "boolean") storage.logToFile = false;
+    if (typeof storage.showUsage !== "boolean") storage.showUsage = true;
+    if (!getStats()) storage.usageStats = emptyStats();
     if (typeof storage.ctxWindow !== "boolean") storage.ctxWindow = true;
     if (typeof storage.ctxIncludeOthers !== "boolean") storage.ctxIncludeOthers = true;
     if (!Number.isFinite(parseInt(storage.ctxBefore, 10))) storage.ctxBefore = CTX_BEFORE_DEF;
@@ -3178,6 +3363,17 @@
     if (typeof storage.composioApiKey !== "string") storage.composioApiKey = "";
     if (typeof storage.exaApiKey !== "string") storage.exaApiKey = "";
 
+    try {
+      log("plugin loaded. settings:\n" + safeJson({
+        autoRewrite: storage.autoRewrite, answerQuestions: storage.answerQuestions, previewBeforeSend: storage.previewBeforeSend,
+        model: storage.model, personality: storage.personality, typingDuration: storage.typingDuration,
+        skip: { mentions: storage.skipMentions, links: storage.skipLinks, botCommands: storage.skipBotCommands },
+        replyContext: { window: storage.ctxWindow, includeOthers: storage.ctxIncludeOthers, before: storage.ctxBefore, after: storage.ctxAfter, history: storage.ctxHistory, readImages: storage.readImages },
+        mathTool: storage.mathTool, advancedEnabled: storage.advancedEnabled, searchEnabled: storage.searchEnabled,
+        showUsage: storage.showUsage, debugToasts: storage.debugToasts, logToFile: storage.logToFile,
+        apiKeys: getKeys().map(maskKey), exaKeySet: !!(storage.exaApiKey || "").trim(), composioKeySet: !!(storage.composioApiKey || "").trim(),
+      }, 2));
+    } catch (e) {}
     try { patchSettingsScreen(); } catch (e) { log("settings patch error", e && e.message); }
     try { startReplyWatch(); } catch (e) { log("reply watch error", e && e.message); }
     try {
