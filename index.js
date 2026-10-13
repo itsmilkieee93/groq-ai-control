@@ -3269,7 +3269,7 @@
           alignItems: "center",
           justifyContent: "center",
         },
-      }, h(Text, { style: { color: "#ffffff", fontWeight: "700", fontSize: small ? 14 : 15 } }, label));
+      }, h(Text, { numberOfLines: 1, style: { color: "#ffffff", fontWeight: "700", fontSize: small ? 14 : 15 } }, label));
 
     // Labelled text field drawn as a real input box (own column/row), not bare text.
     const P = getPalette();
@@ -3409,7 +3409,7 @@
           subLabel: statsSummary() || "Nothing recorded yet",
         }),
         h(View, { style: { paddingHorizontal: 16, paddingVertical: 12, backgroundColor: ROW_BG } },
-          button("Reset statistics", RED, confirmResetStats, false)
+          button("Reset statistics", RED, confirmResetStats, true)
         ),
       ]),
       group("Skip auto-rewrite for 🚫", [
@@ -3488,10 +3488,11 @@
             key: "key-" + k.id,
             label: "#" + k.id + "  " + mask(k.key),
             subLabel: testState[k.id] ? testState[k.id].text : undefined,
-            trailing: h(View, { style: { flexDirection: "row", alignItems: "center" } },
-              h(View, { style: { marginRight: 8, opacity: busy || testingAll ? 0.6 : 1 } },
+            trailing: h(View, { style: { flexDirection: "row", alignItems: "center", marginRight: 4 } },
+              h(View, { style: { width: 96, marginRight: 8, opacity: busy || testingAll ? 0.6 : 1 } },
                 button(busy ? "Testing…" : "Test", "#5865f2", () => testSingleKey(k), true)),
-              button("Delete", RED, () => confirmRemoveKey(k), true)
+              h(View, { style: { width: 96 } },
+                button("Delete", RED, () => confirmRemoveKey(k), true))
             ),
           });
         }),
@@ -3505,12 +3506,12 @@
             onSubmitEditing: addKey,
           })
         ),
-        h(View, { style: { paddingHorizontal: 16, paddingBottom: 16, paddingTop: 4, backgroundColor: ROW_BG } },
-          button("Add API key", GREEN, addKey, false)
+        h(View, { style: { paddingHorizontal: 16, paddingVertical: 12, backgroundColor: ROW_BG } },
+          button("Add API key", GREEN, addKey, true)
         ),
         keys.length > 0
-          ? h(View, { style: { paddingHorizontal: 16, paddingBottom: 16, backgroundColor: ROW_BG } },
-              button(testingAll ? "Testing…" : "Test API keys", "#5865f2", runKeyTests, false)
+          ? h(View, { style: { paddingHorizontal: 16, paddingVertical: 12, backgroundColor: ROW_BG } },
+              button(testingAll ? "Testing…" : "Test API keys", "#5865f2", runKeyTests, true)
             )
           : null,
       ]),
