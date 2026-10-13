@@ -904,9 +904,10 @@
     showToast("Log cleared");
   }
 
-  // 📤 Export into Discord's own package folder under Android/data/<package>/files/
-  // (or the internal equivalent). That is the only location Discord's file manager can
-  // reliably write. Share then sends the real file so you can copy it elsewhere.
+  // 📤 Prefer external package folder:
+  //   /storage/emulated/0/Android/data/<package>/files/AIWriterMagicExports/
+  // "documents" alone often maps to internal /data/user/0/<package>/files. We try external
+  // directory types, absolute external paths, then fall back to internal documents.
   const APP_EXPORT_SUBDIR = "AIWriterMagicExports";
   let lastExported = { path: "", name: "", text: "" };
 
@@ -931,34 +932,101 @@
     } catch (e) { return {}; }
   }
 
-  // Prefer the external Android/data/<package>/files path when the module exposes it.
-  function getDocumentsBase() {
+  function cleanPath(p) {
+    return String(p || "").replace(/^file:\/\//, "").replace(/\/+$/, "");
+  }
+
+  function packageFromPath(p) {
+    const s = cleanPath(p);
+    let m = s.match(/\/Android\/data\/([^/]+)/);
+    if (m) return m[1];
+    m = s.match(/\/data\/(?:user\/\d+|data)\/([^/]+)/);
+    if (m) return m[1];
+    return "";
+  }
+
+  function getPathCandidates() {
     const c = getFileManagerConstants();
-    // Common keys used by Discord / RN file modules
-    const candidates = [
+    const raw = [
       c.ExternalFilesDirPath,
       c.ExternalDirectoryPath,
       c.ExternalStorageDirectoryPath,
       c.DocumentsDirPath,
       c.FilesDirPath,
-    ].filter(Boolean).map((p) => String(p).replace(/^file:\/\//, "").replace(/\/+$/, ""));
-    // Prefer a path that already lives under /storage/emulated/0/Android/data/
-    for (let i = 0; i < candidates.length; i++) {
-      if (candidates[i].indexOf("/Android/data/") !== -1) return candidates[i];
+      c.CacheDirPath,
+    ].filter(Boolean).map(cleanPath);
+    const pkg = packageFromPath(raw.find(Boolean) || "") || "com.discord";
+    const externalPkg = "/storage/emulated/0/Android/data/" + pkg + "/files";
+    const ordered = [externalPkg];
+    for (let i = 0; i < raw.length; i++) {
+      if (raw[i] && ordered.indexOf(raw[i]) === -1) ordered.push(raw[i]);
     }
-    return candidates[0] || "";
+    return { paths: ordered, packageName: pkg, externalPkg: externalPkg };
   }
 
-  // Writes into the app package documents folder: …/Android/data/<package>/files/AIWriterMagicExports/
   async function writeAppFile(text, name) {
     const fm = getFileManager();
     if (!fm) throw new Error("file manager not available");
     const rel = APP_EXPORT_SUBDIR + "/" + name;
-    await fm.writeFile("documents", rel, text, "utf8");
-    const base = getDocumentsBase();
-    const path = (base ? base + "/" : "documents/") + rel;
-    lastExported = { path: path, name: name, text: text };
-    return path;
+    const info = getPathCandidates();
+    const fallbacks = [];
+
+    // 1) External-style directory keys first
+    const dirTypes = ["external", "externalFiles", "external_files", "files", "documents"];
+    for (let i = 0; i < dirTypes.length; i++) {
+      try {
+        await fm.writeFile(dirTypes[i], rel, text, "utf8");
+        const isExt = dirTypes[i].indexOf("external") !== -1 || dirTypes[i] === "files";
+        const path = isExt
+          ? info.externalPkg + "/" + rel
+          : (info.paths.find((p) => p.indexOf("/Android/data/") !== -1) || info.paths[0] || "documents") + "/" + rel;
+        lastExported = { path: path, name: name, text: text };
+        if (isExt) return path;
+        fallbacks.push(path);
+      } catch (e) {}
+    }
+
+    // 2) Absolute external package path
+    const absTargets = [
+      info.externalPkg + "/" + rel,
+      "/sdcard/Android/data/" + info.packageName + "/files/" + rel,
+    ];
+    for (let i = 0; i < absTargets.length; i++) {
+      const abs = absTargets[i];
+      try {
+        await fm.writeFile("documents", abs, text, "utf8");
+        lastExported = { path: abs, name: name, text: text };
+        return abs;
+      } catch (e) {
+        try {
+          await fm.writeFile("", abs, text, "utf8");
+          lastExported = { path: abs, name: name, text: text };
+          return abs;
+        } catch (e2) {}
+      }
+    }
+
+    // 3) Relative climb from documents → external package
+    const climbs = [
+      "../../../../../../storage/emulated/0/Android/data/" + info.packageName + "/files/" + rel,
+      "../../../../../storage/emulated/0/Android/data/" + info.packageName + "/files/" + rel,
+      "../../../../storage/emulated/0/Android/data/" + info.packageName + "/files/" + rel,
+    ];
+    for (let i = 0; i < climbs.length; i++) {
+      try {
+        await fm.writeFile("documents", climbs[i], text, "utf8");
+        const path = info.externalPkg + "/" + rel;
+        lastExported = { path: path, name: name, text: text };
+        return path;
+      } catch (e) {}
+    }
+
+    // 4) Use first successful documents/files write
+    if (fallbacks.length) {
+      lastExported = { path: fallbacks[0], name: name, text: text };
+      return fallbacks[0];
+    }
+    throw new Error("could not write file (external + documents both failed)");
   }
 
   // Shares the last exported file (file URI when possible).
@@ -995,7 +1063,8 @@
     const text = buildExportText();
     try {
       const path = await writeAppFile(text, name);
-      showToast("Exported under Android/data (package): " + path);
+      const isExt = String(path).indexOf("/Android/data/") !== -1;
+      showToast((isExt ? "Exported to Android/data: " : "Exported (internal only): ") + path);
     } catch (e) {
       showToast("Export failed: " + ((e && e.message) || "unknown"));
     }
@@ -1061,7 +1130,8 @@
     const name = "ai_writer_magic_settings_" + exportStamp() + ".json";
     try {
       const path = await writeAppFile(text, name);
-      showToast("Settings exported under Android/data (package): " + path);
+      const isExt = String(path).indexOf("/Android/data/") !== -1;
+      showToast((isExt ? "Settings exported to Android/data: " : "Settings exported (internal only): ") + path);
     } catch (e) {
       showToast("Settings export failed: " + ((e && e.message) || "unknown"));
     }
