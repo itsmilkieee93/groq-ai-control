@@ -1993,6 +1993,7 @@
     if (storage.showUsage === false) return null; // "Show token usage in preview" is off
     if (!u) return null;
     const lines = [];
+    if (u.model) lines.push("AI model: " + modelLabel(u.model));
     if (u.total > 0) lines.push("Used " + fmtNum(u.total) + " tokens (" + fmtNum(u.prompt) + " in · " + fmtNum(u.completion) + " out)");
     if (u.elapsedMs != null) lines.push("AI responded in " + u.elapsedMs + " ms");
     if (u.remTokens != null) {
@@ -2013,8 +2014,25 @@
     return lines.length ? lines : null;
   }
 
+  // 🌸 Words that are just an instruction to the AI ("reply", "hi"...), never worth a web search on their own.
+  const SEARCH_SKIP_WORDS = new Set(["reply", "answer", "respond", "say", "hi", "hello", "hey", "ok", "okay"]);
+
+  // Returns the text to search the web for, or "" when the input is only a tag, a command word or a greeting.
+  function buildSearchQuery(text) {
+    // Strip the leading tag: [Answer], [ans], !ans, ~ans, !~{ans}, (answer)... plus a trailing ":" or "-".
+    // "answer" must come before "ans" in the alternation, otherwise "answer" is cut to "ans" and "wer" is left behind.
+    const cleaned = String(text || "")
+      .replace(/^\s*[!~]*\s*[\[{(]?\s*(?:answer|ans)\b\s*[\]})]?\s*[:,\-–—]?\s*/i, "")
+      .trim();
+    if (cleaned.length < 5) return "";
+    // Only command words / greetings (ignoring punctuation and emoji)? Then there is nothing to look up.
+    const words = cleaned.toLowerCase().split(/[^\p{L}\p{N}']+/u).filter(Boolean);
+    if (!words.length || words.every((w) => SEARCH_SKIP_WORDS.has(w))) return "";
+    return cleaned.slice(0, 200);
+  }
+
   async function callGroq(apiKey, text, replyContext = "", forceAnswer = false) {
-    const usage = { prompt: 0, completion: 0, total: 0, remTokens: null, limTokens: null, remReq: null, limReq: null, resetTokens: null, resetReq: null, resetReqAt: null, elapsedMs: null };
+    const usage = { model: null, prompt: 0, completion: 0, total: 0, remTokens: null, limTokens: null, remReq: null, limReq: null, resetTokens: null, resetReq: null, resetReqAt: null, elapsedMs: null };
     lastUsage = usage;
     const started = Date.now();
     const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
@@ -2046,8 +2064,9 @@
 
     // 🌸 Optional web search grounding for answers (skipped for plain math: JS already has the answer, and it saves tokens).
     if (!mathIsMain && (forceAnswer || storage.answerQuestions !== false) && storage.searchEnabled === true) {
-      const searchQuery = String(text || "").replace(/^[!~\[]?(ans|answer)\]?\s*/i, "").trim().slice(0, 200);
-      if (searchQuery.length >= 4) {
+      const searchQuery = buildSearchQuery(text);
+      if (!searchQuery) log("web search skipped: nothing worth searching in " + JSON.stringify(text));
+      if (searchQuery) {
         const results = await searchWeb(searchQuery);
         if (results) {
           systemPrompt += "\n\n=== LIVE WEB SEARCH RESULTS (prefer them over your memory for facts, dates, news and current info; cite the source briefly when useful) ===\n" +
@@ -2153,6 +2172,7 @@
           data: data,
         }, 2));
         try {
+          usage.model = model; // shown in the preview box (last model used; the vision model when images were read)
           const u = data && data.usage;
           if (u) {
             usage.prompt += u.prompt_tokens || 0;
@@ -2470,6 +2490,9 @@
       : { rowBg: "#151517", border: "#303136", text: "#f2f3f5", title: "#dbdee1", muted: "#b5bac1", placeholder: "#80848e", card: "#2b2d31" };
   }
 
+  // Discord's native CopyIcon asset id (used for the square copy-response button in the preview sheet).
+  const COPY_ASSET = 1941;
+
   function PreviewSheet(props) {
     const { View, Text, TextInput, TouchableOpacity, ScrollView } = RN;
     const { original, finalText, finish, startEditing, onShown, usage } = props;
@@ -2531,16 +2554,33 @@
       h(Text, { style: { color: C.muted, fontSize: 12, fontWeight: "700", textTransform: "uppercase", marginBottom: 8 } }, "Preview"),
       h(
         View,
-        { style: { backgroundColor: C.card, borderRadius: 10, padding: 12, maxHeight: 240 } },
-        editing
-          ? h(TextInput, {
-              value: text,
-              onChangeText: setText,
-              multiline: true,
-              autoFocus: true,
-              style: { color: C.text, fontSize: 15, padding: 0, maxHeight: 216, textAlignVertical: "top" },
-            })
-          : h(ScrollView, null, h(Text, { selectable: true, style: { color: C.text, fontSize: 15 } }, text))
+        { style: { flexDirection: "row", alignItems: "flex-start" } },
+        h(
+          View,
+          { style: { flex: 1, backgroundColor: C.card, borderRadius: 10, padding: 12, maxHeight: 240 } },
+          editing
+            ? h(TextInput, {
+                value: text,
+                onChangeText: setText,
+                multiline: true,
+                autoFocus: true,
+                style: { color: C.text, fontSize: 15, padding: 0, maxHeight: 216, textAlignVertical: "top" },
+              })
+            : h(ScrollView, null, h(Text, { selectable: true, style: { color: C.text, fontSize: 15 } }, text))
+        ),
+        // Square button on the right of the response box: copies the response (including any edits) using Discord's CopyIcon (asset 1941).
+        h(
+          TouchableOpacity,
+          {
+            onPress: () => {
+              if (!text || !text.trim()) return;
+              log("preview: Copy response pressed");
+              showToast(copyText(text) ? "Response copied to clipboard" : "Couldn't copy to clipboard");
+            },
+            style: { width: 44, height: 44, marginLeft: 8, borderRadius: 10, backgroundColor: C.card, alignItems: "center", justifyContent: "center" },
+          },
+          h(RN.Image, { source: COPY_ASSET, style: { width: 22, height: 22, tintColor: C.text } })
+        )
       ),
       usageView,
       ...buttonRows
@@ -3368,7 +3408,7 @@
           label: "Usage statistics",
           subLabel: statsSummary() || "Nothing recorded yet",
         }),
-        h(View, { style: { paddingHorizontal: 16, paddingBottom: 14, paddingTop: 4, backgroundColor: ROW_BG } },
+        h(View, { style: { paddingHorizontal: 16, paddingVertical: 12, backgroundColor: ROW_BG } },
           button("Reset statistics", RED, confirmResetStats, false)
         ),
       ]),
@@ -3413,7 +3453,7 @@
         h(View, { style: { paddingHorizontal: 16, paddingTop: 4, paddingBottom: 14, backgroundColor: ROW_BG } },
           h(Text, { style: { color: RED, fontSize: 12, lineHeight: 18 } }, "⚠️ " + LOG_WARNING)
         ),
-        h(View, { style: { paddingHorizontal: 16, paddingBottom: 12, backgroundColor: ROW_BG } },
+        h(View, { style: { paddingHorizontal: 16, paddingVertical: 12, backgroundColor: ROW_BG } },
           button("Copy native module report", "#4e5058", uiCopyNativeReport, true)
         ),
       ]),
