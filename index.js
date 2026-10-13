@@ -904,12 +904,11 @@
     showToast("Log cleared");
   }
 
-  // 📤 Export to app data folder, then share the real file.
-  // Discord's file manager can only reliably write inside the app's own documents folder.
-  // We write there, then Share opens the system share sheet with the file URI so the user
-  // can save it anywhere (including /storage/emulated/0/Discord).
+  // 📤 Export into Discord's own package folder under Android/data/<package>/files/
+  // (or the internal equivalent). That is the only location Discord's file manager can
+  // reliably write. Share then sends the real file so you can copy it elsewhere.
   const APP_EXPORT_SUBDIR = "AIWriterMagicExports";
-  let lastExported = { path: "", name: "", text: "" }; // last file written, for Share
+  let lastExported = { path: "", name: "", text: "" };
 
   function exportStamp() {
     const d = new Date();
@@ -925,28 +924,44 @@
       logBuffer.join("\n") + "\n";
   }
 
-  function getDocumentsBase() {
+  function getFileManagerConstants() {
     try {
       const fm = getFileManager();
-      const c = fm && typeof fm.getConstants === "function" ? fm.getConstants() : null;
-      return (c && c.DocumentsDirPath) || "";
-    } catch (e) { return ""; }
+      return (fm && typeof fm.getConstants === "function") ? (fm.getConstants() || {}) : {};
+    } catch (e) { return {}; }
   }
 
-  // Writes text into the app documents folder under AIWriterMagicExports/.
-  // Returns the absolute path when known, otherwise the relative path.
+  // Prefer the external Android/data/<package>/files path when the module exposes it.
+  function getDocumentsBase() {
+    const c = getFileManagerConstants();
+    // Common keys used by Discord / RN file modules
+    const candidates = [
+      c.ExternalFilesDirPath,
+      c.ExternalDirectoryPath,
+      c.ExternalStorageDirectoryPath,
+      c.DocumentsDirPath,
+      c.FilesDirPath,
+    ].filter(Boolean).map((p) => String(p).replace(/^file:\/\//, "").replace(/\/+$/, ""));
+    // Prefer a path that already lives under /storage/emulated/0/Android/data/
+    for (let i = 0; i < candidates.length; i++) {
+      if (candidates[i].indexOf("/Android/data/") !== -1) return candidates[i];
+    }
+    return candidates[0] || "";
+  }
+
+  // Writes into the app package documents folder: …/Android/data/<package>/files/AIWriterMagicExports/
   async function writeAppFile(text, name) {
     const fm = getFileManager();
     if (!fm) throw new Error("file manager not available");
     const rel = APP_EXPORT_SUBDIR + "/" + name;
     await fm.writeFile("documents", rel, text, "utf8");
     const base = getDocumentsBase();
-    const path = (base ? base.replace(/\/+$/, "") + "/" : "") + rel;
+    const path = (base ? base + "/" : "documents/") + rel;
     lastExported = { path: path, name: name, text: text };
     return path;
   }
 
-  // Shares the last exported file. Prefers a file URI; falls back to the text content.
+  // Shares the last exported file (file URI when possible).
   async function shareLastFile() {
     const info = lastExported;
     if (!info || !info.path) {
@@ -956,7 +971,6 @@
     const fileUrl = info.path.indexOf("://") === -1 ? "file://" + info.path : info.path;
     try {
       if (RN.Share && typeof RN.Share.share === "function") {
-        // Android Share supports url for file sharing in many versions.
         await RN.Share.share({
           url: fileUrl,
           message: info.text,
@@ -965,9 +979,7 @@
         });
         return;
       }
-    } catch (e) {
-      // fall through to text-only share
-    }
+    } catch (e) {}
     try {
       if (RN.Share && typeof RN.Share.share === "function") {
         await RN.Share.share({ message: info.text, title: info.name });
@@ -983,7 +995,7 @@
     const text = buildExportText();
     try {
       const path = await writeAppFile(text, name);
-      showToast("Exported to app data: " + path);
+      showToast("Exported under Android/data (package): " + path);
     } catch (e) {
       showToast("Export failed: " + ((e && e.message) || "unknown"));
     }
@@ -1049,7 +1061,7 @@
     const name = "ai_writer_magic_settings_" + exportStamp() + ".json";
     try {
       const path = await writeAppFile(text, name);
-      showToast("Settings exported to app data: " + path);
+      showToast("Settings exported under Android/data (package): " + path);
     } catch (e) {
       showToast("Settings export failed: " + ((e && e.message) || "unknown"));
     }
@@ -3221,7 +3233,7 @@
       group("Settings backup 💾", [
         h(View, { style: { paddingHorizontal: 16, paddingTop: 12, paddingBottom: 6, backgroundColor: ROW_BG } },
           h(Text, { style: { color: P.muted, fontSize: 12, lineHeight: 18 } },
-            "Exports all settings (including API keys) as a JSON file into the app data folder. Use Share file to send it, or paste the JSON below to import.")
+            "Exports all settings (including API keys) into Discord's package folder under /storage/emulated/0/Android/data/<package>/files/AIWriterMagicExports/. Use Share file to send or save the file elsewhere, or paste JSON below to import.")
         ),
         h(View, { style: { paddingHorizontal: 16, paddingBottom: 8, backgroundColor: ROW_BG } },
           h(View, { style: { flexDirection: "row" } },
