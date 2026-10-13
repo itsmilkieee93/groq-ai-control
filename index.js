@@ -1060,15 +1060,15 @@
       lastExported = { path: docsPath, name: name, text: text };
       return { path: docsPath, external: false, verified: false };
     }
-    // Nothing verified: keep the text so "Share file" still works, then fail honestly.
+    // Nothing verified: remember the text, then fail honestly.
     lastExported = { path: "", name: name, text: text };
     throw new Error("file was not found after writing (" + (problems.join("; ") || "unknown") + ")");
   }
 
   function exportToastText(label, r) {
     if (r.external && r.verified) return label + " exported & verified: " + r.path;
-    if (r.verified) return label + " saved in app-private storage (not visible in file managers): " + r.path + " - use Share file";
-    return label + " written but could not be verified: " + r.path + " - use Share file";
+    if (r.verified) return label + " saved in app-private storage (not visible in file managers): " + r.path;
+    return label + " written but could not be verified: " + r.path;
   }
 
   // Sensitive-data warnings (shown in settings, in a confirm before sharing, and inside the files).
@@ -1123,137 +1123,12 @@
     showToast(copyText(text) ? "Native module report copied to clipboard" : "Couldn't copy report");
   }
 
-  // react-native-share style sharer (open({url,type,...})), if this Discord build ships one.
-  function findNativeFileSharer() {
-    const names = ["RNShare", "RNShareModule", "RNShareOpen"];
-    const sources = [];
-    try { if (RN.NativeModules) sources.push(RN.NativeModules); } catch (e) {}
-    try { if (typeof nativeModuleProxy !== "undefined" && nativeModuleProxy) sources.push(nativeModuleProxy); } catch (e) {}
-    for (let i = 0; i < sources.length; i++) {
-      for (let j = 0; j < names.length; j++) {
-        try { const m = sources[i][names[j]]; if (m && typeof m.open === "function") return m; } catch (e) {}
-      }
-    }
-    log("share: no file-capable share module. Report:\n" + nativeModuleReport());
-    return null;
-  }
-
-  // UTF-8 bytes of a string (TextEncoder when present, manual encoder otherwise).
-  function utf8Bytes(str) {
-    try { if (typeof TextEncoder !== "undefined") return new TextEncoder().encode(str); } catch (e) {}
-    const out = [];
-    for (let i = 0; i < str.length; i++) {
-      let c = str.charCodeAt(i);
-      if (c >= 0xd800 && c <= 0xdbff && i + 1 < str.length) {
-        const d = str.charCodeAt(i + 1);
-        if (d >= 0xdc00 && d <= 0xdfff) { c = 0x10000 + ((c - 0xd800) << 10) + (d - 0xdc00); i++; }
-      }
-      if (c < 0x80) out.push(c);
-      else if (c < 0x800) out.push(0xc0 | (c >> 6), 0x80 | (c & 63));
-      else if (c < 0x10000) out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
-      else out.push(0xf0 | (c >> 18), 0x80 | ((c >> 12) & 63), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
-    }
-    return Uint8Array.from(out);
-  }
-
-  // Chunked Base64 (no btoa, no String.fromCharCode.apply) - safe for large logs.
-  const B64_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-  function bytesToBase64(bytes) {
-    const CHUNK = 3 * 4096; // multiple of 3, so padding only ever appears in the last chunk
-    const parts = [];
-    for (let i = 0; i < bytes.length; i += CHUNK) {
-      const end = Math.min(i + CHUNK, bytes.length);
-      let s = "";
-      let j = i;
-      for (; j + 2 < end; j += 3) {
-        const n = (bytes[j] << 16) | (bytes[j + 1] << 8) | bytes[j + 2];
-        s += B64_CHARS[(n >> 18) & 63] + B64_CHARS[(n >> 12) & 63] + B64_CHARS[(n >> 6) & 63] + B64_CHARS[n & 63];
-      }
-      if (j < end) {
-        const two = end - j > 1;
-        const n = (bytes[j] << 16) | ((two ? bytes[j + 1] : 0) << 8);
-        s += B64_CHARS[(n >> 18) & 63] + B64_CHARS[(n >> 12) & 63] + (two ? B64_CHARS[(n >> 6) & 63] : "=") + "=";
-      }
-      parts.push(s);
-    }
-    return parts.join("");
-  }
-
-async function shareFileAttachment(info) {
-    if (!info || typeof info.text !== "string" || !info.name) return { ok: false, reason: "nothing to export" };
-    const PUBLIC_DIR = "/storage/emulated/0/Discord/AIWriterMagic";
-    const fm = getFileManager();
-    if (!fm) {
-      log("export: no file manager module");
-      return { ok: false, reason: "file manager not available" };
-    }
-    const safeName = String(info.name).replace(/[\\/:*?"<>|]/g, "_");
-    const target = PUBLIC_DIR + "/" + safeName;
-    const c = getFileManagerConstants(); // base directories come from getConstants()
-    const bases = [["documents", cleanPath(c.DocumentsDirPath)]];
-    if (c.CacheDirPath) bases.push(["cache", cleanPath(c.CacheDirPath)]);
-    const problems = [];
-    for (let i = 0; i < bases.length; i++) {
-      const dirType = bases[i][0];
-      const base = bases[i][1];
-      // Climb from the module's base dir to the filesystem root (extra "../" is harmless at root).
-      const depth = (base ? base.split("/").filter(Boolean).length : 10) + 2;
-      const rel = "../".repeat(depth) + PUBLIC_DIR.replace(/^\//, "") + "/" + safeName;
-      try {
-        await fm.writeFile(dirType, rel, info.text, "utf8");
-        const st = await verifyFile(fm, target, info.text);
-        log("export: public write", dirType, target, st);
-        if (st === "ok") return { ok: true, path: target };
-        problems.push(dirType + ": " + st);
-      } catch (e) {
-        problems.push(dirType + " write failed: " + ((e && e.message) || e));
-        log("export: public write failed", dirType, e);
-      }
-    }
-    return { ok: false, reason: problems.join("; ") || "unknown" };
-  }
-
-  // kind = "log" | "settings": each Share file button only exports its own file.
-  const lastExportedByKind = { log: null, settings: null };
-
-  function uiShareExported(kind) {
-    const info = lastExportedByKind[kind];
-    if (!info) {
-      showToast(kind === "settings" ? "Export settings first" : "Export log first");
-      return;
-    }
-    // Kept on purpose: the file is about to land in a folder every app with storage access can read.
-    confirmDialog({
-      title: "⚠️ Sensitive information",
-      body: (kind === "settings" ? SETTINGS_WARNING : LOG_WARNING) +
-        "\n\nSave " + info.name + " to Downloads/AIWriterMagic? Other apps with storage access can read it.",
-      confirmText: "Save",
-      confirmColor: kind === "settings" ? "red" : "brand",
-      onConfirm: async () => {
-        let r = { ok: false };
-        try { r = await shareFileAttachment(info); } catch (e) { log("export: unexpected error", e); }
-        if (r && r.ok) {
-          showToast("The file " + info.name + " was saved successfully! Please open your phone's File Manager app in the Downloads/AIWriterMagic folder to retrieve the original document.");
-          return;
-        }
-        log("export: public folder unavailable, using clipboard backup:", r && r.reason);
-        // Final safety net: storage denied -> put the contents on the clipboard.
-        let copied = false;
-        try { copied = !!copyText(info.text); } catch (e) {}
-        showToast(copied
-          ? "Storage access denied! Backup text automatically copied to clipboard."
-          : "Storage access denied and the clipboard copy failed. Please export again.");
-      },
-    });
-  }
-  
   async function uiExportLog() {
     if (!logBuffer.length) { showToast("Log is empty, nothing to export"); return; }
     const name = "ai_writer_magic_" + exportStamp() + ".txt";
     const text = buildExportText();
     try {
       const r = await writeAppFile(text, name);
-      lastExportedByKind.log = { path: lastExported.path, name: name, text: text };
       showToast(exportToastText("Log", r));
     } catch (e) {
       showToast("Export failed: " + ((e && e.message) || "unknown"));
@@ -1317,7 +1192,6 @@ async function shareFileAttachment(info) {
     try {
       const r = await writeAppFile(text, name);
       if (r && r.path) storage.lastSettingsExportPath = r.path;
-      lastExportedByKind.settings = { path: lastExported.path, name: name, text: text };
       showToast(exportToastText("Settings", r));
     } catch (e) {
       showToast("Settings export failed: " + ((e && e.message) || "unknown"));
@@ -3521,8 +3395,7 @@ async function shareFileAttachment(info) {
           h(View, { style: { flex: 1 } }, button("Clear log", RED, uiClearLog, true))
         ),
         h(View, { style: { flexDirection: "row", paddingHorizontal: 16, paddingVertical: 12, backgroundColor: ROW_BG } },
-          h(View, { style: { flex: 1, marginRight: 8 } }, button("Export log", "#5865f2", uiExportLog, true)),
-          h(View, { style: { flex: 1 } }, button("Share file", "#4e5058", () => uiShareExported("log"), true))
+          h(View, { style: { flex: 1 } }, button("Export log", "#5865f2", uiExportLog, true))
         ),
         h(View, { style: { paddingHorizontal: 16, paddingTop: 4, paddingBottom: 14, backgroundColor: ROW_BG } },
           h(Text, { style: { color: RED, fontSize: 12, lineHeight: 18 } }, "⚠️ " + LOG_WARNING)
@@ -3534,12 +3407,11 @@ async function shareFileAttachment(info) {
       group("Settings backup 💾", [
         h(View, { style: { paddingHorizontal: 16, paddingTop: 12, paddingBottom: 6, backgroundColor: ROW_BG } },
           h(Text, { style: { color: P.muted, fontSize: 12, lineHeight: 18 } },
-            "Exports all settings into Discord's package folder under /storage/emulated/0/Android/data/<package>/files/AIWriterMagicExports/. Share file sends the exported file. \"Import from file\" reads your last exported settings file (or paste JSON / a file path below to import something else)."),
+            "Exports all settings into Discord's package folder under /storage/emulated/0/Android/data/<package>/files/AIWriterMagicExports/. \"Import from file\" reads your last exported settings file (or paste JSON / a file path below to import something else)."),
           h(Text, { style: { color: RED, fontSize: 12, lineHeight: 18, marginTop: 8 } }, "⚠️ " + SETTINGS_WARNING)
         ),
         h(View, { style: { flexDirection: "row", paddingHorizontal: 16, paddingVertical: 12, backgroundColor: ROW_BG } },
-          h(View, { style: { flex: 1, marginRight: 8 } }, button("Export settings", "#5865f2", uiExportSettings, true)),
-          h(View, { style: { flex: 1 } }, button("Share file", "#4e5058", () => uiShareExported("settings"), true))
+          h(View, { style: { flex: 1 } }, button("Export settings", "#5865f2", uiExportSettings, true))
         ),
         h(View, { style: { paddingHorizontal: 16, paddingVertical: 8, backgroundColor: ROW_BG } },
           inputField("Import settings (paste JSON or file path)", {
