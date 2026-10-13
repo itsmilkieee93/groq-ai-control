@@ -1185,10 +1185,13 @@
     return applied;
   }
 
+  // Fixed name (no timestamp): every export overwrites it, and import always knows what to read.
+  const SETTINGS_FILE = "ai_writer_magic_settings.json";
+
   async function uiExportSettings() {
     const obj = collectSettings();
     const text = JSON.stringify(obj, null, 2);
-    const name = "ai_writer_magic_settings_" + exportStamp() + ".json";
+    const name = SETTINGS_FILE;
     try {
       const r = await writeAppFile(text, name);
       if (r && r.path) storage.lastSettingsExportPath = r.path;
@@ -1204,6 +1207,16 @@
     if (!fm || typeof fm.readFile !== "function") throw new Error("file manager can't read files here");
     let p = cleanPath(String(input || "").trim().replace(/^["']|["']$/g, ""));
     if (!p) p = cleanPath(storage.lastSettingsExportPath || (lastExported.name.endsWith(".json") ? lastExported.path : ""));
+    if (!p) {
+      // Fixed file name, so even without a remembered path we can look in the default export folders.
+      const docsDir = cleanPath(getFileManagerConstants().DocumentsDirPath);
+      const pkg = packageFromPath(docsDir) || "com.discord";
+      const cands = ["/storage/emulated/0/Android/data/" + pkg + "/files/" + APP_EXPORT_SUBDIR + "/" + SETTINGS_FILE];
+      if (docsDir) cands.push(docsDir + "/" + APP_EXPORT_SUBDIR + "/" + SETTINGS_FILE);
+      for (let i = 0; i < cands.length && !p; i++) {
+        try { if (typeof fm.fileExists !== "function" || (await fm.fileExists(cands[i]))) p = cands[i]; } catch (e) {}
+      }
+    }
     if (!p) throw new Error("no exported file known yet - export once, or paste a file path");
     if (p.indexOf("/") !== 0) {
       const docs = cleanPath(getFileManagerConstants().DocumentsDirPath);
