@@ -904,10 +904,13 @@
     showToast("Log cleared");
   }
 
-  // 📤 Export: whole in-memory log -> /storage/emulated/0/Discord/ai_writer_magic_YYYYMMDD_HHMMSS.txt
-  // Prefer a real file on external storage. The Discord file manager only accepts paths relative to
-  // the app documents folder, so we climb out with "../" (tried at several depths). Share is last resort.
-  const EXPORT_DIR = "/storage/emulated/0/Discord";
+  // 📤 Export to app data folder, then share the real file.
+  // Discord's file manager can only reliably write inside the app's own documents folder.
+  // We write there, then Share opens the system share sheet with the file URI so the user
+  // can save it anywhere (including /storage/emulated/0/Discord).
+  const APP_EXPORT_SUBDIR = "AIWriterMagicExports";
+  let lastExported = { path: "", name: "", text: "" }; // last file written, for Share
+
   function exportStamp() {
     const d = new Date();
     const p2 = (n) => (n < 10 ? "0" : "") + n;
@@ -922,60 +925,56 @@
       logBuffer.join("\n") + "\n";
   }
 
-  // Builds candidate relative paths that climb out of the app documents folder to the storage root.
-  function buildExternalCandidates(name) {
-    const fm = getFileManager();
-    let base = "";
+  function getDocumentsBase() {
     try {
+      const fm = getFileManager();
       const c = fm && typeof fm.getConstants === "function" ? fm.getConstants() : null;
-      base = (c && c.DocumentsDirPath) || "";
-    } catch (e) {}
-    const cleaned = String(base).replace(/^file:\/\//, "").replace(/\/+$/, "");
-    const depth = cleaned.split("/").filter(Boolean).length || 5;
-    const candidates = [];
-    for (let d = Math.max(3, depth - 2); d <= depth + 3; d++) {
-      const climb = new Array(d + 1).join("../");
-      candidates.push(climb + "storage/emulated/0/Discord/" + name);
-      candidates.push(climb + "sdcard/Discord/" + name);
-    }
-    candidates.push("/storage/emulated/0/Discord/" + name);
-    candidates.push("/sdcard/Discord/" + name);
-    return candidates;
+      return (c && c.DocumentsDirPath) || "";
+    } catch (e) { return ""; }
   }
 
-  // Try to write a text file under Discord/. Returns the path on success, throws on total failure.
-  async function writeExternalFile(text, name) {
+  // Writes text into the app documents folder under AIWriterMagicExports/.
+  // Returns the absolute path when known, otherwise the relative path.
+  async function writeAppFile(text, name) {
     const fm = getFileManager();
     if (!fm) throw new Error("file manager not available");
-    const candidates = buildExternalCandidates(name);
-    const errors = [];
-    for (let i = 0; i < candidates.length; i++) {
-      try {
-        await fm.writeFile("documents", candidates[i], text, "utf8");
-        return EXPORT_DIR + "/" + name;
-      } catch (e) {
-        errors.push((e && e.message) || String(e));
+    const rel = APP_EXPORT_SUBDIR + "/" + name;
+    await fm.writeFile("documents", rel, text, "utf8");
+    const base = getDocumentsBase();
+    const path = (base ? base.replace(/\/+$/, "") + "/" : "") + rel;
+    lastExported = { path: path, name: name, text: text };
+    return path;
+  }
+
+  // Shares the last exported file. Prefers a file URI; falls back to the text content.
+  async function shareLastFile() {
+    const info = lastExported;
+    if (!info || !info.path) {
+      showToast("Export a file first");
+      return;
+    }
+    const fileUrl = info.path.indexOf("://") === -1 ? "file://" + info.path : info.path;
+    try {
+      if (RN.Share && typeof RN.Share.share === "function") {
+        // Android Share supports url for file sharing in many versions.
+        await RN.Share.share({
+          url: fileUrl,
+          message: info.text,
+          title: info.name,
+          type: info.name.endsWith(".json") ? "application/json" : "text/plain",
+        });
+        return;
       }
+    } catch (e) {
+      // fall through to text-only share
     }
-    throw new Error(errors[0] || "all path variants failed");
-  }
-
-  // Try to read a text file from Discord/. Returns the content or null.
-  async function readExternalFile(name) {
-    const fm = getFileManager();
-    if (!fm || typeof fm.readFile !== "function") return null;
-    const candidates = buildExternalCandidates(name);
-    for (let i = 0; i < candidates.length; i++) {
-      try {
-        const content = await fm.readFile("documents", candidates[i], "utf8");
-        if (typeof content === "string" && content) return content;
-      } catch (e) {}
-    }
-    return null;
-  }
-
-  async function exportLogToSdcard(text, name) {
-    return writeExternalFile(text, name);
+    try {
+      if (RN.Share && typeof RN.Share.share === "function") {
+        await RN.Share.share({ message: info.text, title: info.name });
+        return;
+      }
+    } catch (e2) {}
+    showToast(copyText(info.text) ? "Copied to clipboard (share failed)" : "Couldn't share");
   }
 
   async function uiExportLog() {
@@ -983,19 +982,15 @@
     const name = "ai_writer_magic_" + exportStamp() + ".txt";
     const text = buildExportText();
     try {
-      const where = await exportLogToSdcard(text, name);
-      showToast("Log exported to " + where);
+      const path = await writeAppFile(text, name);
+      showToast("Exported to app data: " + path);
     } catch (e) {
-      const why = (e && e.message) || "unknown";
-      showToast("Couldn't write file to Discord folder (" + why + "). Opening share sheet instead");
-      try {
-        if (RN.Share && typeof RN.Share.share === "function") {
-          await RN.Share.share({ message: text, title: name });
-          return;
-        }
-      } catch (e2) {}
-      showToast(copyText(text) ? "Log copied to clipboard" : "Couldn't export, share or copy log");
+      showToast("Export failed: " + ((e && e.message) || "unknown"));
     }
+  }
+
+  async function uiShareExported() {
+    await shareLastFile();
   }
 
   // ---- Settings export / import (includes API keys) ----
@@ -1016,7 +1011,6 @@
       const k = SETTINGS_KEYS[i];
       if (storage[k] !== undefined) out[k] = storage[k];
     }
-    // Always include apiKeys even if empty, so import can clear them.
     if (!Array.isArray(out.apiKeys)) out.apiKeys = [];
     return out;
   }
@@ -1028,7 +1022,6 @@
       const k = SETTINGS_KEYS[i];
       if (!(k in obj)) continue;
       const v = obj[k];
-      // Basic type guards
       if (k === "apiKeys") {
         if (!Array.isArray(v)) continue;
         storage.apiKeys = v.filter((x) => x && typeof x.key === "string").map((x, idx) => ({
@@ -1055,32 +1048,19 @@
     const text = JSON.stringify(obj, null, 2);
     const name = "ai_writer_magic_settings_" + exportStamp() + ".json";
     try {
-      const where = await writeExternalFile(text, name);
-      showToast("Settings exported to " + where);
+      const path = await writeAppFile(text, name);
+      showToast("Settings exported to app data: " + path);
     } catch (e) {
-      const why = (e && e.message) || "unknown";
-      showToast("Couldn't write settings file (" + why + "). Opening share sheet");
-      try {
-        if (RN.Share && typeof RN.Share.share === "function") {
-          await RN.Share.share({ message: text, title: name });
-          return;
-        }
-      } catch (e2) {}
-      showToast(copyText(text) ? "Settings copied to clipboard" : "Couldn't export or copy settings");
+      showToast("Settings export failed: " + ((e && e.message) || "unknown"));
     }
   }
 
-  // Called from the settings page. jsonText is optional pasted JSON; if empty, tries to read a file from the Discord folder.
   async function importSettingsFrom(jsonText) {
     let raw = typeof jsonText === "string" ? jsonText.trim() : "";
-    if (!raw) {
-      raw = await readExternalFile("ai_writer_magic_settings.json") || "";
-      if (!raw) throw new Error("no JSON pasted and no ai_writer_magic_settings.json found in Discord folder");
-    }
+    if (!raw) throw new Error("paste the exported JSON first");
     let obj;
     try { obj = JSON.parse(raw); } catch (e) { throw new Error("invalid JSON"); }
     if (!obj || typeof obj !== "object") throw new Error("settings must be a JSON object");
-    // Soft check for our marker, but still accept plain objects that contain known keys.
     const applied = applySettings(obj);
     if (!applied) throw new Error("no recognized settings found");
     return applied;
@@ -3230,22 +3210,32 @@
           h(View, { style: { flex: 1 } }, button("Clear log", RED, uiClearLog, true))
         ),
         h(View, { style: { paddingHorizontal: 16, paddingBottom: 12, backgroundColor: ROW_BG } },
-          button("Export log to " + EXPORT_DIR, "#5865f2", uiExportLog, false)
+          h(View, { style: { flexDirection: "row" } },
+            h(View, { style: { flex: 1, marginRight: 8 } },
+              button("Export log", "#5865f2", uiExportLog, true)),
+            h(View, { style: { flex: 1 } },
+              button("Share file", "#4e5058", uiShareExported, true))
+          )
         ),
       ]),
       group("Settings backup 💾", [
         h(View, { style: { paddingHorizontal: 16, paddingTop: 12, paddingBottom: 6, backgroundColor: ROW_BG } },
           h(Text, { style: { color: P.muted, fontSize: 12, lineHeight: 18 } },
-            "Exports all plugin settings, including Groq / Exa / Composio API keys, as a JSON file to " + EXPORT_DIR + " (or opens the share sheet if writing fails).")
+            "Exports all settings (including API keys) as a JSON file into the app data folder. Use Share file to send it, or paste the JSON below to import.")
         ),
         h(View, { style: { paddingHorizontal: 16, paddingBottom: 8, backgroundColor: ROW_BG } },
-          button("Export settings", "#5865f2", uiExportSettings, false)
+          h(View, { style: { flexDirection: "row" } },
+            h(View, { style: { flex: 1, marginRight: 8 } },
+              button("Export settings", "#5865f2", uiExportSettings, true)),
+            h(View, { style: { flex: 1 } },
+              button("Share file", "#4e5058", uiShareExported, true))
+          )
         ),
         h(View, { style: { paddingHorizontal: 16, paddingVertical: 8, backgroundColor: ROW_BG } },
           inputField("Import settings (paste JSON)", {
             value: importJson,
             multiline: true,
-            placeholder: "Paste the exported JSON here, or leave empty to load ai_writer_magic_settings.json from the Discord folder…",
+            placeholder: "Paste exported JSON here…",
             style: { minHeight: 80, textAlignVertical: "top" },
             onChangeText: setImportJson,
           })
@@ -3257,7 +3247,6 @@
             try {
               const n = await importSettingsFrom(importJson);
               setImportJson("");
-              // Refresh local state that is not purely driven by storage proxy.
               setExaKeyInput(storage.exaApiKey || "");
               setComposioKeyInput(storage.composioApiKey || "");
               setCustomPrompt(typeof storage.customPrompt === "string" ? storage.customPrompt : "");
