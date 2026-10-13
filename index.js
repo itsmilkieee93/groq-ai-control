@@ -888,7 +888,16 @@
   }
 
   // The file lives in the app's private storage, so sharing (or copying) is the way to get it out.
-  async function uiShareLog() {
+  function uiShareLog() {
+    confirmDialog({
+      title: "⚠️ Sensitive information",
+      body: LOG_WARNING + "\n\nShare the last 300 log lines as text?",
+      confirmText: "Share",
+      onConfirm: () => { shareLogText(); },
+    });
+  }
+
+  async function shareLogText() {
     const text = logBuffer.slice(-300).join("\n") || "(log is empty)";
     try {
       if (RN.Share && typeof RN.Share.share === "function") {
@@ -921,7 +930,7 @@
     return "AI Writer Magic log\n" +
       "Exported: " + new Date().toISOString() + "\n" +
       "Entries: " + logBuffer.length + "\n" +
-      "Note: contains message text, usernames, IDs and the full AI request/response. API keys are masked.\n\n" +
+      "WARNING: " + LOG_WARNING + "\n\n" +
       logBuffer.join("\n") + "\n";
   }
 
@@ -1062,32 +1071,97 @@
     return label + " written but could not be verified: " + r.path + " - use Share file";
   }
 
-  // Shares the last exported file (file URI when possible).
-  async function shareLastFile() {
-    const info = lastExported;
+  // Sensitive-data warnings (shown in settings, in a confirm before sharing, and inside the files).
+  const LOG_WARNING = "The log contains message text, usernames, user/channel IDs and the full AI requests and replies. API keys are masked, but don't post it publicly.";
+  const SETTINGS_WARNING = "The settings file contains your API keys (Groq, Exa, Composio) in plain text. Never post it publicly or send it to anyone you don't trust.";
+
+  // Looks for native modules that can hand a real file to the Android share sheet.
+  // Only react-native-share's open() has a known shape; anything else is just logged for diagnosis.
+  function findNativeFileSharer() {
+    const mods = [];
+    try { if (RN.NativeModules) mods.push(RN.NativeModules); } catch (e) {}
+    try { if (typeof nativeModuleProxy !== "undefined" && nativeModuleProxy) mods.push(nativeModuleProxy); } catch (e) {}
+    let rnShare = null;
+    const seen = [];
+    for (let i = 0; i < mods.length; i++) {
+      let keys = [];
+      try { keys = Object.keys(mods[i]); } catch (e) {}
+      for (let j = 0; j < keys.length; j++) {
+        try {
+          const m = mods[i][keys[j]];
+          if (!m || (typeof m !== "object" && typeof m !== "function")) continue;
+          const fns = Object.keys(m).filter((k) => /share/i.test(k) && typeof m[k] === "function");
+          if (fns.length) seen.push(keys[j] + "." + fns.join("/"));
+          if (!rnShare && /^RN?Share/i.test(keys[j]) && typeof m.open === "function") rnShare = m;
+        } catch (e) {}
+      }
+    }
+    try {
+      const fm = getFileManager();
+      if (fm) {
+        const fns = Object.keys(fm).filter((k) => /share|open/i.test(k) && typeof fm[k] === "function");
+        if (fns.length) seen.push("fileManager." + fns.join("/"));
+      }
+    } catch (e) {}
+    log("share: native share-capable methods found:", seen.length ? seen.join(", ") : "(none)");
+    return rnShare;
+  }
+
+  // Sends the exported FILE (attachment) through the system share sheet.
+  // Returns true if a file share was started, false if no way to share a real file exists here.
+  async function shareFileAttachment(info) {
+    const sharer = findNativeFileSharer();
+    if (!sharer || !info.path) return false;
+    const url = info.path.indexOf("://") === -1 ? "file://" + info.path : info.path;
+    try {
+      await sharer.open({
+        url: url,
+        type: info.name.endsWith(".json") ? "application/json" : "text/plain",
+        filename: info.name,
+        title: info.name,
+        failOnCancel: false,
+      });
+      log("share: file share sheet opened", info.path);
+      return true;
+    } catch (e) {
+      log("share: file share failed", e);
+      return false;
+    }
+  }
+
+  // Shares an exported file. Real file first; plain text only as a clearly announced fallback.
+  async function shareExportedInfo(info) {
     if (!info || (!info.path && !info.text)) {
       showToast("Export a file first");
       return;
     }
-    const fileUrl = !info.path ? "" : (info.path.indexOf("://") === -1 ? "file://" + info.path : info.path);
+    if (await shareFileAttachment(info)) return;
     try {
       if (RN.Share && typeof RN.Share.share === "function") {
-        await RN.Share.share({
-          url: fileUrl || undefined,
-          message: info.text,
-          title: info.name,
-          type: info.name.endsWith(".json") ? "application/json" : "text/plain",
-        });
-        return;
-      }
-    } catch (e) {}
-    try {
-      if (RN.Share && typeof RN.Share.share === "function") {
+        showToast("This Discord build can't attach files - sharing as text instead");
         await RN.Share.share({ message: info.text, title: info.name });
         return;
       }
-    } catch (e2) {}
-    showToast(copyText(info.text) ? "Copied to clipboard (share failed)" : "Couldn't share");
+    } catch (e) {}
+    showToast(copyText(info.text) ? "Can't attach files here - copied to clipboard instead" : "Couldn't share");
+  }
+
+  // kind = "log" | "settings": each Share file button only sends its own export.
+  const lastExportedByKind = { log: null, settings: null };
+
+  function uiShareExported(kind) {
+    const info = lastExportedByKind[kind];
+    if (!info) {
+      showToast(kind === "settings" ? "Export settings first" : "Export log first");
+      return;
+    }
+    confirmDialog({
+      title: "⚠️ Sensitive information",
+      body: (kind === "settings" ? SETTINGS_WARNING : LOG_WARNING) + "\n\nShare " + info.name + "?",
+      confirmText: "Share",
+      confirmColor: kind === "settings" ? "red" : "brand",
+      onConfirm: () => { shareExportedInfo(info); },
+    });
   }
 
   async function uiExportLog() {
@@ -1096,14 +1170,11 @@
     const text = buildExportText();
     try {
       const r = await writeAppFile(text, name);
+      lastExportedByKind.log = { path: lastExported.path, name: name, text: text };
       showToast(exportToastText("Log", r));
     } catch (e) {
       showToast("Export failed: " + ((e && e.message) || "unknown"));
     }
-  }
-
-  async function uiShareExported() {
-    await shareLastFile();
   }
 
   // ---- Settings export / import (includes API keys) ----
@@ -1119,7 +1190,7 @@
   ];
 
   function collectSettings() {
-    const out = { _type: "ai-writer-magic-settings", _version: 1, exportedAt: new Date().toISOString() };
+    const out = { _type: "ai-writer-magic-settings", _version: 1, _warning: SETTINGS_WARNING, exportedAt: new Date().toISOString() };
     for (let i = 0; i < SETTINGS_KEYS.length; i++) {
       const k = SETTINGS_KEYS[i];
       if (storage[k] !== undefined) out[k] = storage[k];
@@ -1162,15 +1233,41 @@
     const name = "ai_writer_magic_settings_" + exportStamp() + ".json";
     try {
       const r = await writeAppFile(text, name);
+      if (r && r.path) storage.lastSettingsExportPath = r.path;
+      lastExportedByKind.settings = { path: lastExported.path, name: name, text: text };
       showToast(exportToastText("Settings", r));
     } catch (e) {
       showToast("Settings export failed: " + ((e && e.message) || "unknown"));
     }
   }
 
-  async function importSettingsFrom(jsonText) {
-    let raw = typeof jsonText === "string" ? jsonText.trim() : "";
-    if (!raw) throw new Error("paste the exported JSON first");
+  // Reads a settings file. `input` may be empty (use the last exported file) or a file path.
+  async function readSettingsFile(input) {
+    const fm = getFileManager();
+    if (!fm || typeof fm.readFile !== "function") throw new Error("file manager can't read files here");
+    let p = cleanPath(String(input || "").trim().replace(/^["']|["']$/g, ""));
+    if (!p) p = cleanPath(storage.lastSettingsExportPath || (lastExported.name.endsWith(".json") ? lastExported.path : ""));
+    if (!p) throw new Error("no exported file known yet - export once, or paste a file path");
+    if (p.indexOf("/") !== 0) {
+      const docs = cleanPath(getFileManagerConstants().DocumentsDirPath);
+      if (docs) p = docs + "/" + p.replace(/^\/+/, "");
+    }
+    let text;
+    try {
+      text = await fm.readFile(p, "utf8");
+    } catch (e) {
+      throw new Error("couldn't read " + p + " (" + ((e && e.message) || "unknown") + ")");
+    }
+    if (typeof text !== "string" || !text.trim()) throw new Error("file is empty: " + p);
+    log("import: read file", p, text.length + " chars");
+    return text;
+  }
+
+  // `input` = pasted JSON, a file path, or empty. forceFile = always treat input as a file/path.
+  async function importSettingsFrom(input, forceFile) {
+    let raw = typeof input === "string" ? input.trim() : "";
+    if (forceFile || !raw || raw.charAt(0) !== "{") raw = (await readSettingsFile(raw)).trim();
+    if (raw.charCodeAt(0) === 0xfeff) raw = raw.slice(1);
     let obj;
     try { obj = JSON.parse(raw); } catch (e) { throw new Error("invalid JSON"); }
     if (!obj || typeof obj !== "object") throw new Error("settings must be a JSON object");
@@ -2968,6 +3065,24 @@
     const [exaKeyInput, setExaKeyInput] = React.useState(storage.exaApiKey || "");
     const [importJson, setImportJson] = React.useState("");
     const [importBusy, setImportBusy] = React.useState(false);
+    // Pasted JSON wins; with "Import from file" (or an empty box / a pasted path) the file is read instead.
+    const runImport = async (fromFile) => {
+      if (importBusy) return;
+      setImportBusy(true);
+      try {
+        const n = await importSettingsFrom(importJson, fromFile && (importJson || "").trim().charAt(0) !== "{");
+        setImportJson("");
+        setExaKeyInput(storage.exaApiKey || "");
+        setComposioKeyInput(storage.composioApiKey || "");
+        setCustomPrompt(typeof storage.customPrompt === "string" ? storage.customPrompt : "");
+        forceRender();
+        showToast("Imported " + n + " setting" + (n === 1 ? "" : "s"));
+      } catch (e) {
+        showToast("Import failed: " + ((e && e.message) || "unknown"));
+      } finally {
+        setImportBusy(false);
+      }
+    };
     const [testState, setTestState] = React.useState({}); // key id -> { busy, ok, text }
     const [testingAll, setTestingAll] = React.useState(false);
     const [customPrompt, setCustomPrompt] = React.useState(
@@ -3322,55 +3437,36 @@
           h(View, { style: { flex: 1, marginRight: 8 } }, button("Share log", "#4e5058", uiShareLog, true)),
           h(View, { style: { flex: 1 } }, button("Clear log", RED, uiClearLog, true))
         ),
-        h(View, { style: { paddingHorizontal: 16, paddingBottom: 12, backgroundColor: ROW_BG } },
-          h(View, { style: { flexDirection: "row" } },
-            h(View, { style: { flex: 1, marginRight: 8 } },
-              button("Export log", "#5865f2", uiExportLog, true)),
-            h(View, { style: { flex: 1 } },
-              button("Share file", "#4e5058", uiShareExported, true))
-          )
+        h(View, { style: { flexDirection: "row", paddingHorizontal: 16, paddingVertical: 12, backgroundColor: ROW_BG } },
+          h(View, { style: { flex: 1, marginRight: 8 } }, button("Export log", "#5865f2", uiExportLog, true)),
+          h(View, { style: { flex: 1 } }, button("Share file", "#4e5058", () => uiShareExported("log"), true))
+        ),
+        h(View, { style: { paddingHorizontal: 16, paddingTop: 4, paddingBottom: 14, backgroundColor: ROW_BG } },
+          h(Text, { style: { color: RED, fontSize: 12, lineHeight: 18 } }, "⚠️ " + LOG_WARNING)
         ),
       ]),
       group("Settings backup 💾", [
         h(View, { style: { paddingHorizontal: 16, paddingTop: 12, paddingBottom: 6, backgroundColor: ROW_BG } },
           h(Text, { style: { color: P.muted, fontSize: 12, lineHeight: 18 } },
-            "Exports all settings (including API keys) into Discord's package folder under /storage/emulated/0/Android/data/<package>/files/AIWriterMagicExports/. Use Share file to send or save the file elsewhere, or paste JSON below to import.")
+            "Exports all settings into Discord's package folder under /storage/emulated/0/Android/data/<package>/files/AIWriterMagicExports/. Share file sends the exported file. \"Import from file\" reads your last exported settings file (or paste JSON / a file path below to import something else)."),
+          h(Text, { style: { color: RED, fontSize: 12, lineHeight: 18, marginTop: 8 } }, "⚠️ " + SETTINGS_WARNING)
         ),
-        h(View, { style: { paddingHorizontal: 16, paddingBottom: 8, backgroundColor: ROW_BG } },
-          h(View, { style: { flexDirection: "row" } },
-            h(View, { style: { flex: 1, marginRight: 8 } },
-              button("Export settings", "#5865f2", uiExportSettings, true)),
-            h(View, { style: { flex: 1 } },
-              button("Share file", "#4e5058", uiShareExported, true))
-          )
+        h(View, { style: { flexDirection: "row", paddingHorizontal: 16, paddingVertical: 12, backgroundColor: ROW_BG } },
+          h(View, { style: { flex: 1, marginRight: 8 } }, button("Export settings", "#5865f2", uiExportSettings, true)),
+          h(View, { style: { flex: 1 } }, button("Share file", "#4e5058", () => uiShareExported("settings"), true))
         ),
         h(View, { style: { paddingHorizontal: 16, paddingVertical: 8, backgroundColor: ROW_BG } },
-          inputField("Import settings (paste JSON)", {
+          inputField("Import settings (paste JSON or file path)", {
             value: importJson,
             multiline: true,
-            placeholder: "Paste exported JSON here…",
+            placeholder: "Paste exported JSON or a file path here…",
             style: { minHeight: 80, textAlignVertical: "top" },
             onChangeText: setImportJson,
           })
         ),
-        h(View, { style: { paddingHorizontal: 16, paddingBottom: 14, backgroundColor: ROW_BG } },
-          button(importBusy ? "Importing…" : "Import settings", GREEN, async () => {
-            if (importBusy) return;
-            setImportBusy(true);
-            try {
-              const n = await importSettingsFrom(importJson);
-              setImportJson("");
-              setExaKeyInput(storage.exaApiKey || "");
-              setComposioKeyInput(storage.composioApiKey || "");
-              setCustomPrompt(typeof storage.customPrompt === "string" ? storage.customPrompt : "");
-              forceRender();
-              showToast("Imported " + n + " setting" + (n === 1 ? "" : "s"));
-            } catch (e) {
-              showToast("Import failed: " + ((e && e.message) || "unknown"));
-            } finally {
-              setImportBusy(false);
-            }
-          }, false)
+        h(View, { style: { flexDirection: "row", paddingHorizontal: 16, paddingVertical: 12, backgroundColor: ROW_BG } },
+          h(View, { style: { flex: 1, marginRight: 8 } }, button(importBusy ? "Importing…" : "Import settings", GREEN, () => runImport(false), true)),
+          h(View, { style: { flex: 1 } }, button("Import from file", "#5865f2", () => runImport(true), true))
         ),
       ]),
       group("Groq API Keys 🔑", [
