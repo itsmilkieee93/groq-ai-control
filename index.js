@@ -62,7 +62,7 @@
       rememberPending(channelId, message);
       if (message) {
         const w = authorOf(message);
-        log("cached swipe reply: channel " + channelId + ", message id " + message.id + ", author id " + (w.id || "?") + ", @" + (w.username || "?") + " (" + (w.globalName || "?") + "): " + JSON.stringify(textOfMessage(message).slice(0, 300)));
+        log("cached swipe reply: channel " + channelId + ", message id " + message.id + ", author id " + (w.id || "?") + ", @" + (w.username || "?") + " (" + (w.globalName || "?") + "): " + JSON.stringify(detailedOn() ? textOfMessage(message, 0, true) : textOfMessage(message).slice(0, 300)));
       }
     }
 
@@ -101,10 +101,16 @@
       }
     }
 
-    function clipReply(content) {
+    // `full` (only used by the Detailed log) skips the 900-character clip. What is sent to the AI is never affected.
+    function clipReply(content, full) {
       const text = typeof content === "string" ? content.trim() : "";
       if (!text) return "";
+      if (full === true) return text;
       return text.length > 900 ? text.slice(0, 900) + "…" : text;
+    }
+
+    function detailedOn() {
+      return storage.detailedLog === true;
     }
 
     function pushPart(parts, value) {
@@ -170,7 +176,7 @@
       return !!(author.bot || author.isBot || msg.bot || msg.webhookId || msg.webhook_id);
     }
 
-    function textOfMessage(msg, depth) {
+    function textOfMessage(msg, depth, full) {
       if (!msg || typeof msg !== "object") return "";
       const level = depth || 0;
       if (level > 2) return "";
@@ -191,10 +197,10 @@
       }
       const snaps = snapshotMessages(msg);
       for (let i = 0; i < snaps.length; i++) {
-        const inner = textOfMessage(snaps[i], level + 1);
+        const inner = textOfMessage(snaps[i], level + 1, full);
         if (inner) parts.push("forwarded: " + inner);
       }
-      return clipReply(parts.join(" | "));
+      return clipReply(parts.join(" | "), full);
     }
 
     // 🖼️ Image links in a message: attachments, embeds (image / thumbnail of image + gif embeds), plain image links, forwarded snapshots.
@@ -503,6 +509,42 @@
       );
     }
 
+    // Same messages as userHistoryLines, but whole (for the Detailed log only).
+    function userHistoryMessages(channelId, userId) {
+      if (!channelId || !userId) return [];
+      if (storage.ctxWindow === false) return [];
+      const n = typeof ctxSize === "function" ? ctxSize("ctxHistory", HISTORY_DEF) : HISTORY_DEF;
+      if (n <= 0) return [];
+      return getChannelMessages(channelId)
+        .filter((m) => authorOf(m).id === String(userId) && textOfMessage(m))
+        .slice(-n);
+    }
+
+    // Detailed log: every message with author, time, flags and its complete text (no clipping, no collapsed whitespace).
+    function dumpMessages(title, msgs, anchorId) {
+      if (!msgs || !msgs.length) { log("[detailed] " + title + ": no messages"); return; }
+      const selfId = getSelfIdentity().id;
+      const blocks = [];
+      for (let i = 0; i < msgs.length; i++) {
+        const m = msgs[i];
+        const who = authorOf(m);
+        const ms = snowflakeToMs(m.id);
+        const flags = [];
+        if (anchorId && String(m.id) === String(anchorId)) flags.push("REPLY TARGET");
+        if (selfId && who.id === selfId) flags.push("speaker (you)");
+        if (isBotMessage(m)) flags.push("bot");
+        if (isForwardedMessage(m)) flags.push("forwarded");
+        let head = "#" + (i + 1) + " · " + (ms ? new Date(ms).toISOString() : "time ?") + " · message id " + (m.id || "?") +
+          " · author id " + (who.id || "?") + " @" + (who.username || "?") + " (" + (who.globalName || "?") + ")" +
+          (flags.length ? " · [" + flags.join(", ") + "]" : "");
+        let imgs = [];
+        try { imgs = imageUrlsOf(m); } catch (e) {}
+        if (imgs.length) head += " · images: " + imgs.join(" ");
+        blocks.push(head + "\n" + (textOfMessage(m, 0, true) || "(no text)"));
+      }
+      log("[detailed] " + title + " (" + msgs.length + " message" + (msgs.length === 1 ? "" : "s") + ", full text):\n" + blocks.join("\n----\n"));
+    }
+
     function resolveReplyInfo(channelId, args, explicitRef) {
       const fromArgs = extractReplyMessage(args);
       const fromStore = messageFromStore(channelId, explicitRef || findReplyRef(args));
@@ -540,6 +582,13 @@
         "  bot: " + (isBotMessage(msg) || isBotMessage(snaps[0])) + "  forwarded: " + isForwardedMessage(msg) + "\n" +
         "  images: " + (storage.readImages === false ? "off" : imageUrlsOf(msg).length) + "\n" +
         "  content: " + JSON.stringify(textOfMessage(msg)));
+      if (detailedOn()) {
+        try {
+          log("[detailed] reply target full content (message " + (anchorId || "?") + ", " + textOfMessage(msg, 0, true).length + " chars):\n" + textOfMessage(msg, 0, true));
+          dumpMessages("channel messages around the reply target", win ? win.items : [], anchorId);
+          dumpMessages("recent messages from the replied user", userHistoryMessages(chId, replyUserId), anchorId);
+        } catch (e) { log("[detailed] message dump failed:", e && e.message); }
+      }
       const shortId = anchorId ? "…" + anchorId.slice(-6) : "none";
       if (win) toast("ok", "Anchor " + shortId + " · window " + win.items.length + (storage.ctxIncludeOthers === false ? " (target only)" : "") + " · history " + historyLines.length);
       else if (storage.ctxWindow === false) toast("info", "Anchor " + shortId + ": window is off in settings · history " + historyLines.length);
@@ -802,6 +851,7 @@
   // In-memory log buffer (last LOG_MAX lines). Can be written to a file or shared from settings.
   const LOG_MAX = 1000;
   const LOG_ENTRY_MAX = 8000; // one entry (e.g. a full AI request) is cut after this many characters
+  const DETAILED_ENTRY_MAX = 200000; // "Detailed log" on: entries are practically never cut (safety ceiling only)
   const LOG_FILE = "groq-ai-control.log";
   const logBuffer = [];
   let logFlushTimer = null;
@@ -834,7 +884,8 @@
 
   function pushLog(parts) {
     let line = parts.map(logPart).join(" ");
-    if (line.length > LOG_ENTRY_MAX) line = line.slice(0, LOG_ENTRY_MAX) + "… [" + (line.length - LOG_ENTRY_MAX) + " more characters cut]";
+    const entryMax = storage.detailedLog === true ? DETAILED_ENTRY_MAX : LOG_ENTRY_MAX;
+    if (line.length > entryMax) line = line.slice(0, entryMax) + "… [" + (line.length - entryMax) + " more characters cut]";
     logBuffer.push(new Date().toISOString() + " " + line);
     if (logBuffer.length > LOG_MAX) logBuffer.splice(0, logBuffer.length - LOG_MAX);
     if (storage.logToFile === true) scheduleLogFlush();
@@ -1141,7 +1192,7 @@
     "autoRewrite", "answerQuestions", "previewBeforeSend", "typingDuration",
     "advancedEnabled", "advTemperature", "advMaxTokens", "advTopP", "advTimeout", "advReasoning",
     "skipMentions", "skipLinks", "skipBotCommands",
-    "debugToasts", "logToFile", "showUsage", "usageStats",
+    "debugToasts", "logToFile", "detailedLog", "showUsage", "usageStats",
     "ctxWindow", "ctxIncludeOthers", "ctxBefore", "ctxAfter", "ctxHistory",
     "readImages", "mathTool", "searchEnabled",
     "exaApiKey", "composioApiKey",
@@ -2150,7 +2201,7 @@
         if (!res.ok) {
           let errBody = "";
           try { errBody = await res.text(); } catch (e) {}
-          log("← Groq HTTP " + res.status + " after " + (Date.now() - reqStarted) + " ms (key " + maskKey(apiKey) + "): " + String(errBody).slice(0, 1500));
+          log("← Groq HTTP " + res.status + " after " + (Date.now() - reqStarted) + " ms (key " + maskKey(apiKey) + "): " + (storage.detailedLog === true ? String(errBody) : String(errBody).slice(0, 1500)));
           if (res.status === 400 && imagesOn) {
             // An image was rejected (format, size or unreachable link): retry once as text only.
             log("image request rejected (400), retrying text-only");
@@ -2671,6 +2722,9 @@
       finalText = await rewriteText(original, replyContext, forceAnswer);
       usageInfo = lastUsage;
       log("AI job result (" + (finalText === original ? "same as input / fallback" : "changed") + "): " + JSON.stringify(finalText));
+      if (storage.detailedLog === true) {
+        log("[detailed] typed text (" + String(original).length + " chars):\n" + original + "\n[detailed] full AI reply (" + String(finalText).length + " chars):\n" + finalText);
+      }
       if (!preview) {
         const delay = getTypingMs();
         if (delay > 0) await sleep(delay);
@@ -3059,7 +3113,7 @@
 
   function GroqSettingsPage() {
     useProxy(storage);
-    const { ScrollView, Text, View, TextInput, TouchableOpacity } = RN;
+    const { ScrollView, Text, View, TextInput, TouchableOpacity, ActivityIndicator } = RN;
     const ui = getUiMods();
     const Table = ui.Table;
     const TableRowGroup = Table.TableRowGroup;
@@ -3079,8 +3133,12 @@
     const runImport = async (fromFile) => {
       if (importBusy) return;
       setImportBusy(true);
+      const importStarted = Date.now();
+      const importFromFile = !!(fromFile && (importJson || "").trim().charAt(0) !== "{");
+      log("settings: import started · source=" + (importFromFile ? "file" : "pasted text") + " · input length=" + (importJson || "").length + " chars");
       try {
-        const n = await importSettingsFrom(importJson, fromFile && (importJson || "").trim().charAt(0) !== "{");
+        const n = await importSettingsFrom(importJson, importFromFile);
+        log("settings: import ok · " + n + " setting" + (n === 1 ? "" : "s") + " applied · " + (Date.now() - importStarted) + " ms");
         setImportJson("");
         setExaKeyInput(storage.exaApiKey || "");
         setComposioKeyInput(storage.composioApiKey || "");
@@ -3088,6 +3146,7 @@
         forceRender();
         showToast("Imported " + n + " setting" + (n === 1 ? "" : "s"));
       } catch (e) {
+        log("settings: import failed after " + (Date.now() - importStarted) + " ms · " + ((e && e.message) || "unknown"));
         showToast("Import failed: " + ((e && e.message) || "unknown"));
       } finally {
         setImportBusy(false);
@@ -3145,12 +3204,13 @@
       if (!k || typeof k.key !== "string" || !k.key.trim()) return null;
       setTestState((prev) => Object.assign({}, prev, { [k.id]: { busy: true, ok: false, text: "Testing…" } }));
       const r = await testGroqKey(k.key.trim());
-      log("key test #" + k.id + ":", r.status, r.ok ? "ok" : r.summary);
+      log("key test #" + k.id + " (" + maskKey(k.key) + "): HTTP " + r.status + " · " + (r.ok ? "ok" : "FAILED") + " · " + r.ms + " ms · " + r.summary + " · model=" + (MODELS.includes(storage.model) ? storage.model : DEFAULT_MODEL));
       setTestState((prev) => Object.assign({}, prev, { [k.id]: { busy: false, ok: r.ok, text: (r.ok ? "✅ " : "❌ ") + r.summary } }));
       return r;
     };
     const testSingleKey = async (k) => {
       if (testingAll || (testState[k.id] && testState[k.id].busy)) return;
+      log("settings: single key test requested for #" + k.id);
       const r = await testOneKey(k);
       if (r) showToast((r.ok ? "✅ " : "❌ ") + "Key #" + k.id + ": " + r.summary);
     };
@@ -3159,6 +3219,8 @@
       if (!list.length) return showToast("Add an API key first");
       if (testingAll) return;
       setTestingAll(true);
+      const testAllStarted = Date.now();
+      log("settings: bulk key test started · " + list.length + " key" + (list.length === 1 ? "" : "s") + " · ids [" + list.map((x) => "#" + x.id).join(", ") + "]");
       const busy = {};
       list.forEach((k) => { busy[k.id] = { busy: true, ok: false, text: "Testing…" }; });
       setTestState(busy);
@@ -3171,6 +3233,7 @@
         if (list.length === 1) showToast((r.ok ? "✅ " : "❌ ") + "Key #" + k.id + ": " + r.summary);
       }
       if (list.length > 1) showToast((good === list.length ? "✅ " : "⚠️ ") + good + "/" + list.length + " keys working");
+      log("settings: bulk key test finished · " + good + "/" + list.length + " working · " + (Date.now() - testAllStarted) + " ms total");
       setTestingAll(false);
     };
     const removeKey = (id) => {
@@ -3441,6 +3504,8 @@
       ]),
       group("Debug 🐞", [
         sw("Debug toasts", storage.debugToasts === true, (v) => { storage.debugToasts = v; }, "Show success / error toasts for reply context and AI calls"),
+        sw("Detailed log", storage.detailedLog === true, (v) => { storage.detailedLog = v; log("settings: detailed log " + (v ? "ON" : "OFF")); },
+          "Log the complete text of every message used as context (reply target, nearby messages, the replied user's history) and the full AI reply, with no length cuts. Logs get big and contain your chats"),
         sw("Save log to file", storage.logToFile === true, (v) => { storage.logToFile = v; if (v) scheduleLogFlush(); }, "Auto-write the in-memory log to " + LOG_FILE),
         h(View, { style: { flexDirection: "row", paddingHorizontal: 16, paddingVertical: 12, backgroundColor: ROW_BG } },
           h(View, { style: { flex: 1, marginRight: 8 } }, button("Write log", GREEN, uiWriteLog, true)),
@@ -3476,7 +3541,10 @@
           })
         ),
         h(View, { style: { flexDirection: "row", paddingHorizontal: 16, paddingVertical: 12, backgroundColor: ROW_BG } },
-          h(View, { style: { flex: 1, marginRight: 8 } }, button(importBusy ? "Importing…" : "Import settings", GREEN, () => runImport(false), true)),
+          h(View, { style: { flex: 1, marginRight: 8, justifyContent: "center", alignItems: "center" } },
+            importBusy
+              ? h(ActivityIndicator, { size: "small", color: "#248046" })
+              : button("Import settings", GREEN, () => runImport(false), true)),
           h(View, { style: { flex: 1 } }, button("Import from file", "#5865f2", () => runImport(true), true))
         ),
       ]),
@@ -3489,8 +3557,10 @@
             label: "#" + k.id + "  " + mask(k.key),
             subLabel: testState[k.id] ? testState[k.id].text : undefined,
             trailing: h(View, { style: { flexDirection: "row", alignItems: "center", marginRight: 4 } },
-              h(View, { style: { width: 96, marginRight: 8, opacity: busy || testingAll ? 0.6 : 1 } },
-                button(busy ? "Testing…" : "Test", "#5865f2", () => testSingleKey(k), true)),
+              h(View, { style: { width: 96, marginRight: 8, justifyContent: "center", alignItems: "center", opacity: busy || testingAll ? 0.6 : 1 } },
+                busy
+                  ? h(ActivityIndicator, { size: "small", color: "#5865f2" })
+                  : button("Test", "#5865f2", () => testSingleKey(k), true)),
               h(View, { style: { width: 96 } },
                 button("Delete", RED, () => confirmRemoveKey(k), true))
             ),
@@ -3511,7 +3581,9 @@
         ),
         keys.length > 0
           ? h(View, { style: { paddingHorizontal: 16, paddingVertical: 12, backgroundColor: ROW_BG } },
-              button(testingAll ? "Testing…" : "Test API keys", "#5865f2", runKeyTests, true)
+              testingAll
+                ? h(ActivityIndicator, { size: "small", color: "#5865f2" })
+                : button("Test API keys", "#5865f2", runKeyTests, true)
             )
           : null,
       ]),
@@ -3729,6 +3801,7 @@
     if (typeof storage.skipBotCommands !== "boolean") storage.skipBotCommands = true;
     if (typeof storage.debugToasts !== "boolean") storage.debugToasts = false;
     if (typeof storage.logToFile !== "boolean") storage.logToFile = false;
+    if (typeof storage.detailedLog !== "boolean") storage.detailedLog = false;
     if (typeof storage.showUsage !== "boolean") storage.showUsage = true;
     if (!getStats()) storage.usageStats = emptyStats();
     if (typeof storage.ctxWindow !== "boolean") storage.ctxWindow = true;
@@ -3750,7 +3823,7 @@
         skip: { mentions: storage.skipMentions, links: storage.skipLinks, botCommands: storage.skipBotCommands },
         replyContext: { window: storage.ctxWindow, includeOthers: storage.ctxIncludeOthers, before: storage.ctxBefore, after: storage.ctxAfter, history: storage.ctxHistory, readImages: storage.readImages },
         mathTool: storage.mathTool, advancedEnabled: storage.advancedEnabled, searchEnabled: storage.searchEnabled,
-        showUsage: storage.showUsage, debugToasts: storage.debugToasts, logToFile: storage.logToFile,
+        showUsage: storage.showUsage, debugToasts: storage.debugToasts, logToFile: storage.logToFile, detailedLog: storage.detailedLog,
         apiKeys: getKeys().map(maskKey), exaKeySet: !!(storage.exaApiKey || "").trim(), composioKeySet: !!(storage.composioApiKey || "").trim(),
       }, 2));
     } catch (e) {}
