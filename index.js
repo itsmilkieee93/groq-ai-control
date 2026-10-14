@@ -3428,7 +3428,15 @@
     const pick = (label, selected, onPress) =>
       h(TableRow, {
         label: label,
-        trailing: selected ? h(Text, { style: { color: "#5865f2", fontWeight: "700", fontSize: 18 } }, "✓") : undefined,
+        // Radio circle: filled blurple with a white dot when selected, empty ring otherwise.
+        trailing: h(View, {
+          style: {
+            width: 24, height: 24, borderRadius: 12, borderWidth: 2,
+            borderColor: selected ? "#5865f2" : P.muted,
+            backgroundColor: selected ? "#5865f2" : "transparent",
+            alignItems: "center", justifyContent: "center",
+          },
+        }, selected ? h(View, { style: { width: 8, height: 8, borderRadius: 4, backgroundColor: "#ffffff" } }) : null),
         onPress: onPress,
       });
 
