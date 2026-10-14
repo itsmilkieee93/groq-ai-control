@@ -2594,10 +2594,10 @@
         b.iconId
           ? h(RN.Image, {
               source: { uri: previewIconUri(b.iconId) },
-              style: { width: 18, height: 18, marginRight: 6 },
+              style: { width: 18, height: 18, marginRight: 8 },
             })
           : null,
-        h(Text, { numberOfLines: 1, style: { color: "#5865f2", fontWeight: "700", fontSize: 15 } }, b.label)
+        h(Text, { numberOfLines: 1, style: { color: "#ffffff", fontWeight: "700", fontSize: 15, textAlign: "center", textAlignVertical: "center", includeFontPadding: false } }, b.label)
       );
     // Two buttons per row: Send | Edit, then Copy prompt | Cancel (Edit is hidden while editing).
     const buttons = [
@@ -2617,7 +2617,7 @@
     const usageLines = formatUsage(usage);
     const usageView = usageLines
       ? h(View, { style: { marginTop: 10 } },
-          usageLines.map((l, i) => h(Text, { key: "u" + i, style: { color: C.muted, fontSize: 12, marginTop: i ? 2 : 0 } }, l)))
+          usageLines.map((l, i) => h(Text, { key: "u" + i, style: { color: C.muted, fontSize: 12, lineHeight: 16, textAlign: "left", marginTop: i ? 2 : 0 } }, l)))
       : null;
 
     const body = h(
@@ -2626,19 +2626,19 @@
       h(Text, { style: { color: C.muted, fontSize: 12, fontWeight: "700", textTransform: "uppercase", marginBottom: 8 } }, "Preview"),
       h(
         View,
-        { style: { flexDirection: "row", alignItems: "flex-start" } },
+        { style: { flexDirection: "row", alignItems: "center" } },
         h(
           View,
-          { style: { flex: 1, backgroundColor: C.card, borderRadius: 10, padding: 12, maxHeight: 240 } },
+          { style: { flex: 1, backgroundColor: C.card, borderRadius: 10, paddingHorizontal: 12, paddingVertical: 12, minHeight: 44, maxHeight: 240, justifyContent: "center" } },
           editing
             ? h(TextInput, {
                 value: text,
                 onChangeText: setText,
                 multiline: true,
                 autoFocus: true,
-                style: { color: C.text, fontSize: 15, padding: 0, maxHeight: 216, textAlignVertical: "top" },
+                style: { color: C.text, fontSize: 15, lineHeight: 20, padding: 0, maxHeight: 216, textAlignVertical: "top", includeFontPadding: false },
               })
-            : h(ScrollView, null, h(Text, { selectable: true, style: { color: C.text, fontSize: 15 } }, text))
+            : h(ScrollView, { contentContainerStyle: { flexGrow: 1, justifyContent: "center" } }, h(Text, { selectable: true, style: { color: C.text, fontSize: 15, lineHeight: 20, textAlign: "left", includeFontPadding: false } }, text))
         ),
         // Square button on the right of the response box: copies the response (including any edits) using Discord's CopyIcon (asset 1941).
         h(
@@ -2649,9 +2649,9 @@
               log("preview: Copy response pressed");
               showToast(copyText(text) ? "Response copied to clipboard" : "Couldn't copy to clipboard");
             },
-            style: { width: 44, height: 44, marginLeft: 8, borderRadius: 10, backgroundColor: C.card, alignItems: "center", justifyContent: "center" },
+            style: { width: 44, height: 44, marginLeft: 8, borderRadius: 10, backgroundColor: "#9333ea", alignItems: "center", justifyContent: "center" },
           },
-          h(RN.Image, { source: COPY_ASSET, style: { width: 22, height: 22, tintColor: "#a305ab" } })
+          h(RN.Image, { source: COPY_ASSET, style: { width: 22, height: 22, tintColor: "#ffffff" } })
         )
       ),
       usageView,
