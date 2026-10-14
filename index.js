@@ -2567,15 +2567,36 @@
 
     const close = () => { try { ActionSheetModule.hideActionSheet(); } catch (e) {} };
     const act = (action, t) => () => { finish({ action, text: t }); close(); };
-    const btn = (label, bg, onPress, key) => ({ label, bg, onPress, key });
+    // Theme-aware Icons8 icon URI (size 128). Light theme = dark color, dark theme = light color.
+    const previewIconUri = (id) => {
+      const hex = isLightTheme() ? "060607" : "F2F3F5";
+      return "https://img.icons8.com/?size=128&id=" + id + "&format=png&color=" + hex;
+    };
+    const PREVIEW_ICONS = { send: "100004", edit: "114094", copy: "86206", cancel: "63688" };
+    const btn = (label, bg, onPress, key) => ({ label, bg, onPress, key, iconId: PREVIEW_ICONS[key] });
     const renderBtn = (b, first) =>
       h(
         TouchableOpacity,
         {
           key: b.key,
           onPress: b.onPress,
-          style: { flex: 1, backgroundColor: b.bg, borderRadius: 10, paddingVertical: 12, alignItems: "center", justifyContent: "center", marginLeft: first ? 0 : 8 },
+          style: {
+            flex: 1,
+            backgroundColor: b.bg,
+            borderRadius: 10,
+            paddingVertical: 12,
+            alignItems: "center",
+            justifyContent: "center",
+            marginLeft: first ? 0 : 8,
+            flexDirection: "row",
+          },
         },
+        b.iconId
+          ? h(RN.Image, {
+              source: { uri: previewIconUri(b.iconId) },
+              style: { width: 18, height: 18, marginRight: 6 },
+            })
+          : null,
         h(Text, { numberOfLines: 1, style: { color: "#5865f2", fontWeight: "700", fontSize: 15 } }, b.label)
       );
     // Two buttons per row: Send | Edit, then Copy prompt | Cancel (Edit is hidden while editing).
