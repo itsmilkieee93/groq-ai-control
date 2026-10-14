@@ -1853,7 +1853,7 @@
         "Supports + - * / % (modulo) ^ (power) ! (factorial), parentheses, constants pi e tau phi, and functions: " +
         "sqrt cbrt abs sign floor ceil trunc round(x,digits) sin cos tan asin acos atan atan2 sinh cosh tanh (radians), sind cosd tand (degrees), deg rad, " +
         "exp ln log (base 10) log2 log10 log(x,base) pow min max hypot gcd lcm mod fact. " +
-        "Whole numbers are exact for + - * ^ !. Write 15% as 15/100. No units or thousands separators. One call per calculation.",
+        "Whole numbers are exact for + - * ^ !. Write 15% as 15/100. No units or thousands separators. Put the WHOLE chained expression in ONE call (e.g. 192*727/7*8), never one operation per call.",
       parameters: {
         type: "object",
         properties: { expression: { type: "string", description: "e.g. 15/100*2340 + sqrt(144)" } },
@@ -1868,6 +1868,21 @@
     "(2 to 6 lines), in the language of the typed text and in the Style above (your personality), and the last line is the final answer. " +
     "Run every numeric calculation through `calculate` and copy its result exactly (grouping thousands with commas is fine); never work numbers out yourself. " +
     "The final answer is the last `calculate` result. Do not show raw expressions or mention the tool or JavaScript. One trivial operation can be one line.";
+
+  // Turns the tool-call exchange into plain text so a request can be sent without tools.
+  function flattenToolMsgs(msgs) {
+    const out = [], results = [];
+    msgs.forEach((m) => {
+      if (m.role === "tool") results.push(String(m.content).replace(/\n\(use this exact value\)/, ""));
+      else if (m.role === "assistant" && m.tool_calls) return;
+      else out.push(m);
+    });
+    if (results.length) {
+      out.push({ role: "user", content: "Exact calculator results so far: " + results.join("; ") +
+        ". Do not call any tool. Write the final chat message now using these exact values (the last result is the final answer). If a step is still missing, finish it carefully yourself." });
+    }
+    return out;
+  }
 
   function runMathTool(args, withSteps, sink) {
     let expr = "";
@@ -1927,7 +1942,8 @@
   // 🧮 Finds a math-looking part of the typed text and calculates it in JS up front, so the AI starts from the exact result.
   function mathPrecheck(text) {
     try {
-      const whole = String(text || "").trim();
+      const whole = String(text || "").trim().replace(/(\d)\s*[xX]\s*(?=[\d(.])/g, (m, d, off, str) =>
+        (d === "0" && m.length === 2 && (off === 0 || !/\d/.test(str[off - 1]))) ? m : d + "\u00d7");
       const re = /[\d(.\-\u2212][\d\s.+\-*\/\u00d7\u00f7^()%!\u2212\u2013]*[\d)!%]/g;
       const found = [];
       let m;
@@ -2095,21 +2111,26 @@
     let systemPrompt = buildSystemPrompt(forceAnswer) + (replyContext && !ctxInUser ? "\n\n" + replyContext : "");
 
     // 🧮 JS pre-check: calculate any expression in the typed text first and hand the exact result to the AI.
-    const mathPre = (storage.mathTool !== false && (forceAnswer === true || storage.answerQuestions !== false)) ? mathPrecheck(text) : null;
+    let mathPre = (storage.mathTool !== false && (forceAnswer === true || storage.answerQuestions !== false)) ? mathPrecheck(text) : null;
+    // Tagged [Answer] with no math of its own ("Answer" / "reply"): the calculation is in the replied message, so pre-check that instead.
+    if (!mathPre && forceAnswer === true && storage.mathTool !== false) {
+      const rl = (/- reply_message: "([^\n]*)/.exec(replyContext || "") || [])[1] || "";
+      if (rl) mathPre = mathPrecheck(rl.replace(/"\s*$/, ""));
+    }
     // When the typed text is basically one plain calculation, JS has already done the working: the AI just presents it (single request, no tool round).
     // Tagged [Answer] the speaker asked for the answer, so "mostly math" is enough; otherwise the text must be just the calculation (never hijack "see you 5-6").
     const mathIsMain = !!(mathPre && (forceAnswer === true ? mathPre.mostly : mathPre.pure));
     const traceMode = mathIsMain && !!mathPre.trace;
     if (traceMode) {
       systemPrompt += "\n\nJS solved \"" + mathPre.expr + "\" exactly, step by step: " + mathPre.trace.join("; ") + ". Result: " + mathPre.text +
-        ". Explain it in natural language, like a friend talking it through: one short line per step saying what is done and what it gives " +
-        "(for example 'first 181 times 81 gives 14661'), in the language of the typed text and in the Style above (your personality), not as a raw list of equations. " +
-        "You may group thousands with commas and merge trivial steps, but every number you mention must be one JS gave. Do not recalculate. " +
+        ". ALWAYS explain the working: go through EVERY step above in order, one short line per step (do not skip or merge steps), like a friend talking it through, " +
+        "saying what is done and what it gives (for example 'first 181 times 81 gives 14661'), in the language of the typed text (or of the replied message when the typed text is only a tag) and in the Style above (your personality), not as a raw list of equations. " +
+        "You may group thousands with commas, but every number you mention must be one JS gave. Do not recalculate. " +
         "The last line is the final answer " + mathPre.text + ".";
       log("math trace:", mathPre.expr, "=", mathPre.text);
     } else if (mathIsMain) {
       systemPrompt += "\n\nJS pre-check (exact): the typed text contains \"" + mathPre.expr + "\", which JavaScript calculated as " + mathPre.text +
-        ". If the question asks for that calculation, use this exact value and explain the working in short natural-language steps. Ignore it if the text is about something else.";
+        ". If the question asks for that calculation, use this exact value and ALWAYS explain the working in short natural-language steps (one line per operation, in order), ending with the final answer. Ignore it if the text is about something else.";
       log("math pre-check:", mathPre.expr, "=", mathPre.text);
     }
 
@@ -2168,6 +2189,7 @@
       const msgs = buildBase().concat(extra || []);
       mathResults.length = 0;
       if (traceMode) mathResults.push(mathPre.text); // the final answer is still checked against the JS result
+      let flatTools = false; // true once the tool exchange has been turned into plain text (no tools sent anymore)
       for (let round = 0; ; round++) {
         const model = imagesOn ? VISION_MODEL : (MODELS.includes(storage.model) ? storage.model : DEFAULT_MODEL);
         const qwen = model.indexOf("qwen/") === 0;
@@ -2183,9 +2205,12 @@
         // include_reasoning and reasoning_format can't be mixed: gpt-oss uses the first, Qwen the second.
         if (qwen) body.reasoning_format = "hidden";
         else body.include_reasoning = false;
-        if (useMath) {
+        if (useMath && !flatTools && round < MAX_TOOL_ROUNDS) {
           body.tools = [MATH_TOOL];
-          body.tool_choice = round < MAX_TOOL_ROUNDS ? "auto" : "none";
+          body.tool_choice = "auto";
+        } else if (useMath) {
+          // Out of tool rounds: Groq rejects tool_choice "none" if the model still calls a tool, so send no tools and the results as plain text.
+          body.messages = flattenToolMsgs(msgs);
         }
         const reqStarted = Date.now();
         log("→ Groq request (key " + maskKey(apiKey) + ", round " + round + "):\n" + safeJson({ url: GROQ_URL, body: body }, 2));
@@ -2202,6 +2227,24 @@
           let errBody = "";
           try { errBody = await res.text(); } catch (e) {}
           log("← Groq HTTP " + res.status + " after " + (Date.now() - reqStarted) + " ms (key " + maskKey(apiKey) + "): " + (storage.detailedLog === true ? String(errBody) : String(errBody).slice(0, 1500)));
+          if (res.status === 400 && useMath && !flatTools && /tool_use_failed/.test(String(errBody))) {
+            // The model tried one more tool call: run it anyway, then continue with the results as plain text.
+            log("tool_use_failed: running the attempted call and continuing without tools");
+            try {
+              const fg = JSON.parse(errBody).error.failed_generation;
+              const g = JSON.parse(fg);
+              if (g && g.name === "calculate") {
+                const args = typeof g.arguments === "string" ? g.arguments : JSON.stringify(g.arguments || {});
+                const id = "fc_fix" + round;
+                const result = runMathTool(args, mathSteps, mathResults);
+                log("math tool call (recovered): calculate(" + args + ") -> " + result);
+                msgs.push({ role: "assistant", content: "", tool_calls: [{ id: id, type: "function", function: { name: "calculate", arguments: args } }] });
+                msgs.push({ role: "tool", tool_call_id: id, content: result });
+              }
+            } catch (e) {}
+            flatTools = true;
+            continue;
+          }
           if (res.status === 400 && imagesOn) {
             // An image was rejected (format, size or unreachable link): retry once as text only.
             log("image request rejected (400), retrying text-only");
@@ -2572,7 +2615,7 @@
       const hex = isLightTheme() ? "060607" : "F2F3F5";
       return "https://img.icons8.com/?size=128&id=" + id + "&format=png&color=" + hex;
     };
-    const PREVIEW_ICONS = { send: "100004", edit: "114094", copy: "86206", cancel: "63688" };
+    const PREVIEW_ICONS = { send: "100004", edit: "114094", copy: "86206", cancel: "0UkEquwk40Zu" };
     const btn = (label, bg, onPress, key) => ({ label, bg, onPress, key, iconId: PREVIEW_ICONS[key] });
     const renderBtn = (b, first) =>
       h(
