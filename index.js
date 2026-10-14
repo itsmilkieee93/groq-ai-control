@@ -2576,13 +2576,13 @@
           onPress: b.onPress,
           style: { flex: 1, backgroundColor: b.bg, borderRadius: 10, paddingVertical: 12, alignItems: "center", justifyContent: "center", marginLeft: first ? 0 : 8 },
         },
-        h(Text, { numberOfLines: 1, style: { color: "#fff", fontWeight: "700", fontSize: 15 } }, b.label)
+        h(Text, { numberOfLines: 1, style: { color: "#5865f2", fontWeight: "700", fontSize: 15 } }, b.label)
       );
     // Two buttons per row: Send | Edit, then Copy prompt | Cancel (Edit is hidden while editing).
     const buttons = [
       btn("Send", C.accent, () => { if (!text.trim()) return; act("send", text)(); }, "send"),
-      editing ? null : btn("Edit", C.neutral, () => setEditing(true), "edit"),
-      btn("Copy prompt", C.neutral, () => { log("preview: Copy prompt pressed"); showToast(copyText(original) ? "Prompt copied to clipboard" : "Couldn't copy to clipboard"); }, "copy"),
+      editing ? null : btn("Edit", "#228a0b", () => setEditing(true), "edit"),
+      btn("Copy prompt", "#997A00", () => { log("preview: Copy prompt pressed"); showToast(copyText(original) ? "Prompt copied to clipboard" : "Couldn't copy to clipboard"); }, "copy"),
       btn("Cancel", C.danger, act("cancel", original), "cancel"),
     ].filter(Boolean);
     const buttonRows = [];
@@ -2630,7 +2630,7 @@
             },
             style: { width: 44, height: 44, marginLeft: 8, borderRadius: 10, backgroundColor: C.card, alignItems: "center", justifyContent: "center" },
           },
-          h(RN.Image, { source: COPY_ASSET, style: { width: 22, height: 22, tintColor: C.text } })
+          h(RN.Image, { source: COPY_ASSET, style: { width: 22, height: 22, tintColor: "#a305ab" } })
         )
       ),
       usageView,
@@ -3541,9 +3541,10 @@
           })
         ),
         h(View, { style: { flexDirection: "row", paddingHorizontal: 16, paddingVertical: 12, backgroundColor: ROW_BG } },
-          h(View, { style: { flex: 1, marginRight: 8, justifyContent: "center", alignItems: "center" } },
+          h(View, { style: { flex: 1, marginRight: 8 } },
             importBusy
-              ? h(ActivityIndicator, { size: "small", color: "#248046" })
+              ? h(View, { style: { paddingVertical: 8, alignItems: "center", justifyContent: "center" } },
+                  h(ActivityIndicator, { size: "small", color: "#248046" }))
               : button("Import settings", GREEN, () => runImport(false), true)),
           h(View, { style: { flex: 1 } }, button("Import from file", "#5865f2", () => runImport(true), true))
         ),
@@ -3557,9 +3558,10 @@
             label: "#" + k.id + "  " + mask(k.key),
             subLabel: testState[k.id] ? testState[k.id].text : undefined,
             trailing: h(View, { style: { flexDirection: "row", alignItems: "center", marginRight: 4 } },
-              h(View, { style: { width: 96, marginRight: 8, justifyContent: "center", alignItems: "center", opacity: busy || testingAll ? 0.6 : 1 } },
+              h(View, { style: { width: 96, marginRight: 8, opacity: busy || testingAll ? 0.6 : 1 } },
                 busy
-                  ? h(ActivityIndicator, { size: "small", color: "#5865f2" })
+                  ? h(View, { style: { paddingVertical: 8, alignItems: "center", justifyContent: "center" } },
+                      h(ActivityIndicator, { size: "small", color: "#5865f2" }))
                   : button("Test", "#5865f2", () => testSingleKey(k), true)),
               h(View, { style: { width: 96 } },
                 button("Delete", RED, () => confirmRemoveKey(k), true))
@@ -3582,7 +3584,8 @@
         keys.length > 0
           ? h(View, { style: { paddingHorizontal: 16, paddingVertical: 12, backgroundColor: ROW_BG } },
               testingAll
-                ? h(ActivityIndicator, { size: "small", color: "#5865f2" })
+                ? h(View, { style: { paddingVertical: 8, alignItems: "center", justifyContent: "center" } },
+                    h(ActivityIndicator, { size: "small", color: "#5865f2" }))
                 : button("Test API keys", "#5865f2", runKeyTests, true)
             )
           : null,
