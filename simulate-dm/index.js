@@ -5,6 +5,7 @@
   const { after } = vendetta.patcher;
   const metro = vendetta.metro;
   const { React, ReactNative: RN } = metro.common;
+  const h = React.createElement;
   const { showToast } = vendetta.ui.toasts;
   const { useProxy } = vendetta.storage;
   const unpatches = [];
