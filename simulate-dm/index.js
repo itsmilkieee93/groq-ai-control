@@ -227,6 +227,82 @@
     showToast(copyToClipboard(text) ? "Log copied to clipboard" : "Couldn't share or copy log");
   }
 
+  // ---------- Discord user helpers ----------
+  const DEFAULT_AVATAR = "https://cdn.discordapp.com/embed/avatars/0.png";
+  const loggedOnce = {};
+  function logOnce(key, ...args) {
+    if (loggedOnce[key]) return;
+    loggedOnce[key] = true;
+    log(...args);
+  }
+
+  function getUserStore() {
+    try { return metro.findByStoreName?.("UserStore") || null; } catch (e) { return null; }
+  }
+  function getCurrentUser() {
+    try { return getUserStore()?.getCurrentUser?.() || null; } catch (e) { return null; }
+  }
+  function avatarUrlFor(user) {
+    if (user && user.id && user.avatar) return "https://cdn.discordapp.com/avatars/" + user.id + "/" + user.avatar + ".png?size=128";
+    return DEFAULT_AVATAR;
+  }
+  function displayNameOf(user) {
+    return (user && (user.globalName || user.global_name || user.username)) || "User";
+  }
+  // Server tag (the "MC" pill next to names)
+  function guildTagOf(user) {
+    try {
+      const pg = user && (user.primaryGuild || user.primary_guild);
+      if (!pg || !pg.tag) return null;
+      const gid = pg.identityGuildId || pg.identity_guild_id;
+      const badge = pg.badge;
+      const urls = gid && badge
+        ? [
+            "https://cdn.discordapp.com/guild-tag-badges/" + gid + "/" + badge + ".png?size=64",
+            "https://cdn.discordapp.com/clan-badges/" + gid + "/" + badge + ".png?size=64",
+          ]
+        : [];
+      return { tag: String(pg.tag), urls };
+    } catch (e) { return null; }
+  }
+  // Fields stored on a contact, taken from a Discord user object
+  function contactFieldsFromUser(user) {
+    const gt = guildTagOf(user);
+    return {
+      discordId: user.id,
+      username: displayNameOf(user),
+      handle: user.username || "",
+      avatar: avatarUrlFor(user),
+      tag: gt ? gt.tag : "",
+      tagUrls: gt ? gt.urls : [],
+    };
+  }
+
+  // ---------- Date formatting (Discord-style) ----------
+  const MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+  const p2 = (n) => (n < 10 ? "0" : "") + n;
+  function msgDate(m) {
+    const n = Number(m && (m.ts || m.id));
+    return new Date(isFinite(n) && n > 1e12 ? n : Date.now());
+  }
+  function sameDay(a, b) {
+    return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
+  }
+  function fmtClock(d) {
+    let hr = d.getHours();
+    const ap = hr >= 12 ? "PM" : "AM";
+    hr = hr % 12 || 12;
+    return hr + ":" + p2(d.getMinutes()) + " " + ap;
+  }
+  // Today: "9:24 PM"   Other days: "08/23/2026 8:45 PM"
+  function fmtStamp(d) {
+    if (sameDay(d, new Date())) return fmtClock(d);
+    return p2(d.getMonth() + 1) + "/" + p2(d.getDate()) + "/" + d.getFullYear() + " " + fmtClock(d);
+  }
+  function fmtDivider(d) {
+    return MONTHS[d.getMonth()] + " " + d.getDate() + ", " + d.getFullYear();
+  }
+
   // ---------- Theme ----------
   function isLightTheme() {
     try {
@@ -242,6 +318,14 @@
     return isLightTheme()
       ? { bg: "#ffffff", text: "#060607", muted: "#4e5058", card: "#f2f3f5", accent: "#5865f2", input: "#e3e5e8" }
       : { bg: "#313338", text: "#dbdee1", muted: "#80848e", card: "#2b2d31", accent: "#5865f2", input: "#383a40" };
+  }
+
+  // Chat screen colors: pure-black Discord look in dark mode
+  function getChatPalette() {
+    const base = getPalette();
+    return isLightTheme()
+      ? Object.assign({}, base, { composer: "#f2f3f5", line: "#d4d7dc", pill: "#e3e5e8" })
+      : Object.assign({}, base, { bg: "#000000", text: "#f2f3f5", card: "#0b0b0c", composer: "#111214", line: "#2b2d31", pill: "#2b2d31" });
   }
 
   // ---------- Groq call ----------
@@ -295,14 +379,29 @@
     return "AI request failed. Check your API key.";
   }
 
-  // ---------- Fake Chat Screen ----------
+  // ---------- Fake Chat Screen (Discord DM look) ----------
+  function TagPill({ tag, urls }) {
+    const { View, Text, Image } = RN;
+    const [i, setI] = React.useState(0);
+    const url = urls && urls[i];
+    return h(
+      View,
+      { style: { flexDirection: "row", alignItems: "center", backgroundColor: "#2b2d31", borderRadius: 6, paddingHorizontal: 6, paddingVertical: 2, marginLeft: 6 } },
+      url
+        ? h(Image, { source: { uri: url }, onError: () => setI(i + 1), style: { width: 14, height: 14, marginRight: 4 } })
+        : null,
+      h(Text, { style: { color: "#dbdee1", fontSize: 12, fontWeight: "700" } }, tag)
+    );
+  }
+
   function FakeChatScreen({ contact }) {
-    const { View, Text, ScrollView, Image, TextInput, TouchableOpacity, KeyboardAvoidingView, Platform, ActivityIndicator } = RN;
-    const P = getPalette();
+    const { View, Text, ScrollView, Image, TextInput, TouchableOpacity, KeyboardAvoidingView, Platform } = RN;
+    const P = getChatPalette();
     const [messages, setMessages] = React.useState(() => getMessages(contact.id));
     const [input, setInput] = React.useState("");
     const [busy, setBusy] = React.useState(false);
     const scrollRef = React.useRef(null);
+    const me = getCurrentUser();
 
     const refresh = () => setMessages([...getMessages(contact.id)]);
 
@@ -310,11 +409,13 @@
       const text = input.trim();
       if (!text || busy) return;
 
+      const now = Date.now();
       const userMsg = {
-        id: Date.now().toString(),
+        id: now.toString(),
+        ts: now,
         from: "me",
         text,
-        time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+        time: new Date(now).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
       };
       log("Sent message to", contact.username);
       addMessage(contact.id, userMsg);
@@ -324,11 +425,13 @@
 
       try {
         const replyText = await getAIReply(text, contact);
+        const t2 = Date.now();
         const reply = {
-          id: (Date.now() + 1).toString(),
+          id: (t2 + 1).toString(),
+          ts: t2,
           from: "them",
           text: replyText,
-          time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+          time: new Date(t2).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
         };
         addMessage(contact.id, reply);
         refresh();
@@ -341,79 +444,120 @@
 
     React.useEffect(() => {
       setTimeout(() => scrollRef.current?.scrollToEnd?.({ animated: true }), 80);
-    }, [messages]);
+    }, [messages, busy]);
 
-    const renderMessage = (msg, index) => {
-      const isMe = msg.from === "me";
-      const showAvatar = !isMe && (index === 0 || messages[index - 1]?.from !== "them");
+    // Author info for the header line of a message group
+    const authorOf = (msg) => {
+      if (msg.from === "me") {
+        const display = displayNameOf(me);
+        const handle = (me && me.username) || "";
+        const gt = guildTagOf(me);
+        return { avatar: avatarUrlFor(me), display, handle, tag: gt ? gt.tag : "", tagUrls: gt ? gt.urls : [] };
+      }
+      return {
+        avatar: contact.avatar || DEFAULT_AVATAR,
+        display: contact.username || "User",
+        handle: contact.handle || "",
+        tag: contact.tag || "",
+        tagUrls: contact.tagUrls || [],
+      };
+    };
 
-      return h(
-        View,
-        { key: msg.id, style: { flexDirection: "row", paddingHorizontal: 12, paddingVertical: 3, alignItems: "flex-start" } },
-        showAvatar
-          ? h(Image, {
-              source: { uri: contact.avatar || "https://cdn.discordapp.com/embed/avatars/0.png" },
-              style: { width: 40, height: 40, borderRadius: 20, marginRight: 12, marginTop: 2 },
-            })
-          : h(View, { style: { width: 52 } }),
+    const rows = [];
+    messages.forEach((msg, index) => {
+      const d = msgDate(msg);
+      const prev = index > 0 ? messages[index - 1] : null;
+      const pd = prev ? msgDate(prev) : null;
+      const newDay = !pd || !sameDay(d, pd);
+      const grouped = !!prev && !newDay && prev.from === msg.from && d.getTime() - pd.getTime() < 7 * 60 * 1000;
+
+      if (newDay) {
+        rows.push(
+          h(
+            View,
+            { key: "day" + msg.id, style: { flexDirection: "row", alignItems: "center", marginHorizontal: 12, marginTop: 18, marginBottom: 2 } },
+            h(View, { style: { flex: 1, height: 1, backgroundColor: P.line } }),
+            h(Text, { style: { color: P.muted, fontSize: 13, fontWeight: "600", marginHorizontal: 12 } }, fmtDivider(d)),
+            h(View, { style: { flex: 1, height: 1, backgroundColor: P.line } })
+          )
+        );
+      }
+
+      const a = authorOf(msg);
+      const nameLine = a.handle && a.handle.toLowerCase() !== a.display.toLowerCase() ? a.display + " (@" + a.handle + ")" : a.display;
+
+      rows.push(
         h(
           View,
-          { style: { flex: 1 } },
-          showAvatar
-            ? h(
-                View,
-                { style: { flexDirection: "row", alignItems: "baseline", marginBottom: 1 } },
-                h(Text, { style: { color: "#00a8fc", fontWeight: "600", fontSize: 16 } }, contact.username || "User"),
-                h(Text, { style: { color: P.muted, fontSize: 12, marginLeft: 8 } }, msg.time)
-              )
-            : null,
-          h(Text, { style: { color: P.text, fontSize: 16, lineHeight: 22 } }, msg.text)
+          { key: msg.id, style: { flexDirection: "row", paddingHorizontal: 12, paddingTop: grouped ? 2 : 14, alignItems: "flex-start" } },
+          grouped
+            ? h(View, { style: { width: 52 } })
+            : h(Image, { source: { uri: a.avatar }, style: { width: 40, height: 40, borderRadius: 20, marginRight: 12, marginTop: 2, backgroundColor: P.pill } }),
+          h(
+            View,
+            { style: { flex: 1 } },
+            grouped
+              ? null
+              : h(
+                  View,
+                  { style: { flexDirection: "row", alignItems: "center", marginBottom: 2 } },
+                  h(Text, { numberOfLines: 1, style: { flexShrink: 1, color: P.text, fontWeight: "700", fontSize: 16 } }, nameLine),
+                  a.tag ? h(TagPill, { tag: a.tag, urls: a.tagUrls }) : null,
+                  h(Text, { style: { color: P.muted, fontSize: 12, marginLeft: 8 } }, fmtStamp(d))
+                ),
+            h(Text, { selectable: true, style: { color: P.text, fontSize: 16, lineHeight: 22 } }, msg.text)
+          )
         )
       );
-    };
+    });
+
+    // Decorative composer buttons (visual only)
+    const glyph = (g, size) =>
+      h(View, { style: { width: 38, height: 38, alignItems: "center", justifyContent: "center" } },
+        h(Text, { style: { color: P.muted, fontSize: size || 22 } }, g));
+
+    const hasText = input.trim().length > 0;
 
     return h(
       KeyboardAvoidingView,
       { style: { flex: 1, backgroundColor: P.bg }, behavior: Platform.OS === "ios" ? "padding" : undefined },
       h(
         ScrollView,
-        { ref: scrollRef, contentContainerStyle: { paddingVertical: 8 }, keyboardShouldPersistTaps: "handled" },
-        messages.map(renderMessage)
+        { ref: scrollRef, contentContainerStyle: { paddingBottom: 12 }, keyboardShouldPersistTaps: "handled" },
+        rows
       ),
       h(
         View,
-        { style: { flexDirection: "row", padding: 10, backgroundColor: P.card, alignItems: "flex-end" } },
-        h(TextInput, {
-          value: input,
-          onChangeText: setInput,
-          placeholder: "Message " + (contact.username || "user"),
-          placeholderTextColor: P.muted,
-          style: {
-            flex: 1,
-            backgroundColor: P.input,
-            color: P.text,
-            borderRadius: 8,
-            paddingHorizontal: 12,
-            paddingVertical: 10,
-            marginRight: 8,
-            fontSize: 16,
-            maxHeight: 100,
-          },
-          multiline: true,
-        }),
+        { style: { paddingHorizontal: 10, paddingTop: 6, paddingBottom: 10, backgroundColor: P.bg } },
+        busy
+          ? h(Text, { style: { color: P.muted, fontSize: 12, marginLeft: 14, marginBottom: 4 } }, (contact.username || "They") + " is typing…")
+          : null,
         h(
-          TouchableOpacity,
-          {
-            onPress: send,
-            disabled: busy,
-            style: { backgroundColor: busy ? "#4e5058" : P.accent, borderRadius: 8, paddingHorizontal: 16, paddingVertical: 12 },
-          },
-          busy
-            ? h(ActivityIndicator, { size: "small", color: "#fff" })
-            : h(Text, { style: { color: "#fff", fontWeight: "700" } }, "Send")
+          View,
+          { style: { flexDirection: "row", alignItems: "flex-end", backgroundColor: P.composer, borderRadius: 26, borderWidth: 1, borderColor: P.line, paddingHorizontal: 6, paddingVertical: 4 } },
+          glyph("+", 26),
+          h(TextInput, {
+            value: input,
+            onChangeText: setInput,
+            placeholder: "Message @" + (contact.username || "user"),
+            placeholderTextColor: P.muted,
+            multiline: true,
+            style: { flex: 1, color: P.text, fontSize: 16, paddingHorizontal: 6, paddingVertical: 8, maxHeight: 120 },
+          }),
+          hasText
+            ? h(
+                TouchableOpacity,
+                { onPress: send, disabled: busy, style: { width: 38, height: 38, borderRadius: 19, backgroundColor: busy ? "#4e5058" : P.accent, alignItems: "center", justifyContent: "center", marginLeft: 4 } },
+                h(Text, { style: { color: "#fff", fontSize: 20, fontWeight: "700" } }, "↑")
+              )
+            : h(View, { style: { flexDirection: "row" } }, glyph("🎁", 18), glyph("☺", 24), glyph("🎤", 18))
         )
       )
     );
+  }
+
+  function openChat(contact) {
+    openCustomPage(contact.username || "Chat", () => h(FakeChatScreen, { contact }));
   }
 
   // ---------- Contact Manager ----------
@@ -438,7 +582,15 @@
       showToast("Contact added");
     };
 
-    const openChat = (c) => openCustomPage("Chat · " + c.username, () => h(FakeChatScreen, { contact: c }));
+    const removeContact = (c) => {
+      storage.contacts = getContacts().filter((x) => x.id !== c.id);
+      const m = Object.assign({}, storage.messages || {});
+      delete m[c.id];
+      storage.messages = m;
+      setContacts(getContacts().slice());
+      log("Contact removed:", c.username);
+      showToast("Contact removed");
+    };
 
     return h(
       ScrollView,
@@ -455,7 +607,12 @@
                 style: { flexDirection: "row", alignItems: "center", padding: 12, backgroundColor: P.card, borderRadius: 10, marginBottom: 8 },
               },
               h(Image, { source: { uri: c.avatar }, style: { width: 44, height: 44, borderRadius: 22, marginRight: 12 } }),
-              h(Text, { style: { color: P.text, fontSize: 16, fontWeight: "600" } }, c.username)
+              h(Text, { style: { color: P.text, fontSize: 16, fontWeight: "600", flex: 1 } }, c.username),
+              h(
+                TouchableOpacity,
+                { onPress: () => removeContact(c), style: { paddingHorizontal: 10, paddingVertical: 6 } },
+                h(Text, { style: { color: "#da373c", fontSize: 18, fontWeight: "700" } }, "✕")
+              )
             )
           ),
       h(Text, { style: { color: P.muted, marginTop: 16, marginBottom: 8, fontWeight: "600" } }, "Add contact"),
@@ -762,38 +919,42 @@
     function patchFn(args, ret) {
       try {
         const props = args[0] || {};
-        const user = props.user || props.displayProfile?.user;
-        if (!user || !user.id) return;
+        let user = props.user || props.displayProfile?.user;
+        if (!user) {
+          const uid = props.userId || props.user_id;
+          if (uid) user = getUserStore()?.getUser?.(uid);
+        }
+        if (!user || !user.id) {
+          logOnce("noUser", "profile menu: no user found, props:", Object.keys(props).join(","));
+          return;
+        }
         const items = getMainItems(ret);
-        if (!items || items.some((i) => i?.label === "Simulate DM")) return;
+        if (!items) {
+          logOnce("noItems", "profile menu: menu items not found");
+          return;
+        }
+        if (items.some((i) => i?.label === "Simulate DM")) return;
 
         items.push({
           label: "Simulate DM",
           action: () => {
-            const username = user.globalName || user.global_name || user.username || "User";
-            const avatar = user.avatar
-              ? `https://cdn.discordapp.com/avatars/${user.id}/${user.avatar}.${user.avatar.startsWith("a_") ? "gif" : "png"}?size=256`
-              : "https://cdn.discordapp.com/embed/avatars/0.png";
+            const fields = contactFieldsFromUser(user);
+            log("Simulate DM pressed for", fields.username, "(@" + fields.handle + ")", fields.discordId);
 
             let contact = getContacts().find((c) => c.discordId === user.id);
             if (!contact) {
-              contact = {
-                id: Date.now().toString(),
-                discordId: user.id,
-                username: username,
-                avatar: avatar,
-              };
+              contact = Object.assign({ id: Date.now().toString() }, fields);
               saveContact(contact);
-              log("Contact created from profile:", username);
-              showToast("Contact created: " + username);
+              log("Contact created from profile:", contact.username);
+              showToast("Contact created: " + contact.username);
             } else {
-              // update avatar/name in case they changed
-              contact.username = username;
-              contact.avatar = avatar;
+              // refresh name/avatar/tag in case they changed
+              contact = Object.assign({}, contact, fields);
               saveContact(contact);
+              log("Contact updated from profile:", contact.username);
             }
 
-            openCustomPage("Chat · " + contact.username, () => h(FakeChatScreen, { contact }));
+            openChat(contact);
           },
         });
       } catch (e) {
@@ -801,14 +962,32 @@
       }
     }
 
-    for (const name of NAMES) {
+    let hooked = 0;
+    const tryHook = (mod, label) => {
       try {
-        const mod = metro.findByName?.(name, false);
-        if (mod) {
-          unpatches.push(after("default", mod, patchFn));
-        }
+        if (!mod || typeof mod.default !== "function") return false;
+        unpatches.push(after("default", mod, patchFn));
+        hooked++;
+        log("profile menu: patched", label);
+        return true;
+      } catch (e) {
+        log("profile menu: patch failed for", label, e);
+        return false;
+      }
+    };
+
+    for (const name of NAMES) {
+      try { tryHook(metro.findByName?.(name, false), name); } catch (e) {}
+    }
+    if (!hooked) {
+      // Fallback: scan loaded modules for a profile overflow menu component
+      try {
+        const re = /UserProfile.*OverflowMenu|UserProfileOverflow/i;
+        const all = metro.findAll?.((m) => { try { return typeof m?.default === "function" && re.test(fnName(m.default)); } catch (e) { return false; } }) || [];
+        all.slice(0, 4).forEach((m) => tryHook(m, fnName(m.default)));
       } catch (e) {}
     }
+    if (!hooked) log("profile menu: no overflow menu component found, Simulate DM entry is unavailable there");
   }
 
   function onLoad() {
