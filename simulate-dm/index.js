@@ -41,6 +41,192 @@
     return list.map((k) => (k && typeof k.key === "string" ? k.key.trim() : "")).filter(Boolean);
   }
 
+  // ---------- Logging & export ----------
+  const logBuffer = [];
+
+  function fmtArg(a) {
+    if (a instanceof Error) return a.message;
+    if (typeof a === "string") return a;
+    try { return JSON.stringify(a); } catch (e) { return String(a); }
+  }
+  function log(...args) {
+    const line = "[" + new Date().toISOString() + "] " + args.map(fmtArg).join(" ");
+    logBuffer.push(line);
+    if (logBuffer.length > 500) logBuffer.shift();
+    try { console.log("[FakeDM]", ...args); } catch (e) {}
+  }
+
+  function buildLogText() {
+    const contacts = Array.isArray(storage.contacts) ? storage.contacts.length : 0;
+    const msgCount = Object.values(storage.messages || {}).reduce((n, l) => n + (Array.isArray(l) ? l.length : 0), 0);
+    return [
+      "Simulate DM logs",
+      "Exported: " + new Date().toISOString(),
+      "Model: " + (storage.model || DEFAULT_MODEL),
+      "API keys: " + getKeys().length + " (not included)",
+      "Contacts: " + contacts + " | Messages: " + msgCount,
+      "Entries: " + logBuffer.length,
+      "-----",
+      ...(logBuffer.length ? logBuffer : ["(no log entries)"]),
+    ].join("\n");
+  }
+
+  function copyToClipboard(text) {
+    const cands = [metro.findByProps?.("setString", "getString"), metro.common?.clipboard, RN.Clipboard];
+    for (const c of cands) {
+      try { if (c && typeof c.setString === "function") { c.setString(text); return true; } } catch (e) {}
+    }
+    return false;
+  }
+
+  // Export location (same approach as AI Writer Magic):
+  //   /storage/emulated/0/Android/data/<package>/files/FakeDMExports/
+  // "documents" + a RELATIVE path is resolved by the file manager itself; the external package
+  // folder is reached with a "../" climb from the real documents dir, and every write is verified.
+  const APP_EXPORT_SUBDIR = "FakeDMExports";
+
+  function getFileManager() {
+    const names = ["DCDFileManager", "NativeFileModule", "RTNFileManager"];
+    const sources = [];
+    try { if (typeof nativeModuleProxy !== "undefined" && nativeModuleProxy) sources.push(nativeModuleProxy); } catch (e) {}
+    try { if (globalThis.nativeModuleProxy) sources.push(globalThis.nativeModuleProxy); } catch (e) {}
+    try { if (RN.NativeModules) sources.push(RN.NativeModules); } catch (e) {}
+    for (let i = 0; i < sources.length; i++) {
+      for (let j = 0; j < names.length; j++) {
+        try {
+          const m = sources[i][names[j]];
+          if (m && typeof m.writeFile === "function") return m;
+        } catch (e) {}
+      }
+    }
+    return null;
+  }
+
+  function getFileManagerConstants() {
+    try {
+      const fm = getFileManager();
+      return fm && typeof fm.getConstants === "function" ? fm.getConstants() || {} : {};
+    } catch (e) { return {}; }
+  }
+
+  function cleanPath(p) {
+    return String(p || "").replace(/^file:\/\//, "").replace(/\/+$/, "");
+  }
+
+  function packageFromPath(p) {
+    const s = cleanPath(p);
+    let m = s.match(/\/Android\/data\/([^/]+)/);
+    if (m) return m[1];
+    m = s.match(/\/data\/(?:user\/\d+|data)\/([^/]+)/);
+    return m ? m[1] : "";
+  }
+
+  function exportStamp() {
+    const d = new Date();
+    const p2 = (n) => (n < 10 ? "0" : "") + n;
+    return d.getFullYear() + p2(d.getMonth() + 1) + p2(d.getDate()) + "_" + p2(d.getHours()) + p2(d.getMinutes()) + p2(d.getSeconds());
+  }
+
+  // Reads the file back to prove it exists with the right content: "ok" | "mismatch" | "missing" | "unverified"
+  async function verifyFile(fm, absPath, expected) {
+    let exists;
+    try { if (typeof fm.fileExists === "function") exists = await fm.fileExists(absPath); } catch (e) { exists = undefined; }
+    if (exists === false) return "missing";
+    try {
+      if (typeof fm.readFile === "function") {
+        const back = await fm.readFile(absPath, "utf8");
+        if (typeof back === "string") return back === expected ? "ok" : "mismatch";
+      }
+    } catch (e) {
+      return exists === true ? "ok" : "missing";
+    }
+    return exists === true ? "ok" : "unverified";
+  }
+
+  // Returns { path, external, verified } or throws if nothing could be verified.
+  async function writeAppFile(text, name) {
+    const fm = getFileManager();
+    if (!fm) throw new Error("file manager not available");
+    const rel = APP_EXPORT_SUBDIR + "/" + name;
+    const docsDir = cleanPath(getFileManagerConstants().DocumentsDirPath);
+    const pkg = packageFromPath(docsDir);
+    const isExtPath = (p) => String(p).indexOf("/Android/data/") !== -1;
+    const problems = [];
+
+    // 1) documents + relative path
+    let docsPath = "";
+    let docsState = "unverified";
+    try {
+      await fm.writeFile("documents", rel, text, "utf8");
+      docsPath = docsDir ? docsDir + "/" + rel : "";
+      if (docsPath) docsState = await verifyFile(fm, docsPath, text);
+      log("export: documents write", docsPath || "(path unknown)", docsState);
+      if (docsState === "ok" && isExtPath(docsPath)) return { path: docsPath, external: true, verified: true };
+      if (docsState === "missing" || docsState === "mismatch") problems.push("documents: " + docsState);
+    } catch (e) {
+      problems.push("documents write failed: " + ((e && e.message) || e));
+      log("export: documents write failed", e);
+    }
+
+    // 2) documents dir is internal -> try the external package folder via a relative "../" climb
+    if (docsDir && pkg && !isExtPath(docsDir)) {
+      const extDir = "/storage/emulated/0/Android/data/" + pkg + "/files";
+      const depth = docsDir.split("/").filter(Boolean).length;
+      let up = "";
+      for (let i = 0; i < depth; i++) up += "../";
+      const climbRel = up + extDir.replace(/^\//, "") + "/" + rel;
+      const extPath = extDir + "/" + rel;
+      try {
+        await fm.writeFile("documents", climbRel, text, "utf8");
+        const st = await verifyFile(fm, extPath, text);
+        log("export: external write", extPath, st);
+        if (st === "ok") return { path: extPath, external: true, verified: true };
+        problems.push("external: " + st);
+      } catch (e) {
+        problems.push("external write failed: " + ((e && e.message) || e));
+        log("export: external write failed", e);
+      }
+    }
+
+    // 3) fall back to the internal file, never pretending it is external
+    if (docsPath && docsState === "ok") return { path: docsPath, external: false, verified: true };
+    if (docsPath && docsState === "unverified") return { path: docsPath, external: false, verified: false };
+    throw new Error("file was not found after writing (" + (problems.join("; ") || "unknown") + ")");
+  }
+
+  function exportToastText(r) {
+    if (r.external && r.verified) return "Logs exported & verified: " + r.path;
+    if (r.verified) return "Logs saved in app-private storage (not visible in file managers): " + r.path;
+    return "Logs written but could not be verified: " + r.path;
+  }
+
+  async function exportLogs() {
+    const text = buildLogText();
+    try {
+      const r = await writeAppFile(text, "fakedm-log-" + exportStamp() + ".txt");
+      log("Logs exported to", r.path);
+      showToast(exportToastText(r));
+    } catch (e) {
+      log("Export failed:", e);
+      showToast(
+        copyToClipboard(text)
+          ? "Storage access denied! Backup text automatically copied to clipboard."
+          : "Export failed: " + ((e && e.message) || "unknown")
+      );
+    }
+  }
+
+  async function shareLogs() {
+    const text = logBuffer.slice(-300).join("\n") || "(log is empty)";
+    try {
+      if (RN.Share && typeof RN.Share.share === "function") {
+        await RN.Share.share({ message: text, title: "Simulate DM log" });
+        return;
+      }
+    } catch (e) {}
+    showToast(copyToClipboard(text) ? "Log copied to clipboard" : "Couldn't share or copy log");
+  }
+
   // ---------- Theme ----------
   function isLightTheme() {
     try {
@@ -99,9 +285,11 @@
     const history = getMessages(contact.id);
     for (const key of keys) {
       try {
-        return await callGroq(key, userText, contact, history);
+        const out = await callGroq(key, userText, contact, history);
+        log("AI reply OK for", contact.username, "(" + out.length + " chars)");
+        return out;
       } catch (e) {
-        console.log("[FakeDM] key failed", e.message);
+        log("key failed", e.message);
       }
     }
     return "AI request failed. Check your API key.";
@@ -128,6 +316,7 @@
         text,
         time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
       };
+      log("Sent message to", contact.username);
       addMessage(contact.id, userMsg);
       refresh();
       setInput("");
@@ -301,6 +490,7 @@
     const [newKey, setNewKey] = React.useState("");
     const [prompt, setPrompt] = React.useState(storage.systemPrompt || "");
     const keys = Array.isArray(storage.apiKeys) ? storage.apiKeys : [];
+    const [, bump] = React.useState(0);
 
     const addKey = () => {
       const k = newKey.trim();
@@ -326,6 +516,12 @@
       ScrollView,
       { style: { flex: 1, backgroundColor: P.bg }, contentContainerStyle: { padding: 16 } },
       h(Text, { style: { color: P.text, fontSize: 20, fontWeight: "700", marginBottom: 16 } }, "Simulate DM Settings"),
+      h(
+        TouchableOpacity,
+        { onPress: () => openCustomPage("Simulate DMs", ContactManager), style: { backgroundColor: P.accent, borderRadius: 8, padding: 14, alignItems: "center", marginBottom: 24 } },
+        h(Text, { style: { color: "#fff", fontWeight: "700", fontSize: 16 } }, "Open Simulated DMs")
+      ),
+
 
       h(Text, { style: { color: P.muted, fontWeight: "700", marginBottom: 8 } }, "GROQ API KEYS"),
       keys.length === 0
@@ -370,6 +566,29 @@
         TouchableOpacity,
         { onPress: savePrompt, style: { backgroundColor: P.accent, borderRadius: 8, padding: 12, alignItems: "center" } },
         h(Text, { style: { color: "#fff", fontWeight: "700" } }, "Save Prompt")
+      ),
+
+      h(Text, { style: { color: P.muted, fontWeight: "700", marginTop: 24, marginBottom: 8 } }, "DEBUG LOGS"),
+      h(Text, { style: { color: P.muted, fontSize: 12, marginBottom: 8 } }, logBuffer.length + " log entries. Logs include usernames and error details; API keys are never included. Exports go to Android/data/<package>/files/FakeDMExports/."),
+      h(
+        TouchableOpacity,
+        { onPress: async () => { await exportLogs(); bump((n) => n + 1); }, style: { backgroundColor: "#248046", borderRadius: 8, padding: 12, alignItems: "center", marginBottom: 8 } },
+        h(Text, { style: { color: "#fff", fontWeight: "700" } }, "Export Logs")
+      ),
+      h(
+        TouchableOpacity,
+        { onPress: shareLogs, style: { backgroundColor: "#5865f2", borderRadius: 8, padding: 12, alignItems: "center", marginBottom: 8 } },
+        h(Text, { style: { color: "#fff", fontWeight: "700" } }, "Share Logs")
+      ),
+      h(
+        TouchableOpacity,
+        { onPress: () => { showToast(copyToClipboard(buildLogText()) ? "Logs copied to clipboard" : "Copy failed"); }, style: { backgroundColor: P.accent, borderRadius: 8, padding: 12, alignItems: "center", marginBottom: 8 } },
+        h(Text, { style: { color: "#fff", fontWeight: "700" } }, "Copy Logs")
+      ),
+      h(
+        TouchableOpacity,
+        { onPress: () => { logBuffer.length = 0; bump((n) => n + 1); showToast("Logs cleared"); }, style: { backgroundColor: "#da373c", borderRadius: 8, padding: 12, alignItems: "center" } },
+        h(Text, { style: { color: "#fff", fontWeight: "700" } }, "Clear Logs")
       )
     );
   }
@@ -388,6 +607,7 @@
       const Navigation = metro.findByProps("Navigation")?.Navigation;
       Navigation?.push?.("VendettaCustomPage", { title, render });
     } catch (e) {
+      log("openCustomPage failed:", e);
       showToast("Could not open page");
     }
   }
@@ -430,7 +650,7 @@
 
   function patchDMScreen() {
     const candidates = findDMListCandidates();
-    console.log("[FakeDM] DM list candidates:", candidates.map((c) => c.label).join(", ") || "none");
+    log("DM list candidates:", candidates.map((c) => c.label).join(", ") || "none");
 
     if (!candidates.length) {
       showToast("Simulate DM: DM list not found (check logs)");
@@ -465,7 +685,7 @@
         unpatches.push(after(c.key, c.holder, injectButton));
         patched++;
       } catch (e) {
-        console.log("[FakeDM] patch failed for", c.label, e?.message);
+        log("patch failed for", c.label, e?.message);
       }
     }
     showToast("Simulate DM: patched " + patched + " DM list component(s)");
@@ -564,6 +784,7 @@
                 avatar: avatar,
               };
               saveContact(contact);
+              log("Contact created from profile:", username);
               showToast("Contact created: " + username);
             } else {
               // update avatar/name in case they changed
@@ -576,7 +797,7 @@
           },
         });
       } catch (e) {
-        console.log("[FakeDM] profile menu patch error", e);
+        log("profile menu patch error", e);
       }
     }
 
@@ -597,9 +818,10 @@
     if (typeof storage.systemPrompt !== "string") {
       storage.systemPrompt = "You are roleplaying as {name} in a Discord DM. Reply naturally and casually in character. Keep most replies short.";
     }
-    try { patchDMScreen(); } catch (e) { console.log("[FakeDM] DM patch failed", e); }
-    try { patchSettings(); } catch (e) { console.log("[FakeDM] settings patch failed", e); }
-    try { patchUserProfileMenu(); } catch (e) { console.log("[FakeDM] profile menu patch failed", e); }
+    // patchDMScreen() disabled: wrapping the DM list crashes native views (removeViewAt error)
+    log("Plugin loaded");
+    try { patchSettings(); } catch (e) { log("settings patch failed", e); }
+    try { patchUserProfileMenu(); } catch (e) { log("profile menu patch failed", e); }
   }
 
   function onUnload() {
