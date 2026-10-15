@@ -1,0 +1,14 @@
+{
+  "name": "Simulate DM",
+  "description": "Simulate Discord DMs with AI-powered replies using Groq. Add contacts manually or from user profiles, chat in a Discord-styled interface.",
+  "authors": [
+    {
+      "name": "User",
+      "id": "0"
+    }
+  ],
+  "main": "index.js",
+  "vendetta": {
+    "icon": "ic_chat_bubble_16px"
+  }
+}
