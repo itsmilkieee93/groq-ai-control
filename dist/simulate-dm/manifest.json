@@ -7,7 +7,7 @@
       "id": "0"
     }
   ],
-  "main": "index.js",
+  "main": "dist/simulate-dm/index.js",
   "vendetta": {
     "icon": "ic_chat_bubble_16px"
   }
