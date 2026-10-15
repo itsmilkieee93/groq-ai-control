@@ -1,5 +1,6 @@
 (function () {
   "use strict";
+  // Simulate DM plugin - refreshed
 
   const { storage } = vendetta.plugin;
   const { after } = vendetta.patcher;
