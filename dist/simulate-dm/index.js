@@ -5,6 +5,7 @@
   const { after } = vendetta.patcher;
   const metro = vendetta.metro;
   const { React, ReactNative: RN } = metro.common;
+  const h = React.createElement;
   const { showToast } = vendetta.ui.toasts;
   const { useProxy } = vendetta.storage;
 
@@ -392,46 +393,82 @@
   }
 
   // ---------- Patch DM list ----------
+  const DM_NAME_RE = /^(DirectMessages|DirectMessagesScreen|DirectMessageList|PrivateChannels|PrivateChannelList|PrivateChannelsList|ConnectedPrivateChannels|DMList|DMsList|MessagesTab|MessagesScreen|HomeDirectMessages)$|PrivateChannel.*List|DirectMessage.*List/i;
+
+  function fnName(f) {
+    try { return (f && (f.displayName || f.name)) || ""; } catch (e) { return ""; }
+  }
+
+  function findDMListCandidates() {
+    const found = [];
+    const seen = new Set();
+    const add = (holder, key, label) => {
+      try {
+        if (!holder || typeof holder[key] !== "function" || seen.has(holder[key])) return;
+        seen.add(holder[key]);
+        found.push({ holder, key, label });
+      } catch (e) {}
+    };
+
+    // 1) Known / likely names
+    const names = ["DirectMessages", "DirectMessagesScreen", "PrivateChannels", "PrivateChannelList", "ConnectedPrivateChannels", "DMList", "MessagesTab", "HomeDirectMessages"];
+    for (const n of names) {
+      try { const m = metro.findByName?.(n, false); if (m) add(m, "default", n); } catch (e) {}
+      try { (metro.findByNameAll?.(n, false) || []).forEach((m) => add(m, "default", n)); } catch (e) {}
+    }
+
+    // 2) Scan every loaded module for a default export whose name looks like a DM list
+    try {
+      const all = metro.findAll?.((m) => {
+        try { return typeof m?.default === "function" && DM_NAME_RE.test(fnName(m.default)); } catch (e) { return false; }
+      }) || [];
+      all.forEach((m) => add(m, "default", fnName(m.default)));
+    } catch (e) {}
+
+    return found;
+  }
+
   function patchDMScreen() {
-    const candidates = [
-      metro.findByProps("PrivateChannel"),
-      metro.find((m) => m?.default?.name === "PrivateChannelList"),
-      metro.find((m) => m?.PrivateChannelList),
-    ].filter(Boolean);
+    const candidates = findDMListCandidates();
+    console.log("[FakeDM] DM list candidates:", candidates.map((c) => c.label).join(", ") || "none");
 
     if (!candidates.length) {
-      console.log("[FakeDM] DM list component not found");
+      showToast("Simulate DM: DM list not found (check logs)");
       return;
     }
 
-    unpatches.push(
-      after("default", candidates[0], (args, ret) => {
-        try {
-          return h(
-            RN.View,
-            { style: { flex: 1 } },
-            h(
-              RN.TouchableOpacity,
-              {
-                onPress: () => openCustomPage("Simulate DMs", ContactManager),
-                style: {
-                  marginHorizontal: 12,
-                  marginVertical: 8,
-                  padding: 14,
-                  backgroundColor: "#5865f2",
-                  borderRadius: 8,
-                  alignItems: "center",
-                },
-              },
-              h(RN.Text, { style: { color: "#fff", fontWeight: "700", fontSize: 16 } }, "Simulate DM")
-            ),
-            ret
-          );
-        } catch (e) {
-          return ret;
-        }
-      })
-    );
+    const injectButton = (args, ret) => {
+      try {
+        if (!ret || !RN || ret?.props?.["data-fakedm"]) return ret;
+        return h(
+          RN.View,
+          { style: { flex: 1 }, "data-fakedm": true },
+          h(
+            RN.TouchableOpacity,
+            {
+              onPress: () => openCustomPage("Simulate DMs", ContactManager),
+              style: { marginHorizontal: 12, marginVertical: 8, padding: 14, backgroundColor: "#5865f2", borderRadius: 8, alignItems: "center" },
+            },
+            h(RN.Text, { style: { color: "#fff", fontWeight: "700", fontSize: 16 } }, "Simulate DM")
+          ),
+          ret
+        );
+      } catch (e) {
+        return ret;
+      }
+    };
+
+    // Patch the first few candidates; the wrapper skips anything already wrapped
+    let patched = 0;
+    for (const c of candidates.slice(0, 4)) {
+      try {
+        unpatches.push(after(c.key, c.holder, injectButton));
+        patched++;
+      } catch (e) {
+        console.log("[FakeDM] patch failed for", c.label, e?.message);
+      }
+    }
+    showToast("Simulate DM: patched " + patched + " DM list component(s)");
   }
 
   // ---------- Settings entry (like AI Writer Magic) ----------
@@ -529,6 +566,7 @@
               saveContact(contact);
               showToast("Contact created: " + username);
             } else {
+              // update avatar/name in case they changed
               contact.username = username;
               contact.avatar = avatar;
               saveContact(contact);
