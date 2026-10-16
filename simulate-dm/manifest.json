@@ -1,6 +1,6 @@
 {
   "name": "Simulate DM",
-  "description": "Simulate Discord DMs with AI-powered replies using Groq. Add contacts manually or from user profiles, chat in a Discord-styled interface.",
+  "description": "Simulate Discord DMs with AI-powered replies using Groq. Adds a button next to the search icon in the Messages tab.",
   "authors": [
     {
       "name": "User",
@@ -11,5 +11,5 @@
   "vendetta": {
     "icon": "ic_chat_bubble_16px"
   },
-  "hash": "a95b2eff4f7563bead4c705e79feb557b0a4cc140b7c24f1b827e773b6ecab4d"
+  "hash": "578a293ef953220b88dee38a912b4f7accade20f2ccebdd5b3db54dcdce144c1"
 }
