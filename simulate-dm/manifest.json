@@ -1,6 +1,6 @@
 {
   "name": "Simulate DM",
-  "description": "Simulate Discord DMs with AI-powered replies using Groq. Adds a button next to the search icon in the Messages tab.",
+  "description": "Simulate Discord DMs with AI replies. Adds Simulate DM to user profile menu. Does not touch the DMs list.",
   "authors": [
     {
       "name": "User",
@@ -11,5 +11,5 @@
   "vendetta": {
     "icon": "ic_chat_bubble_16px"
   },
-  "hash": "578a293ef953220b88dee38a912b4f7accade20f2ccebdd5b3db54dcdce144c1"
+  "hash": "616bf7953f24da911bdd538ab78499d7abf602d60c86baa0c9d34e428fa8ae88"
 }
