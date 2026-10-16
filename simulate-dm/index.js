@@ -35,6 +35,7 @@
     msgs.push(msg);
     storage.messages = { ...storage.messages };
   }
+
   function getKeys() {
     const list = Array.isArray(storage.apiKeys) ? storage.apiKeys : [];
     return list.map((k) => (k && typeof k.key === "string" ? k.key.trim() : "")).filter(Boolean);
@@ -71,6 +72,7 @@
   }
 
   function openChat(contact) {
+    showToast("Opening chat with " + (contact.username || "user"));
     openPage(contact.username || "Chat", () => h(FakeChatScreen, { contact }));
   }
 
@@ -110,7 +112,6 @@
             if (!contact) {
               contact = { id: Date.now().toString(), discordId: user.id, username: username, avatar: avatar };
               saveContact(contact);
-              showToast("Contact created: " + username);
             } else {
               contact.username = username;
               contact.avatar = avatar;
@@ -147,7 +148,10 @@
       setBusy(true);
       try {
         const keys = getKeys();
-        if (!keys.length) { showToast("Add a Groq API key in settings first"); return; }
+        if (!keys.length) {
+          showToast("No API key found. Add one in Settings \u2192 Simulate DM");
+          return;
+        }
         const system = (storage.systemPrompt || "You are roleplaying as {name} in a Discord DM. Reply naturally and casually.").replace("{name}", contact.username || "the user");
         const history = getMessages(contact.id).slice(-8);
         const msgs = [{ role: "system", content: system }];
@@ -158,12 +162,19 @@
           headers: { "Content-Type": "application/json", Authorization: "Bearer " + keys[0] },
           body: JSON.stringify({ model: storage.model || DEFAULT_MODEL, temperature: 0.8, max_completion_tokens: 256, messages: msgs }),
         });
+        if (!res.ok) {
+          showToast("API error " + res.status);
+          return;
+        }
         const data = await res.json();
         const reply = data?.choices?.[0]?.message?.content?.trim() || "AI error";
         addMessage(contact.id, { id: (Date.now() + 1).toString(), from: "them", text: reply, ts: Date.now() });
         setMessages(getMessages(contact.id).slice(-50));
-      } catch (e) { showToast("AI error"); }
-      finally { setBusy(false); }
+      } catch (e) {
+        showToast("AI error: " + (e.message || "unknown"));
+      } finally {
+        setBusy(false);
+      }
     };
 
     React.useEffect(() => {
@@ -210,13 +221,13 @@
       const nextId = list.reduce((m, x) => Math.max(m, x.id || 0), 0) + 1;
       storage.apiKeys = list.concat([{ id: nextId, key: k }]);
       setNewKey("");
-      showToast("Key added");
+      showToast("Key added (" + getKeys().length + " total)");
     };
     const removeKey = (id) => { storage.apiKeys = (storage.apiKeys || []).filter((x) => x.id !== id); };
     return h(ScrollView, { style: { flex: 1, backgroundColor: "#313338" }, contentContainerStyle: { padding: 16 } },
       h(Text, { style: { color: "#fff", fontSize: 20, fontWeight: "700", marginBottom: 8 } }, "Simulate DM"),
       h(Text, { style: { color: "#80848e", marginBottom: 20 } }, "Profile \u2192 \u2022\u2022\u2022 \u2192 Simulate DM"),
-      h(Text, { style: { color: "#b5bac1", fontWeight: "700", marginBottom: 8 } }, "API KEYS"),
+      h(Text, { style: { color: "#b5bac1", fontWeight: "700", marginBottom: 8 } }, "API KEYS (" + keys.length + ")"),
       keys.length === 0 ? h(Text, { style: { color: "#80848e", marginBottom: 12 } }, "None added") : keys.map((k) => h(View, { key: k.id, style: { flexDirection: "row", alignItems: "center", backgroundColor: "#2b2d31", borderRadius: 8, padding: 12, marginBottom: 8 } },
         h(Text, { style: { color: "#fff", flex: 1 } }, "#" + k.id + "  " + k.key.slice(0, 6) + "..." + k.key.slice(-4)),
         h(TouchableOpacity, { onPress: () => removeKey(k.id), style: { paddingHorizontal: 10 } }, h(Text, { style: { color: "#da373c", fontWeight: "700" } }, "\u2715"))

@@ -1,6 +1,6 @@
 {
   "name": "Simulate DM",
-  "description": "Simulate Discord DMs with AI replies. Profile menu entry. Fixed navigation and input.",
+  "description": "Simulate Discord DMs with AI replies. Profile menu entry.",
   "authors": [
     {
       "name": "User",
@@ -11,5 +11,5 @@
   "vendetta": {
     "icon": "ic_chat_bubble_16px"
   },
-  "hash": "e190410b29500ce7da265773be0796c4742e9e18e3e7cb6d336895a4e19e1919"
+  "hash": "32535c52a645b72136a7d9b65f14d94e9b7d8a8f623218ccb4a3e149d5270a75"
 }
