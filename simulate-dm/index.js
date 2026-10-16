@@ -50,42 +50,32 @@
     return (user && (user.globalName || user.global_name || user.username)) || "User";
   }
 
-  function openChat(contact) {
-    const openLazy = metro.findByProps("openLazy")?.openLazy;
-    if (openLazy) {
-      try {
-        openLazy(Promise.resolve({ default: () => h(FakeChatScreen, { contact }) }), "fakedm-chat-" + contact.id, {});
-        return;
-      } catch (e) {}
-    }
+  function openPage(title, renderFn) {
     try {
       const navMod = metro.findByProps("getRootNavigationRef");
       const ref = navMod?.getRootNavigationRef?.();
       if (ref?.navigate) {
-        ref.navigate("VendettaCustomPage", { title: contact.username, render: () => h(FakeChatScreen, { contact }) });
-        return;
+        ref.navigate("VendettaCustomPage", { title, render: renderFn });
+        return true;
       }
     } catch (e) {}
-    showToast("Could not open chat page");
+    try {
+      const Navigation = metro.findByProps("Navigation")?.Navigation;
+      if (Navigation?.push) {
+        Navigation.push("VendettaCustomPage", { title, render: renderFn });
+        return true;
+      }
+    } catch (e) {}
+    showToast("Could not open page");
+    return false;
+  }
+
+  function openChat(contact) {
+    openPage(contact.username || "Chat", () => h(FakeChatScreen, { contact }));
   }
 
   function openSettings() {
-    const openLazy = metro.findByProps("openLazy")?.openLazy;
-    if (openLazy) {
-      try {
-        openLazy(Promise.resolve({ default: SettingsPage }), "fakedm-settings", {});
-        return;
-      } catch (e) {}
-    }
-    try {
-      const navMod = metro.findByProps("getRootNavigationRef");
-      const ref = navMod?.getRootNavigationRef?.();
-      if (ref?.navigate) {
-        ref.navigate("VendettaCustomPage", { title: "Simulate DM Settings", render: SettingsPage });
-        return;
-      }
-    } catch (e) {}
-    showToast("Could not open settings");
+    openPage("Simulate DM Settings", SettingsPage);
   }
 
   function patchUserProfileMenu() {
@@ -142,7 +132,7 @@
 
   function FakeChatScreen({ contact }) {
     const { View, Text, ScrollView, TextInput, TouchableOpacity, Image, KeyboardAvoidingView, Platform } = RN;
-    const [messages, setMessages] = React.useState(() => getMessages(contact.id));
+    const [messages, setMessages] = React.useState(() => getMessages(contact.id).slice(-50));
     const [input, setInput] = React.useState("");
     const [busy, setBusy] = React.useState(false);
     const scrollRef = React.useRef(null);
@@ -152,53 +142,55 @@
       if (!text || busy) return;
       const now = Date.now();
       addMessage(contact.id, { id: now.toString(), from: "me", text, ts: now });
-      setMessages([...getMessages(contact.id)]);
+      setMessages(getMessages(contact.id).slice(-50));
       setInput("");
       setBusy(true);
       try {
         const keys = getKeys();
-        if (!keys.length) { showToast("Add a Groq API key in settings"); return; }
+        if (!keys.length) { showToast("Add a Groq API key in settings first"); return; }
         const system = (storage.systemPrompt || "You are roleplaying as {name} in a Discord DM. Reply naturally and casually.").replace("{name}", contact.username || "the user");
-        const history = getMessages(contact.id).slice(-10);
+        const history = getMessages(contact.id).slice(-8);
         const msgs = [{ role: "system", content: system }];
         for (const m of history) msgs.push({ role: m.from === "me" ? "user" : "assistant", content: m.text });
         msgs.push({ role: "user", content: text });
         const res = await fetch(GROQ_URL, {
           method: "POST",
           headers: { "Content-Type": "application/json", Authorization: "Bearer " + keys[0] },
-          body: JSON.stringify({ model: storage.model || DEFAULT_MODEL, temperature: 0.8, max_completion_tokens: 512, messages: msgs }),
+          body: JSON.stringify({ model: storage.model || DEFAULT_MODEL, temperature: 0.8, max_completion_tokens: 256, messages: msgs }),
         });
         const data = await res.json();
         const reply = data?.choices?.[0]?.message?.content?.trim() || "AI error";
         addMessage(contact.id, { id: (Date.now() + 1).toString(), from: "them", text: reply, ts: Date.now() });
-        setMessages([...getMessages(contact.id)]);
+        setMessages(getMessages(contact.id).slice(-50));
       } catch (e) { showToast("AI error"); }
       finally { setBusy(false); }
     };
 
-    React.useEffect(() => { setTimeout(() => scrollRef.current?.scrollToEnd?.({ animated: true }), 60); }, [messages]);
+    React.useEffect(() => {
+      const t = setTimeout(() => scrollRef.current?.scrollToEnd?.({ animated: true }), 80);
+      return () => clearTimeout(t);
+    }, [messages]);
 
     return h(
       KeyboardAvoidingView,
-      { style: { flex: 1, backgroundColor: "#313338" }, behavior: Platform.OS === "ios" ? "padding" : undefined },
-      h(View, { style: { flexDirection: "row", alignItems: "center", padding: 12, backgroundColor: "#2b2d31", borderBottomWidth: 1, borderBottomColor: "#1e1f22" } },
-        h(Image, { source: { uri: contact.avatar }, style: { width: 36, height: 36, borderRadius: 18, marginRight: 10 } }),
-        h(Text, { style: { color: "#fff", fontSize: 16, fontWeight: "700" } }, contact.username)
-      ),
-      h(ScrollView, { ref: scrollRef, contentContainerStyle: { padding: 12 } },
+      { style: { flex: 1, backgroundColor: "#313338" }, behavior: Platform.OS === "ios" ? "padding" : "height" },
+      h(ScrollView, { ref: scrollRef, style: { flex: 1 }, contentContainerStyle: { padding: 12, paddingBottom: 8 }, keyboardShouldPersistTaps: "handled" },
         messages.length === 0
-          ? h(Text, { style: { color: "#80848e", textAlign: "center", marginTop: 40 } }, "No messages yet. Say hi!")
-          : messages.map((m) => h(View, { key: m.id, style: { flexDirection: "row", marginBottom: 10, alignItems: "flex-start" } },
-              m.from !== "me" ? h(Image, { source: { uri: contact.avatar }, style: { width: 36, height: 36, borderRadius: 18, marginRight: 10 } }) : h(View, { style: { width: 46 } }),
+          ? h(Text, { style: { color: "#80848e", textAlign: "center", marginTop: 60 } }, "No messages yet")
+          : messages.map((m) => h(View, { key: m.id, style: { flexDirection: "row", marginBottom: 12, alignItems: "flex-start" } },
+              m.from !== "me" ? h(Image, { source: { uri: contact.avatar }, style: { width: 40, height: 40, borderRadius: 20, marginRight: 12 } }) : h(View, { style: { width: 52 } }),
               h(View, { style: { flex: 1 } },
-                h(Text, { style: { color: m.from === "me" ? "#00a8fc" : "#dbdee1", fontWeight: "600", marginBottom: 2 } }, m.from === "me" ? "You" : contact.username),
-                h(Text, { style: { color: "#dbdee1", fontSize: 16 } }, m.text)
+                h(View, { style: { flexDirection: "row", alignItems: "baseline" } },
+                  h(Text, { style: { color: m.from === "me" ? "#00a8fc" : "#dbdee1", fontWeight: "600", fontSize: 16 } }, m.from === "me" ? "You" : contact.username),
+                  h(Text, { style: { color: "#80848e", fontSize: 12, marginLeft: 8 } }, new Date(m.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }))
+                ),
+                h(Text, { style: { color: "#dbdee1", fontSize: 16, marginTop: 2 } }, m.text)
               )
             ))
       ),
-      h(View, { style: { flexDirection: "row", padding: 10, backgroundColor: "#2b2d31", alignItems: "center" } },
-        h(TextInput, { value: input, onChangeText: setInput, placeholder: "Message " + (contact.username || "user"), placeholderTextColor: "#80848e", style: { flex: 1, backgroundColor: "#383a40", color: "#fff", borderRadius: 8, paddingHorizontal: 12, paddingVertical: 10, marginRight: 8 } }),
-        h(TouchableOpacity, { onPress: send, disabled: busy, style: { backgroundColor: busy ? "#4e5058" : "#5865f2", borderRadius: 8, paddingHorizontal: 16, paddingVertical: 10 } },
+      h(View, { style: { flexDirection: "row", paddingHorizontal: 12, paddingVertical: 8, backgroundColor: "#313338", borderTopWidth: 1, borderTopColor: "#1e1f22", alignItems: "center" } },
+        h(TextInput, { value: input, onChangeText: setInput, placeholder: "Message @" + (contact.username || "user"), placeholderTextColor: "#80848e", style: { flex: 1, backgroundColor: "#383a40", color: "#fff", borderRadius: 20, paddingHorizontal: 16, paddingVertical: 10, marginRight: 8, maxHeight: 100 }, multiline: true }),
+        h(TouchableOpacity, { onPress: send, disabled: busy || !input.trim(), style: { backgroundColor: busy || !input.trim() ? "#4e5058" : "#5865f2", borderRadius: 20, paddingHorizontal: 18, paddingVertical: 10 } },
           h(Text, { style: { color: "#fff", fontWeight: "700" } }, busy ? "..." : "Send")
         )
       )
@@ -214,19 +206,24 @@
       const k = newKey.trim();
       if (!k.startsWith("gsk_")) return showToast("Key must start with gsk_");
       const list = Array.isArray(storage.apiKeys) ? storage.apiKeys : [];
+      if (list.some((x) => x.key === k)) return showToast("Key already added");
       const nextId = list.reduce((m, x) => Math.max(m, x.id || 0), 0) + 1;
       storage.apiKeys = list.concat([{ id: nextId, key: k }]);
       setNewKey("");
       showToast("Key added");
     };
+    const removeKey = (id) => { storage.apiKeys = (storage.apiKeys || []).filter((x) => x.id !== id); };
     return h(ScrollView, { style: { flex: 1, backgroundColor: "#313338" }, contentContainerStyle: { padding: 16 } },
-      h(Text, { style: { color: "#fff", fontSize: 20, fontWeight: "700", marginBottom: 16 } }, "Simulate DM Settings"),
-      h(Text, { style: { color: "#80848e", marginBottom: 16 } }, "Open a user profile \u2192 tap the \u2022\u2022\u2022 menu \u2192 Simulate DM"),
-      h(Text, { style: { color: "#80848e", fontWeight: "700", marginBottom: 8 } }, "GROQ API KEYS"),
-      keys.length === 0 ? h(Text, { style: { color: "#80848e", marginBottom: 8 } }, "No keys added") : keys.map((k) => h(Text, { key: k.id, style: { color: "#fff", marginBottom: 4 } }, "#" + k.id + "  " + k.key.slice(0, 8) + "...")),
+      h(Text, { style: { color: "#fff", fontSize: 20, fontWeight: "700", marginBottom: 8 } }, "Simulate DM"),
+      h(Text, { style: { color: "#80848e", marginBottom: 20 } }, "Profile \u2192 \u2022\u2022\u2022 \u2192 Simulate DM"),
+      h(Text, { style: { color: "#b5bac1", fontWeight: "700", marginBottom: 8 } }, "API KEYS"),
+      keys.length === 0 ? h(Text, { style: { color: "#80848e", marginBottom: 12 } }, "None added") : keys.map((k) => h(View, { key: k.id, style: { flexDirection: "row", alignItems: "center", backgroundColor: "#2b2d31", borderRadius: 8, padding: 12, marginBottom: 8 } },
+        h(Text, { style: { color: "#fff", flex: 1 } }, "#" + k.id + "  " + k.key.slice(0, 6) + "..." + k.key.slice(-4)),
+        h(TouchableOpacity, { onPress: () => removeKey(k.id), style: { paddingHorizontal: 10 } }, h(Text, { style: { color: "#da373c", fontWeight: "700" } }, "\u2715"))
+      )),
       h(TextInput, { value: newKey, onChangeText: setNewKey, placeholder: "gsk_...", placeholderTextColor: "#80848e", autoCapitalize: "none", style: { backgroundColor: "#2b2d31", color: "#fff", borderRadius: 8, padding: 12, marginBottom: 8 } }),
-      h(TouchableOpacity, { onPress: addKey, style: { backgroundColor: "#248046", borderRadius: 8, padding: 12, alignItems: "center" } },
-        h(Text, { style: { color: "#fff", fontWeight: "700" } }, "Add API Key")
+      h(TouchableOpacity, { onPress: addKey, style: { backgroundColor: "#248046", borderRadius: 8, padding: 14, alignItems: "center" } },
+        h(Text, { style: { color: "#fff", fontWeight: "700" } }, "Add Key")
       )
     );
   }
