@@ -1,6 +1,6 @@
 {
   "name": "Simulate DM",
-  "description": "Simulate Discord DMs with AI replies. Adds Simulate DM to user profile menu. Does not touch the DMs list.",
+  "description": "Simulate Discord DMs with AI replies. Adds Simulate DM to user profile menu.",
   "authors": [
     {
       "name": "User",
@@ -11,5 +11,5 @@
   "vendetta": {
     "icon": "ic_chat_bubble_16px"
   },
-  "hash": "616bf7953f24da911bdd538ab78499d7abf602d60c86baa0c9d34e428fa8ae88"
+  "hash": "7af378e971a1419ae260e018a49fff905012b5c407512ae4cccb7cd1e19b0c0c"
 }

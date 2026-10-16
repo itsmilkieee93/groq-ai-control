@@ -40,23 +40,6 @@
     return list.map((k) => (k && typeof k.key === "string" ? k.key.trim() : "")).filter(Boolean);
   }
 
-  function openCustomPage(title, render) {
-    try {
-      const navMod = metro.findByProps("getRootNavigationRef");
-      const ref = navMod?.getRootNavigationRef?.();
-      if (ref?.navigate) {
-        ref.navigate("VendettaCustomPage", { title, render });
-        return;
-      }
-    } catch (e) {}
-    try {
-      const Navigation = metro.findByProps("Navigation")?.Navigation;
-      Navigation?.push?.("VendettaCustomPage", { title, render });
-    } catch (e) {
-      showToast("Could not open page");
-    }
-  }
-
   function avatarUrlFor(user) {
     if (user && user.id && user.avatar) {
       return "https://cdn.discordapp.com/avatars/" + user.id + "/" + user.avatar + ".png?size=128";
@@ -65,6 +48,44 @@
   }
   function displayNameOf(user) {
     return (user && (user.globalName || user.global_name || user.username)) || "User";
+  }
+
+  function openChat(contact) {
+    const openLazy = metro.findByProps("openLazy")?.openLazy;
+    if (openLazy) {
+      try {
+        openLazy(Promise.resolve({ default: () => h(FakeChatScreen, { contact }) }), "fakedm-chat-" + contact.id, {});
+        return;
+      } catch (e) {}
+    }
+    try {
+      const navMod = metro.findByProps("getRootNavigationRef");
+      const ref = navMod?.getRootNavigationRef?.();
+      if (ref?.navigate) {
+        ref.navigate("VendettaCustomPage", { title: contact.username, render: () => h(FakeChatScreen, { contact }) });
+        return;
+      }
+    } catch (e) {}
+    showToast("Could not open chat page");
+  }
+
+  function openSettings() {
+    const openLazy = metro.findByProps("openLazy")?.openLazy;
+    if (openLazy) {
+      try {
+        openLazy(Promise.resolve({ default: SettingsPage }), "fakedm-settings", {});
+        return;
+      } catch (e) {}
+    }
+    try {
+      const navMod = metro.findByProps("getRootNavigationRef");
+      const ref = navMod?.getRootNavigationRef?.();
+      if (ref?.navigate) {
+        ref.navigate("VendettaCustomPage", { title: "Simulate DM Settings", render: SettingsPage });
+        return;
+      }
+    } catch (e) {}
+    showToast("Could not open settings");
   }
 
   function patchUserProfileMenu() {
@@ -105,7 +126,7 @@
               contact.avatar = avatar;
               saveContact(contact);
             }
-            openCustomPage(username, () => h(FakeChatScreen, { contact }));
+            openChat(contact);
           },
         });
       } catch (e) {}
@@ -160,14 +181,20 @@
     return h(
       KeyboardAvoidingView,
       { style: { flex: 1, backgroundColor: "#313338" }, behavior: Platform.OS === "ios" ? "padding" : undefined },
+      h(View, { style: { flexDirection: "row", alignItems: "center", padding: 12, backgroundColor: "#2b2d31", borderBottomWidth: 1, borderBottomColor: "#1e1f22" } },
+        h(Image, { source: { uri: contact.avatar }, style: { width: 36, height: 36, borderRadius: 18, marginRight: 10 } }),
+        h(Text, { style: { color: "#fff", fontSize: 16, fontWeight: "700" } }, contact.username)
+      ),
       h(ScrollView, { ref: scrollRef, contentContainerStyle: { padding: 12 } },
-        messages.map((m) => h(View, { key: m.id, style: { flexDirection: "row", marginBottom: 10, alignItems: "flex-start" } },
-          m.from !== "me" ? h(Image, { source: { uri: contact.avatar }, style: { width: 36, height: 36, borderRadius: 18, marginRight: 10 } }) : h(View, { style: { width: 46 } }),
-          h(View, { style: { flex: 1 } },
-            h(Text, { style: { color: m.from === "me" ? "#00a8fc" : "#dbdee1", fontWeight: "600", marginBottom: 2 } }, m.from === "me" ? "You" : contact.username),
-            h(Text, { style: { color: "#dbdee1", fontSize: 16 } }, m.text)
-          )
-        ))
+        messages.length === 0
+          ? h(Text, { style: { color: "#80848e", textAlign: "center", marginTop: 40 } }, "No messages yet. Say hi!")
+          : messages.map((m) => h(View, { key: m.id, style: { flexDirection: "row", marginBottom: 10, alignItems: "flex-start" } },
+              m.from !== "me" ? h(Image, { source: { uri: contact.avatar }, style: { width: 36, height: 36, borderRadius: 18, marginRight: 10 } }) : h(View, { style: { width: 46 } }),
+              h(View, { style: { flex: 1 } },
+                h(Text, { style: { color: m.from === "me" ? "#00a8fc" : "#dbdee1", fontWeight: "600", marginBottom: 2 } }, m.from === "me" ? "You" : contact.username),
+                h(Text, { style: { color: "#dbdee1", fontSize: 16 } }, m.text)
+              )
+            ))
       ),
       h(View, { style: { flexDirection: "row", padding: 10, backgroundColor: "#2b2d31", alignItems: "center" } },
         h(TextInput, { value: input, onChangeText: setInput, placeholder: "Message " + (contact.username || "user"), placeholderTextColor: "#80848e", style: { flex: 1, backgroundColor: "#383a40", color: "#fff", borderRadius: 8, paddingHorizontal: 12, paddingVertical: 10, marginRight: 8 } }),
@@ -209,7 +236,7 @@
     if (!settingConstants) return;
     const SETTINGS_KEY = "FAKE_DM_SIM";
     const row = {};
-    row[SETTINGS_KEY] = { type: "pressable", title: () => "Simulate DM", useTitle: () => "Simulate DM", usePredicate: () => true, onPress: () => openCustomPage("Simulate DM Settings", SettingsPage), withArrow: true };
+    row[SETTINGS_KEY] = { type: "pressable", title: () => "Simulate DM", useTitle: () => "Simulate DM", usePredicate: () => true, onPress: openSettings, withArrow: true };
     let value = settingConstants.SETTING_RENDERER_CONFIG;
     try {
       Object.defineProperty(settingConstants, "SETTING_RENDERER_CONFIG", { enumerable: true, configurable: true, get: () => Object.assign({}, value, row), set: (v) => { value = v; } });
